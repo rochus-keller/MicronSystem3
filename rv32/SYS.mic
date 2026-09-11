@@ -1,0 +1,135 @@
+module SYS [level=1]  // RK 2026
+
+// Oberon-07 built-in procedures which have no counterpart in Oberon-90, plus spillRegs
+
+import MIC
+
+const NofRegs* = 14 // ra, sp and s0 to s11, see spillRegs
+
+type 
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  Int32Ptr = pointer to int32 // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int32ArrPtr = pointer to array of int32 // helper type for an address moved by an offset
+
+procedure TRACE*(ch: char)
+  // the RS232 interface serves as debug console, see DESIGN.md
+begin
+  Int32Ptr{MIC.rs232data}^ := +ord(ch)
+end TRACE
+
+procedure TRACEHEX*(n: int32)
+  // a number on the debug console
+  var i, d: int32
+    u: uint32
+    buf: array 8 of char
+begin
+  u := usig(n)
+  i := 0
+  while i < 8 do
+    d := cast(int32,band(u, 0FH))
+    u := shr(u, 4)
+    if d < 10 then
+      buf[i] := chr(d + 30H)
+    else
+      buf[i] := chr(d + 37H)
+    end
+    inc(i)
+  end
+  while i > 0 do
+    dec(i)
+    TRACE(buf[i])
+  end
+  TRACE(" ")
+end TRACEHEX
+
+procedure ROT*(x, n: int32): int32
+  // x rotated left by n bits, right if n is negative; two shifts, see DESIGN.md
+  var m: uint32
+    u: uint32
+begin
+  m := usig(obmod(n, 32)) // 0 <= m < 32, also for a negative n
+  u := usig(x)
+  if m = 0 then
+    return x
+  end
+  return cast(int32,shl(u, m) + shr(u, 32 - m))
+end ROT
+
+procedure MOVE*(src, dst: AnyPtr; n: int32)
+  // n bytes from src to dst; the blocks may overlap, see DESIGN.md
+  var s, d: AnyPtr
+    sw, dw: Int32ArrPtr
+    i, w: int32
+begin
+  if (n <= 0) or (src = dst) or (src = nil) or (dst = nil) then return end
+  if val(uint32, ord(dst)) > val(uint32, ord(src)) then
+    if band(bor(val(uint32, ord(src)), val(uint32, ord(dst))), 3) = 0 then
+      // both blocks are word aligned, so whole words are moved
+      w := n div 4
+    else
+      w := 0
+    end
+    i := n - 1
+    s := ptroff(src, i)
+    d := ptroff(dst, i)
+    while i >= w * 4 do
+      d^ := s^
+      s := ptroff(s, -1)
+      d := ptroff(d, -1)
+      dec(i)
+    end
+    sw := cast(Int32ArrPtr, src)
+    dw := cast(Int32ArrPtr, dst)
+    i := w - 1
+    while i >= 0 do
+      dw[i] := sw[i]
+      dec(i)
+    end
+  else
+    if band(bor(val(uint32, ord(src)), val(uint32, ord(dst))), 3) = 0 then
+      // both blocks are word aligned, so whole words are moved
+      sw := cast(Int32ArrPtr, src)
+      dw := cast(Int32ArrPtr, dst)
+      w := n div 4
+      i := 0
+      while i < w do
+        dw[i] := sw[i]
+        inc(i)
+      end
+      i := w * 4
+    else
+      i := 0
+    end
+    s := ptroff(src, i)
+    d := ptroff(dst, i)
+    while i < n do
+      d^ := s^
+      s := ptroff(s, 1)
+      d := ptroff(d, 1)
+      inc(i)
+    end
+  end
+end MOVE
+
+// SYSTEM.H, REG, REGADR and LDREG are no longer required, see DESIGN.md
+
+procedure spillRegs*(p: ^array of uint32)
+// the NofRegs registers a called procedure must preserve, as words at p
+begin
+  getreg(1, p[0])   // ra
+  getreg(2, p[1])   // sp
+  getreg(8, p[2])   // s0
+  getreg(9, p[3])   // s1
+  getreg(18, p[4])  // s2
+  getreg(19, p[5])  // s3
+  getreg(20, p[6])  // s4
+  getreg(21, p[7])  // s5
+  getreg(22, p[8])  // s6
+  getreg(23, p[9])  // s7
+  getreg(24, p[10]) // s8
+  getreg(25, p[11]) // s9
+  getreg(26, p[12]) // s10
+  getreg(27, p[13]) // s11
+end spillRegs
+
+end SYS.

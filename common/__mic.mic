@@ -1,0 +1,816 @@
+module __mic [level=1] // soft float LONGREAL operations for RV32
+
+// The RV32 machine has the F extension, but not D, so micc generates calls of __mic$<op>_r8 for LONGREAL
+// This module implements them in IEEE 754 double arithmetic over 128 bit integers
+
+const
+  Bias = 1023i4
+  NW = 4i4 // words of the working significand
+  Zero = 0i4 // number classes
+  Finite = 1i4
+  Inf = 2i4
+  NaN = 3i4
+
+type
+  U32Ptr = pointer to uint32
+  RealPtr = pointer to real
+  W = array 4 of uint32
+  PW = pointer to W
+
+procedure clear(a: PW)
+  var i: int32
+begin
+  for i := 0 to NW - 1 do
+    a[i] := 0
+  end
+end clear
+
+procedure isZero(a: PW): boolean
+  var i: int32
+begin
+  for i := 0 to NW - 1 do
+    if a[i] # 0 then
+      return false
+    end
+  end
+  return true
+end isZero
+
+procedure msb(a: PW): int32 // index of the highest set bit, -1 if zero
+  var i, k: int32
+begin
+  i := NW - 1
+  while i >= 0 do
+    if a[i] # 0 then
+      k := 31
+      while band(a[i], shl(1u4, usig(k))) = 0 do
+        dec(k)
+      end
+      return i * 32 + k
+    end
+    dec(i)
+  end
+  return -1
+end msb
+
+procedure bit(a: PW; i: int32): int32
+begin
+  if (i < 0) or (i >= NW * 32) then
+    return 0
+  end
+  return val(int32, band(shr(a[i div 32], usig(i mod 32)), 1))
+end bit
+
+procedure cmp(a, b: PW): int32
+  var i: int32
+begin
+  i := NW - 1
+  while i >= 0 do
+    if a[i] # b[i] then
+      if a[i] > b[i] then
+        return 1
+      else
+        return -1
+      end
+    end
+    dec(i)
+  end
+  return 0
+end cmp
+
+procedure add(a, b: PW) // a := a + b
+  var
+    i: int32
+    s, carry: uint32
+begin
+  carry := 0
+  for i := 0 to NW - 1 do
+    s := a[i] + b[i]
+    if s < a[i] then
+      a[i] := s + carry
+      carry := 1
+    else
+      a[i] := s + carry
+      if (carry = 1) & (a[i] = 0) then
+        carry := 1
+      else
+        carry := 0
+      end
+    end
+  end
+end add
+
+procedure addWord(a: PW; n: uint32) // a := a + n
+  var
+    i: int32
+    s: uint32
+begin
+  i := 0
+  while (i < NW) & (n # 0) do
+    s := a[i] + n
+    if s < a[i] then
+      n := 1
+    else
+      n := 0
+    end
+    a[i] := s
+    inc(i)
+  end
+end addWord
+
+procedure sub(a, b: PW) // a := a - b, a >= b
+  var
+    i: int32
+    borrow, d: uint32
+begin
+  borrow := 0
+  for i := 0 to NW - 1 do
+    d := a[i] - b[i]
+    if a[i] < b[i] then
+      a[i] := d - borrow
+      borrow := 1
+    else
+      a[i] := d - borrow
+      if (borrow = 1) & (d = 0) then
+        borrow := 1
+      else
+        borrow := 0
+      end
+    end
+  end
+end sub
+
+procedure subWord(a: PW; n: uint32)
+  var
+    i: int32
+    d: uint32
+begin
+  i := 0
+  while (i < NW) & (n # 0) do
+    d := a[i] - n
+    if a[i] < n then
+      n := 1
+    else
+      n := 0
+    end
+    a[i] := d
+    inc(i)
+  end
+end subWord
+
+procedure shl1(a: PW)
+  var
+    i: int32
+    c, nc: uint32
+begin
+  c := 0
+  for i := 0 to NW - 1 do
+    nc := shr(a[i], 31)
+    a[i] := bor(shl(a[i], 1), c)
+    c := nc
+  end
+end shl1
+
+procedure shr1(a: PW): int32 // returns the bit shifted out
+  var
+    i, out: int32
+begin
+  out := val(int32, band(a[0], 1))
+  i := 0
+  while i < NW - 1 do
+    a[i] := bor(shr(a[i], 1), shl(a[i + 1], 31))
+    inc(i)
+  end
+  a[NW - 1] := shr(a[NW - 1], 1)
+  return out
+end shr1
+
+procedure shift1(a: PW) // shift right by one, discarding the bit
+  var b: int32
+begin
+  b := shr1(a)
+end shift1
+
+procedure shiftLeft(a: PW; n: int32)
+begin
+  while n > 0 do
+    shl1(a)
+    dec(n)
+  end
+end shiftLeft
+
+procedure shiftRight(a: PW; n: int32; sticky: pointer to boolean)
+begin
+  if n >= NW * 32 then
+    if ~isZero(a) then
+      sticky^ := true
+    end
+    clear(a)
+    return
+  end
+  while n > 0 do
+    if shr1(a) # 0 then
+      sticky^ := true
+    end
+    dec(n)
+  end
+end shiftRight
+
+procedure mul(ah, al, bh, bl: uint32; r: PW) // r := (ah,al) * (bh,bl)
+  var
+    a, b: array 4 of uint32 // 16 bit limbs
+    p: array 8 of uint32
+    i, j: int32
+    t, carry: uint32
+begin
+  a[0] := band(al, 0FFFFH)
+  a[1] := shr(al, 16)
+  a[2] := band(ah, 0FFFFH)
+  a[3] := shr(ah, 16)
+  b[0] := band(bl, 0FFFFH)
+  b[1] := shr(bl, 16)
+  b[2] := band(bh, 0FFFFH)
+  b[3] := shr(bh, 16)
+  for i := 0 to 7 do
+    p[i] := 0
+  end
+  for i := 0 to 3 do
+    carry := 0
+    for j := 0 to 3 do
+      t := p[i + j] + a[i] * b[j] + carry
+      p[i + j] := band(t, 0FFFFH)
+      carry := shr(t, 16)
+    end
+    p[i + 4] := p[i + 4] + carry
+  end
+  for i := 0 to NW - 1 do
+    r[i] := bor(p[2 * i], shl(p[2 * i + 1], 16))
+  end
+end mul
+
+procedure divide(a, b: PW; q: PW; sticky: pointer to boolean)
+  var
+    rem: W
+    i: int32
+begin
+  clear(q)
+  clear(@rem)
+  i := msb(a)
+  while i >= 0 do
+    shl1(@rem)
+    if bit(a, i) # 0 then
+      rem[0] := bor(rem[0], 1)
+    end
+    if cmp(@rem, b) >= 0 then
+      sub(@rem, b)
+      q[i div 32] := bor(q[i div 32], shl(1u4, usig(i mod 32)))
+    end
+    dec(i)
+  end
+  if ~isZero(@rem) then
+    sticky^ := true
+  end
+end divide
+
+procedure pack(s, e: int32; mh, ml: uint32): longreal
+  var x: longreal
+begin
+  cast(U32Ptr, @x)^ := ml
+  ptroff(cast(U32Ptr, @x), 1)^ := bor(bor(shl(usig(s), 31), shl(usig(e), 20)),
+                                      band(mh, 0FFFFFH))
+  return x
+end pack
+
+procedure zero(s: int32): longreal
+begin
+  return pack(s, 0, 0, 0)
+end zero
+
+procedure infinite(s: int32): longreal
+begin
+  return pack(s, 2047, 0, 0)
+end infinite
+
+procedure nan(): longreal
+begin
+  return pack(0, 2047, 8000H, 0)
+end nan
+
+procedure compose(s, exp: int32; a: PW; sticky: boolean): longreal
+  // x = a * 2^exp; sticky tells whether nonzero bs were dropped from a
+  var
+    k, e, r, n: int32
+    lost: boolean
+begin
+  k := msb(a)
+  if k < 0 then
+    if sticky then // the exact result underflowed
+      return zero(s)
+    end
+    return zero(s)
+  end
+  lost := sticky
+  if k > 55 then
+    shiftRight(a, k - 55, @lost)
+    inc(exp, k - 55)
+  elsif k < 55 then
+    shiftLeft(a, 55 - k)
+    dec(exp, 55 - k)
+  end
+  e := exp + 55 + Bias
+  if e >= 2047 then
+    return infinite(s)
+  end
+  if e <= 0 then
+    n := 1 - e
+    if n >= 56 then
+      return zero(s)
+    end
+    shiftRight(a, n, @lost)
+    e := 0
+  end
+  r := val(int32, band(a[0], 7))
+  if (r > 4) or ((r = 4) & (lost or (band(a[0], 8) # 0))) then
+    addWord(a, 8)
+    k := msb(a)
+    if k > 55 then
+      shift1(a)
+      inc(e)
+      if e >= 2047 then
+        return infinite(s)
+      end
+    elsif (e = 0) & (k = 55) then
+      e := 1 // a subnormal rounded up to the smallest normal number
+    end
+  end
+  shift1(a)
+  shift1(a)
+  shift1(a)
+  return pack(s, e, a[1], a[0])
+end compose
+
+procedure decompose(x: longreal; s, exp, class_: pointer to int32; a: PW)
+  // x = a * 2^exp, with the sign and the class of x
+  var
+    hi, lo: uint32
+    e: int32
+begin
+  lo := cast(U32Ptr, @x)^
+  hi := ptroff(cast(U32Ptr, @x), 1)^
+  s^ := val(int32, shr(hi, 31))
+  e := val(int32, band(shr(hi, 20), 07FFH))
+  clear(a)
+  a[0] := lo
+  a[1] := band(hi, 0FFFFFH)
+  if e = 2047 then
+    if isZero(a) then
+      class_^ := Inf
+    else
+      class_^ := NaN
+    end
+    exp^ := 0
+  elsif e = 0 then
+    if isZero(a) then
+      class_^ := Zero
+      exp^ := 0
+    else
+      class_^ := Finite
+      exp^ := -1074
+    end
+  else
+    class_^ := Finite
+    a[1] := bor(a[1], 0100000H)
+    exp^ := e - Bias - 52
+  end
+end decompose
+
+procedure addImpl(x, y: longreal): longreal
+  var
+    sx, sy, ex, ey, cx, cy, s: int32
+    a, b: W
+    sticky: boolean
+begin
+  decompose(x, @sx, @ex, @cx, @a)
+  decompose(y, @sy, @ey, @cy, @b)
+  if (cx = NaN) or (cy = NaN) then
+    return nan()
+  end
+  if cx = Inf then
+    if (cy = Inf) & (sx # sy) then
+      return nan()
+    end
+    return infinite(sx)
+  end
+  if cy = Inf then
+    return infinite(sy)
+  end
+  if cx = Zero then
+    if cy = Zero then
+      if sx = sy then
+        return zero(sx)
+      end
+      return zero(0)
+    end
+    return y
+  end
+  if cy = Zero then
+    return x
+  end
+  sticky := false
+  shiftLeft(@a, 3)
+  dec(ex, 3)
+  shiftLeft(@b, 3)
+  dec(ey, 3)
+  if ex > ey then
+    shiftRight(@b, ex - ey, @sticky)
+    ey := ex
+  elsif ey > ex then
+    shiftRight(@a, ey - ex, @sticky)
+    ex := ey
+  end
+  if sx = sy then
+    add(@a, @b)
+    s := sx
+  elsif cmp(@a, @b) >= 0 then
+    sub(@a, @b)
+    s := sx
+    if sticky then
+      subWord(@a, 1) // the dropped bs of the subtrahend
+    end
+  else
+    sub(@b, @a)
+    a := b
+    s := sy
+    if sticky then
+      subWord(@a, 1)
+    end
+  end
+  return compose(s, ex, @a, sticky)
+end addImpl
+
+procedure neg(x: longreal): longreal
+  var hi: uint32
+begin
+  hi := ptroff(cast(U32Ptr, @x), 1)^
+  ptroff(cast(U32Ptr, @x), 1)^ := bxor(hi, 80000000H)
+  return x
+end neg
+
+procedure mulImpl(x, y: longreal): longreal
+  var
+    sx, sy, ex, ey, cx, cy: int32
+    a, b, r: W
+begin
+  decompose(x, @sx, @ex, @cx, @a)
+  decompose(y, @sy, @ey, @cy, @b)
+  if (cx = NaN) or (cy = NaN) then
+    return nan()
+  end
+  if (cx = Inf) or (cy = Inf) then
+    if (cx = Zero) or (cy = Zero) then
+      return nan()
+    end
+    return infinite(band(sx + sy, 1))
+  end
+  if (cx = Zero) or (cy = Zero) then
+    return zero(val(int32, band(usig(sx + sy), 1)))
+  end
+  mul(a[1], a[0], b[1], b[0], @r)
+  return compose(val(int32, band(usig(sx + sy), 1)), ex + ey, @r, false)
+end mulImpl
+
+procedure divImpl(x, y: longreal): longreal
+  var
+    sx, sy, ex, ey, cx, cy, s: int32
+    a, b, q: W
+    sticky: boolean
+begin
+  decompose(x, @sx, @ex, @cx, @a)
+  decompose(y, @sy, @ey, @cy, @b)
+  s := val(int32, band(usig(sx + sy), 1))
+  if (cx = NaN) or (cy = NaN) then
+    return nan()
+  end
+  if cx = Inf then
+    if cy = Inf then
+      return nan()
+    end
+    return infinite(s)
+  end
+  if cy = Inf then
+    return zero(s)
+  end
+  if cy = Zero then
+    if cx = Zero then
+      return nan()
+    end
+    return infinite(s)
+  end
+  if cx = Zero then
+    return zero(s)
+  end
+  sticky := false
+  shiftLeft(@a, 57)
+  divide(@a, @b, @q, @sticky)
+  return compose(s, ex - ey - 57, @q, sticky)
+end divImpl
+
+procedure compare(x, y: longreal; res: pointer to int32): boolean
+  var
+    sx, sy, ex, ey, cx, cy, c, ka, kb: int32
+    a, b: W
+begin
+  decompose(x, @sx, @ex, @cx, @a)
+  decompose(y, @sy, @ey, @cy, @b)
+  if (cx = NaN) or (cy = NaN) then
+    return false
+  end
+  if (cx = Zero) & (cy = Zero) then
+    res^ := 0
+    return true
+  end
+  if (cx = Zero) or (cy = Zero) or (sx # sy) then
+    if cx = Zero then
+      if sy = 0 then
+        res^ := -1
+      else
+        res^ := 1
+      end
+    elsif cy = Zero then
+      if sx = 0 then
+        res^ := 1
+      else
+        res^ := -1
+      end
+    elsif sx = 0 then
+      res^ := 1
+    else
+      res^ := -1
+    end
+    return true
+  end
+  if cx = Inf then
+    if cy = Inf then
+      res^ := 0
+    elsif sx = 0 then
+      res^ := 1
+    else
+      res^ := -1
+    end
+    return true
+  end
+  if cy = Inf then
+    if sy = 0 then
+      res^ := -1
+    else
+      res^ := 1
+    end
+    return true
+  end
+  ka := msb(@a) + ex
+  kb := msb(@b) + ey
+  if ka # kb then // the leading bits are at different binary positions
+    if ka > kb then
+      c := 1
+    else
+      c := -1
+    end
+  else
+    if ex > ey then
+      shiftLeft(@a, ex - ey)
+    elsif ey > ex then
+      shiftLeft(@b, ey - ex)
+    end
+    c := cmp(@a, @b)
+  end
+  if sx # 0 then
+    c := -c
+  end
+  res^ := c
+  return true
+end compare
+
+// the generated calls pass the operands in reverse order
+
+procedure add_r8*(y, x: longreal): longreal
+begin
+  return addImpl(x, y)
+end add_r8
+
+procedure sub_r8*(y, x: longreal): longreal
+begin
+  return addImpl(x, neg(y))
+end sub_r8
+
+procedure mul_r8*(y, x: longreal): longreal
+begin
+  return mulImpl(x, y)
+end mul_r8
+
+procedure div_r8*(y, x: longreal): longreal
+begin
+  return divImpl(x, y)
+end div_r8
+
+procedure ceq_r8*(y, x: longreal): int32
+  var c: int32
+begin
+  if ~compare(x, y, @c) then
+    return 0
+  end
+  if c = 0 then
+    return 1
+  end
+  return 0
+end ceq_r8
+
+procedure clt_r8*(y, x: longreal): int32
+  var c: int32
+begin
+  if ~compare(x, y, @c) then
+    return 0
+  end
+  if c < 0 then
+    return 1
+  end
+  return 0
+end clt_r8
+
+procedure cgt_r8*(y, x: longreal): int32
+  var c: int32
+begin
+  if ~compare(x, y, @c) then
+    return 0
+  end
+  if c > 0 then
+    return 1
+  end
+  return 0
+end cgt_r8
+
+procedure conv_r8_i4*(i: int32): longreal
+  var
+    a: W
+    s: int32
+begin
+  clear(@a)
+  if i < 0 then
+    s := 1
+    if i = (-2147483647-1) then
+      a[0] := 80000000H
+    else
+      a[0] := usig(-i)
+    end
+  else
+    s := 0
+    a[0] := usig(i)
+  end
+  if a[0] = 0 then
+    return zero(0)
+  end
+  return compose(s, 0, @a, false)
+end conv_r8_i4
+
+procedure conv_r8_u4*(u: uint32): longreal
+  var a: W
+begin
+  clear(@a)
+  a[0] := u
+  if u = 0 then
+    return zero(0)
+  end
+  return compose(0, 0, @a, false)
+end conv_r8_u4
+
+procedure trunc(x: longreal; s: pointer to int32): uint32
+  var
+    exp, class_, k: int32
+    a: W
+    sticky: boolean
+begin
+  decompose(x, s, @exp, @class_, @a)
+  if (class_ = Zero) or (class_ = NaN) then
+    return 0
+  end
+  sticky := false
+  if exp > 0 then
+    k := msb(@a)
+    if k + exp > 63 then
+      return 0FFFFFFFFH // out of range
+    end
+    shiftLeft(@a, exp)
+  elsif exp < 0 then
+    shiftRight(@a, -exp, @sticky)
+  end
+  return a[0]
+end trunc
+
+procedure conv_i4_r8*(x: longreal): int32
+  var
+    s: int32
+    m: uint32
+begin
+  m := trunc(x, @s)
+  if s # 0 then
+    return -val(int32, band(m, 07FFFFFFFH))
+  end
+  return val(int32, band(m, 07FFFFFFFH))
+end conv_i4_r8
+
+procedure conv_u4_r8*(x: longreal): uint32
+  var s: int32
+begin
+  return trunc(x, @s)
+end conv_u4_r8
+
+procedure conv_r8_r4*(f: real): longreal
+  var
+    bs: uint32
+    s, e: int32
+    a: W
+begin
+  bs := cast(U32Ptr, @f)^
+  s := val(int32, shr(bs, 31))
+  e := val(int32, band(shr(bs, 23), 255))
+  clear(@a)
+  a[0] := band(bs, 07FFFFFH)
+  if e = 255 then
+    if isZero(@a) then
+      return infinite(s)
+    end
+    return nan()
+  end
+  if e = 0 then
+    if isZero(@a) then
+      return zero(s)
+    end
+    return compose(s, -149, @a, false)
+  end
+  a[0] := bor(a[0], 0800000H)
+  return compose(s, e - 127 - 23, @a, false)
+end conv_r8_r4
+
+procedure conv_r4_r8*(x: longreal): real
+  var
+    s, exp, class_, k, e, r: int32
+    a: W
+    lost: boolean
+    bs: uint32
+    f: real
+begin
+  decompose(x, @s, @exp, @class_, @a)
+  if class_ = NaN then
+    bs := 07FC00000H
+  elsif class_ = Inf then
+    bs := bor(shl(usig(s), 31), 07F800000H)
+  elsif class_ = Zero then
+    bs := shl(usig(s), 31)
+  else
+    lost := false
+    k := msb(@a)
+    if k > 26 then
+      shiftRight(@a, k - 26, @lost)
+      inc(exp, k - 26)
+    elsif k < 26 then
+      shiftLeft(@a, 26 - k)
+      dec(exp, 26 - k)
+    end
+    e := exp + 26 + 127
+    if e >= 255 then
+      bs := bor(shl(usig(s), 31), 07F800000H)
+    else
+      if e <= 0 then
+        if 1 - e >= 27 then
+          bs := shl(usig(s), 31)
+          cast(U32Ptr, @f)^ := bs
+          return f
+        end
+        shiftRight(@a, 1 - e, @lost)
+        e := 0
+      end
+      r := val(int32, band(a[0], 7))
+      if (r > 4) or ((r = 4) & (lost or (band(a[0], 8) # 0))) then
+        addWord(@a, 8)
+        k := msb(@a)
+        if k > 26 then
+          shift1(@a)
+          inc(e)
+        elsif (e = 0) & (k = 26) then
+          e := 1
+        end
+      end
+      if e >= 255 then
+        bs := bor(shl(usig(s), 31), 07F800000H)
+      else
+        shift1(@a)
+        shift1(@a)
+        shift1(@a)
+        bs := bor(bor(shl(usig(s), 31), shl(usig(e), 23)), band(a[0], 07FFFFFH))
+      end
+    end
+  end
+  cast(U32Ptr, @f)^ := bs
+  return f
+end conv_r4_r8
+
+end __mic.

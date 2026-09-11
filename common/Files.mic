@@ -1,0 +1,297 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Files [level=5]
+
+import OFS, Modules
+// pjm
+
+// Native-compatible Files module based on OFS
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+
+  File* = OFS.File
+  Rider* = OFS.Rider
+
+  Bytes4 = array 4 of byte
+  PBytes4 = pointer to Bytes4
+  Bytes8 = array 8 of byte
+  PBytes8 = pointer to Bytes8
+
+// Creates a new file with the specified name.
+procedure New*(const name: pointer to array of char): File
+begin
+  return OFS.New(name)
+end New
+
+// Open an existing file. The same file descriptor is returned if a file is opened multiple times.
+procedure Old*(const name: pointer to array of char): File
+begin
+  return OFS.Old(name)
+end Old
+
+(** Register a file created with New in the directory, replacing the previous file in the
+directory with the same name. The file is automatically closed. *)
+procedure Register*(f: File)
+begin
+  OFS.Register(f)
+end Register
+
+// Flushes the changes made to a file to disk. Register will automatically Close a file.
+procedure Close*(f: File)
+begin
+  if f # nil then
+    f.fs.Close(f)
+  end
+end Close
+
+// Returns the current length of a file.
+procedure Length*(f: File): int32
+begin
+  return f.fs.Length(f)
+end Length
+
+// Returns the time (t) and date (d) when a file was last modified.
+procedure GetDate*(f: File; t, d: pointer to int32)
+begin
+  f.fs.GetDate(f, t, d)
+end GetDate
+
+// Sets the modification time (t) and date (d) of a file.
+procedure SetDate*(f: File; t, d: int32)
+begin
+  f.fs.SetDate(f, t, d)
+end SetDate
+
+(** Positions a Rider at a certain position in a file. Multiple Riders can be positioned
+at different locations in a file. A Rider cannot be positioned beyond the end of a file. *)
+procedure Set*(r: pointer to Rider; f: File; pos: int32)
+begin
+  if f # nil then
+    f.fs.Set(r, f, pos)
+  else
+    r.hint := nil
+    r.file := nil
+    r.fs := nil
+  end
+end Set
+
+// Returns the offset of a Rider positioned on a file.
+procedure Pos*(r: pointer to Rider): int32
+begin
+  return r.fs.Pos(r)
+end Pos
+
+// Returns the File a Rider is based on.
+procedure Base*(r: pointer to Rider): File
+begin
+  return r.file
+end Base
+
+(** Read a byte from a file, advancing the Rider one byte further. R.eof indicates if the end
+of the file has been passed. *)
+procedure Read*(r: pointer to Rider; x: pointer to byte)
+begin
+  r.fs.Read(r, x)
+end Read
+
+(** Reads a sequence of length n bytes into the buffer x, advancing the Rider. Less bytes
+will be read when reading over the length of the file. r.res indicates the number of unread bytes.
+x must be big enough to hold n bytes. *)
+procedure ReadBytes*(r: pointer to Rider; x: pointer to array of byte; x_len: int32; n: int32)
+begin
+  r.fs.ReadBytes(r, x, x_len, n)
+end ReadBytes
+
+(**
+Portable routines to read the standard Oberon types.
+*)
+
+procedure ReadInt*(r: pointer to Rider; x: pointer to int16)
+  var
+    x0, x1: int8
+begin
+  r.fs.Read(r, cast(BytePtr, @x0))
+  r.fs.Read(r, cast(BytePtr, @x1))
+  x^ := val(int16, x1) * 256 + band(val(int16, x0), 255)
+end ReadInt
+
+procedure ReadLInt*(r: pointer to Rider; x: pointer to int32)
+begin
+  r.fs.ReadBytes(r, cast(PBytes4, x), 4, 4)
+end ReadLInt
+
+procedure ReadSet*(r: pointer to Rider; x: pointer to set)
+begin
+  r.fs.ReadBytes(r, cast(PBytes4, x), 4, 4)
+end ReadSet
+
+procedure ReadBool*(r: pointer to Rider; x: pointer to boolean)
+  var
+    s: int8
+begin
+  r.fs.Read(r, cast(BytePtr, @s))
+  x^ := s # 0
+end ReadBool
+
+procedure ReadReal*(r: pointer to Rider; x: pointer to real)
+begin
+  r.fs.ReadBytes(r, cast(PBytes4, x), 4, 4)
+end ReadReal
+
+procedure ReadLReal*(r: pointer to Rider; x: pointer to longreal)
+begin
+  r.fs.ReadBytes(r, cast(PBytes8, x), 8, 8)
+end ReadLReal
+
+procedure ReadString*(r: pointer to Rider; x: pointer to array of char; x_len: int32)
+  var
+    i: int16
+    ch: char
+begin
+  i := 0
+  loop
+    r.fs.Read(r, cast(BytePtr, @ch))
+    x[i] := ch
+    inc(i)
+    if ch = 0X then
+      exit
+    end
+    if i = val(int16, x_len) then
+      x[i - 1] := 0X
+      repeat
+        r.fs.Read(r, cast(BytePtr, @ch))
+      until ch = 0X
+      exit
+    end
+  end
+end ReadString
+
+// Reads a number in compressed variable length notation using the minimum amount of bytes.
+procedure ReadNum*(r: pointer to Rider; x: pointer to int32)
+  var
+    ch: char
+    n: int32
+    y: int32
+begin
+  n := 0
+  y := 0
+  r.fs.Read(r, cast(BytePtr, @ch))
+  while ch >= 80X do
+    inc(y, sigc(shl(val(int32, ord(ch)) - 128, usig(n))))
+    inc(n, 7)
+    r.fs.Read(r, cast(BytePtr, @ch))
+  end
+  if n >= 25 then
+    x^ := sigc(shl(val(int32, sigc(shl(val(int32, ord(ch)), 25))), usig(n - 25))) + y
+  else
+    x^ := asr(sigc(shl(val(int32, ord(ch)), 25)), usig(25 - n)) + y
+  end
+end ReadNum
+
+// Writes a byte into the file at the Rider position, advancing the Rider by one.
+procedure Write*(r: pointer to Rider; x: byte)
+begin
+  r.fs.Write(r, x)
+end Write
+
+// Writes the buffer x containing n bytes into a file at the Rider position.
+procedure WriteBytes*(r: pointer to Rider; x: pointer to array of byte; x_len: int32; n: int32)
+begin
+  r.fs.WriteBytes(r, x, x_len, n)
+end WriteBytes
+
+(**
+Portable routines to write the standard Oberon types.
+*)
+
+procedure WriteInt*(r: pointer to Rider; x: int16)
+begin
+  r.fs.Write(r, val(byte, val(int8, x)))
+  r.fs.Write(r, val(byte, val(int8, asr(x, 8))))
+end WriteInt
+
+procedure WriteLInt*(r: pointer to Rider; x: int32)
+begin
+  r.fs.WriteBytes(r, cast(PBytes4, @x), 4, 4)
+end WriteLInt
+
+procedure WriteSet*(r: pointer to Rider; x: set)
+begin
+  r.fs.WriteBytes(r, cast(PBytes4, @x), 4, 4)
+end WriteSet
+
+procedure WriteBool*(r: pointer to Rider; x: boolean)
+begin
+  if x then
+    r.fs.Write(r, 1u1)
+  else
+    r.fs.Write(r, 0u1)
+  end
+end WriteBool
+
+procedure WriteReal*(r: pointer to Rider; x: real)
+begin
+  r.fs.WriteBytes(r, cast(PBytes4, @x), 4, 4)
+end WriteReal
+
+procedure WriteLReal*(r: pointer to Rider; x: longreal)
+begin
+  r.fs.WriteBytes(r, cast(PBytes8, @x), 8, 8)
+end WriteLReal
+
+procedure WriteString*(r: pointer to Rider; const x: pointer to array of char; x_len: int32)
+  var
+    i: int16
+    ch: char
+begin
+  i := 0
+  loop
+    ch := x[i]
+    r.fs.Write(r, val(byte, ord(ch)))
+    inc(i)
+    if ch = 0X then
+      exit
+    end
+    if i = val(int16, x_len) then
+      r.fs.Write(r, val(byte, ord(0X)))
+      exit
+    end
+  end
+end WriteString
+
+// Writes a number in a compressed format.
+procedure WriteNum*(r: pointer to Rider; x: int32)
+begin
+  while (x < -64) or (x > 63) do
+    r.fs.Write(r, val(byte, band(x, 127) + 128))
+    x := asr(x, 7)
+  end
+  r.fs.Write(r, val(byte, band(x, 127)))
+end WriteNum
+
+// Deletes a file. res = 0 indicates success.
+procedure Delete*(const name: pointer to array of char; res: pointer to int16)
+begin
+  OFS.Delete(name, res)
+end Delete
+
+// Renames a file. res = 0 indicates success.
+procedure Rename*(const old, new_: pointer to array of char; res: pointer to int16)
+begin
+  OFS.Rename(old, new_, res)
+end Rename
+
+// Returns the full name of a file.
+procedure GetName*(f: File; name: pointer to array of char)
+  var
+    fname: OFS.LocalName
+begin
+  f.fs.GetName(f, @fname, 128 (* OFS.LocalLength *))
+  OFS.JoinName(@f.fs.prefix, @fname, name)
+end GetName
+
+begin
+  Modules.Register("Files", nil)
+end Files.

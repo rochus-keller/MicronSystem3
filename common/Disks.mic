@@ -1,0 +1,546 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Disks [level=5]
+
+import Kernel, Modules
+// non-portable
+// pjm
+
+// Block devices.
+
+// Based on AosDisks
+
+const
+  Read* = 0 // Device.transfer.op
+  Write* = 1
+
+  // res parameter
+  Ok* = 0 // no error
+
+  // common errors - a device may also return its own error codes > 0
+  MediaChanged* = -1 // media in removable device was changed unexpectedly
+  WriteProtected* = -2 // write failed because media is write-protected
+  Unsupported* = -3 // operation is currently not supported on this device
+  DeviceInUse* = -4 // the device is open (UpdatePartitionTable) or mounted already
+  MediaMissing* = -5 // the device media is not present
+
+  // Device.flags
+  ReadOnly* = 0 // the current media can not be written to
+  Removable* = 1 // the device has removable media
+
+  // Partition.flags
+  Mounted* = 0 // a file system is currently mounted on the partition (set by file system implementations)
+  Primary* = 1 // a primary partition
+  Boot* = 2 // a bootable partition
+  Valid* = 3 // media contains a valid partition table.
+
+  BS = 512 // default block size
+
+  Trace = false
+
+type
+  Name* = array 32 of char
+  Description* = array 64 of char
+
+  Message* = object
+  end
+  PMessage* = pointer to Message
+
+  Device* = pointer to DeviceDesc
+
+  Partition* = record
+    type_*: int32 // partition type
+    start*: int32 // start block and size of partition in blocks
+    size_*: int32
+    flags*: set // Mounted, Primary, Boot, Valid
+    ptblock*: int32 // block containing partition table entry
+    ptoffset*: int32 // offset in partition table of entry, 0 if unknown
+  end
+
+  PartitionTable* = pointer to array of Partition
+
+  TransferProc* = procedure(dev: Device; op: int32; block: int32; num: int32; data: pointer to array of char; data_len: int32; 
+                                ofs: int32; res: pointer to int32)
+  GetSizeProc* = procedure(dev: Device; size_: pointer to int32; res: pointer to int32)
+  HandleProc* = procedure(dev: Device; msg: pointer to Message; res: pointer to int32)
+
+  (** The base for block devices. It provides operations on an abstract array of disk blocks of blockSize bytes,
+  numbered from 0 to size-1. If applicable, a PC-format partition table starts at block 0, and can be read into
+  the table field with Open or UpdatePartitionTable. *)
+
+  DeviceDesc* = object
+    // fields read-only, initialized by extender
+    name*: Name // unique device name
+    desc*: Description // device description for Partition.Show etc.
+    blockSize*: int32 // in bytes - unit of block, num & size parameters
+    flags*: set // ReadOnly, Removable
+    transfer*: TransferProc // read or write blocks
+    getSize*: GetSizeProc // get total size of device
+    handle*: HandleProc // handle optional messages
+    table*: PartitionTable // cache for partition table
+    tableLen*: int32
+    openCount*: int32 // number of times device has been opened
+  end
+
+  EjectMsg* = object (Message)
+  end // eject the media
+  PEjectMsg* = pointer to EjectMsg
+  LockMsg* = object (Message)
+  end // disallow manual ejection
+  PLockMsg* = pointer to LockMsg
+  UnlockMsg* = object (Message)
+  end // allow manual ejection
+  PUnlockMsg* = pointer to UnlockMsg
+  SavePowerMsg* = object (Message)
+  end // spin down the device
+  PSavePowerMsg* = pointer to SavePowerMsg
+  GetGeometryMsg* = object (Message)
+    // return physical geometry
+    cyls*, hds*, spt*: int32
+  end
+  PGetGeometryMsg* = pointer to GetGeometryMsg
+
+  ShutdownMsg* = object (Message)
+  end // shut down the device (driver)
+  PShutdownMsg* = pointer to ShutdownMsg
+
+  DeviceTable* = pointer to array of Device
+
+  DiskBlock = array 512 (* BS *) of char
+
+var
+  num: int32
+  dev: DeviceTable
+  devLen: int32
+
+procedure Transfer(dev: Device; op, block, num: int32; data: pointer to array of char; data_len: int32; ofs: int32; res: pointer to int32)
+begin
+  res^ := Unsupported
+end Transfer
+
+procedure GetSize(dev: Device; size_, res: pointer to int32)
+begin
+  res^ := Unsupported
+end GetSize
+
+procedure Handle(dev: Device; msg: pointer to Message; res: pointer to int32)
+begin
+  res^ := Unsupported
+end Handle
+
+// Initialize a device. Defaults: blockSize = 512, flags = {}, all methods return res = Unsupported.
+
+procedure InitDevice*(d: Device; const name: pointer to array of char)
+begin
+  copy(@d.name, name, 32)
+  copy(@d.desc, "", 64)
+  d.blockSize := BS
+  d.flags := {}
+  d.table := nil
+  d.tableLen := 0
+  d.openCount := 0
+  d.transfer := Transfer
+  d.getSize := GetSize
+  d.handle := Handle
+end InitDevice
+
+// Register a new device.
+
+procedure Register*(d: Device)
+  var
+    old: DeviceTable
+    i: int32
+begin
+  for i := 0 to num - 1 do
+    assert(d.name # dev[i].name) // name must be unique
+  end
+
+  if num = devLen then
+    old := dev
+    newgc(dev, 2 * devLen)
+    for i := 0 to num - 1 do
+      dev[i] := old[i]
+    end
+    devLen := 2 * devLen
+  end
+
+  dev[num] := d
+  inc(num)
+end Register
+
+// Unregister a device. Existing clients may still have pointers to the device!
+
+procedure Unregister*(d: Device)
+  var
+    i: int32
+begin
+  assert(d # nil)
+  i := 0 // must be registered
+  while dev[i] # d do
+    inc(i)
+  end
+  while i + 1 < num do
+    dev[i] := dev[i + 1]
+    inc(i)
+  end
+  dec(num)
+  dev[num] := nil
+  d.transfer := Transfer // restore null methods
+  d.getSize := GetSize
+  d.handle := Handle
+end Unregister
+
+
+procedure NumRegistered*(): int32
+begin
+  return num
+end NumRegistered
+
+// Get a table of currently registered devices.
+
+procedure GetRegistered*(table: pointer to DeviceTable)
+  var
+    i: int32
+begin
+  if num # 0 then
+    newgc(table^, num)
+    for i := 0 to num - 1 do
+      table^[i] := dev[i]
+    end
+  else
+    table^ := nil
+  end
+end GetRegistered
+
+(*
+Partition table starts at 01BEH in partition table sector and consists of 4 records of the type:
+
+00  bootind: Types.Byte;
+01  head: Types.Byte;
+02  sectorcyl: Types.Byte;
+03  cyl: Types.Byte;
+04  type: Types.Byte;
+05  head2: Types.Byte;
+06  sector2cyl: Types.Byte;
+07  cyl2: Types.Byte;
+08  start: Types.DWord;
+12  num: Types.DWord
+
+References:
+MSKB Q69912 MS-DOS Partitioning Summary
+MSKB Q51978 Order in Which MS-DOS and Windows 95 Assigns Drive Letters
+MSKB Q151414 Windows 95 Partition Types Not Recognized by Windows NT
+MSKB Q93373 Default Drive Letters and Partitions in Windows NT
+*)
+
+procedure Resize(p: pointer to PartitionTable; plen: pointer to int32; n: int32)
+  var
+    old: PartitionTable
+    i, len_: int32
+begin
+  if plen^ >= n then
+    return
+  end
+  len_ := plen^
+  while len_ < n do
+    len_ := 2 * len_
+  end
+  old := p^
+  newgc(p^, len_)
+  for i := 0 to plen^ - 1 do
+    p^[i] := old[i]
+  end
+  plen^ := len_
+end Resize
+
+procedure Get4(b: pointer to array of char; i: int32): int32
+begin
+  return val(int32, ord(b[i])) + val(int32, ord(b[i + 1])) * 100H +
+         val(int32, ord(b[i + 2])) * 10000H + val(int32, ord(b[i + 3])) * 1000000H
+end Get4
+
+procedure Extended(type_: int32): boolean
+begin
+  return (type_ = 5) or (type_ = 15)
+end Extended
+
+(*
+PROCEDURE ValidFlag(f: CHAR): BOOLEAN;
+BEGIN
+(* to do: this fails with some tables generated by some partitioning tools (e.g. efdisk) *)
+RETURN (f = 0X) OR (f = 80X) OR (f = 81X)
+END ValidFlag;
+*)
+
+// Read primary partition table entries into p
+
+procedure ReadPrimary(dev: Device; devsize: int32; p: pointer to PartitionTable; plen, n, res: pointer to int32; valid: pointer to boolean)
+  var
+    b: DiskBlock
+    e, size_, i: int32
+begin
+  n^ := 0
+  dev.transfer(dev, Read, 0, 1, @b, 512 (* BS *), 0, res)
+  if (res^ = Ok) & (b[510] = "U") & (b[511] = 0AAX) then
+    // signature ok
+    // valid := ~((b[21] = 0F0X) & (b[24] = CHR(18)) & (b[26] = CHR(2)));
+    // this check must determine if the drive contains a valid partition table (is not a floppy)
+    // valid := ValidFlag(b[01BEH]) & ValidFlag(b[01BEH+16]) & ValidFlag(b[01BEH+32]) & ValidFlag(b[01BEH+48]);
+    valid^ := true
+    for i := 0 to 3 do
+      e := 446 + 16 * i
+      size_ := Get4(@b, e + 12)
+      if (b[e + 4] # 0X) & (size_ # 0) then
+        // non-empty partition
+        Resize(p, plen, n^ + 1)
+        p^[n^].type_ := val(int32, ord(b[e + 4]))
+        p^[n^].start := Get4(@b, e + 8)
+        p^[n^].size_ := size_
+        p^[n^].flags := {Valid,Primary}
+        if b[e] # 0X then
+          p^[n^].flags := p^[n^].flags + {Boot}
+        end
+        p^[n^].ptblock := 0
+        p^[n^].ptoffset := e
+        valid^ := valid^ & (p^[n^].start >= 0) & (p^[n^].start < devsize) & (size_ > 0) & (p^[n^].start + size_ <= devsize)
+        inc(n^)
+      end
+    end
+
+    if ~valid^ then
+      n^ := 0
+    end
+  else
+    if Trace then
+      Kernel.WriteString("Disks: ReadPrimary = ")
+      Kernel.WriteInt(res^, 1)
+      Kernel.WriteString(" on ")
+      Kernel.WriteString(@dev.name)
+      Kernel.WriteLn()
+    end
+  end
+end ReadPrimary
+
+// Read "logical drive" partitions into p
+
+procedure ReadLogical(dev: Device; first: int32; p: pointer to PartitionTable; plen, n, res: pointer to int32)
+  var
+    b: DiskBlock
+    e, sec, size_, i: int32
+    found: boolean
+begin
+  sec := first
+  repeat
+    found := false
+    dev.transfer(dev, Read, sec, 1, @b, 512 (* BS *), 0, res)
+    if (res^ = Ok) & (b[510] = "U") & (b[511] = 0AAX) then
+      for i := 0 to 3 do
+        // look for partition entry (max one expected)
+        e := 446 + 16 * i
+        size_ := Get4(@b, e + 12)
+        if (b[e + 4] # 0X) & ~Extended(val(int32, ord(b[e + 4]))) & (size_ # 0) then
+          Resize(p, plen, n^ + 1)
+          p^[n^].type_ := val(int32, ord(b[e + 4]))
+          p^[n^].start := sec + Get4(@b, e + 8)
+          p^[n^].size_ := size_
+          p^[n^].flags := {Valid}
+          if b[e] # 0X then
+            p^[n^].flags := p^[n^].flags + {Boot}
+          end
+          p^[n^].ptblock := sec
+          p^[n^].ptoffset := e
+          inc(n^)
+        end
+      end
+
+      i := 0
+      while (i # 4) & ~found do
+        // look for nested extended entry (max one expected)
+        e := 446 + 16 * i
+        size_ := Get4(@b, e + 12)
+        if Extended(val(int32, ord(b[e + 4]))) & (size_ # 0) then
+          // found
+          sec := first + Get4(@b, e + 8)
+          i := 4
+          found := true
+        else
+          inc(i)
+        end
+      end
+
+    else
+      if Trace then
+        Kernel.WriteString("Disks: ReadLogical = ")
+        Kernel.WriteInt(res^, 1)
+        Kernel.WriteString(" on ")
+        Kernel.WriteString(@dev.name)
+        Kernel.WriteString(" sector ")
+        Kernel.WriteInt(sec, 1)
+        Kernel.WriteLn()
+      end
+    end
+  until ~found
+end ReadLogical
+
+(** Read a PC-format partition table starting at block 0 and initialize dev.table. dev.table[0] is a virtual
+partition spanning the entire device, with type = 256. If the device has been opened before, do nothing and
+return DeviceInUse, otherwise return Ok. On any other error dev.table is set NIL. *)
+
+procedure UpdatePartitionTable*(dev: Device; res: pointer to int32)
+  var
+    p, t: PartitionTable
+    i, pn, tn, pl, tl, size_: int32
+    valid: boolean
+begin
+  if dev.openCount = 0 then
+    tn := 0
+    res^ := Ok
+    dev.table := nil
+    dev.tableLen := 0
+    dev.getSize(dev, @size_, res)
+    if (res^ = Ok) & (dev.blockSize = BS) then
+      newgc(p, 4)
+      pl := 4
+      newgc(t, 8)
+      tl := 8
+      ReadPrimary(dev, size_, @p, @pl, @pn, res, @valid)
+      i := 0
+      while valid & (i # pn) & (res^ = Ok) do
+        Resize(@t, @tl, tn + 1)
+        t[tn] := p[i]
+        inc(tn)
+        if Extended(p[i].type_) then
+          ReadLogical(dev, p[i].start, @t, @tl, @tn, res)
+        end
+
+        inc(i)
+      end
+    end
+
+    if res^ = Ok then
+      newgc(dev.table, tn + 1)
+      dev.tableLen := tn + 1
+      dev.table[0].type_ := 256
+      if valid then
+        dev.table[0].flags := {Valid}
+      else
+        dev.table[0].flags := {}
+      end
+      dev.table[0].start := 0
+      dev.table[0].size_ := size_
+      for i := 1 to tn do
+        dev.table[i] := t[i - 1]
+      end
+    end
+
+  else
+    res^ := DeviceInUse // could not update partition table
+  end
+end UpdatePartitionTable
+
+(** Open the device and increment its open count if successful. If the device is opened for the first time,
+lock it and update its partition table. *)
+procedure Open*(dev: Device; res: pointer to int32)
+  var
+    lockMsg: LockMsg
+    unlockMsg: UnlockMsg
+    ignore: int32
+begin
+  res^ := Ok
+  if dev.openCount = 0 then
+    dev.handle(dev, @lockMsg, res)
+    if res^ = Unsupported then
+      res^ := Ok
+    end
+    if res^ = Ok then
+      UpdatePartitionTable(dev, res)
+      if res^ # Ok then
+        dev.handle(dev, @unlockMsg, @ignore)
+      end
+    end
+  end
+
+  if res^ = Ok then
+    inc(dev.openCount)
+  end
+end Open
+
+// Close the device and decrement its open count. Unlock it if the open count has reached 0.
+procedure Close*(dev: Device; res: pointer to int32)
+  var
+    unlockMsg: UnlockMsg
+begin
+  res^ := Ok
+  if dev.openCount > 0 then
+    dec(dev.openCount)
+    if dev.openCount = 0 then
+      dev.handle(dev, @unlockMsg, res)
+      if res^ = Unsupported then
+        res^ := Ok
+      end
+      dev.table := nil
+    end
+
+  else
+    if Trace then
+      Kernel.WriteString("Disks: Device ")
+      Kernel.WriteString(@dev.name)
+      Kernel.WriteString(" not open")
+      Kernel.WriteLn()
+    end
+  end
+end Close
+
+// Mount the specified partition, if not already mounted.
+procedure Mount*(dev: Device; part: int32; res: pointer to int32)
+begin
+  if dev.table # nil then
+    if ~(Mounted in dev.table[part].flags) then
+      dev.table[part].flags := dev.table[part].flags + {Mounted}
+      res^ := Ok
+    else
+      res^ := DeviceInUse
+    end
+
+  else
+    res^ := Unsupported
+  end
+end Mount
+
+// Return TRUE iff the specified partition is already mounted.
+procedure IsMounted*(dev: Device; part: int32): boolean
+begin
+  return (dev.table # nil) & (Mounted in dev.table[part].flags)
+end IsMounted
+
+// Unmount the specified partition.
+procedure Unmount*(dev: Device; part: int32)
+begin
+  if (dev.table # nil) & (Mounted in dev.table[part].flags) then
+    dev.table[part].flags := dev.table[part].flags - {Mounted}
+  end
+end Unmount
+
+// Clean up the installed devices.
+procedure Cleanup()
+  var
+    dev: DeviceTable
+    i, res: int32
+    msg: ShutdownMsg
+begin
+  GetRegistered(@dev)
+  if dev # nil then
+    for i := 0 to num - 1 do
+      dev[i].handle(dev[i], @msg, @res) // ignore res
+    end
+  end
+end Cleanup
+
+begin
+  Modules.Register("Disks", nil)
+  num := 0
+  newgc(dev, 4)
+  devLen := 4
+  Kernel.InstallTermHandler(Cleanup)
+end Disks.

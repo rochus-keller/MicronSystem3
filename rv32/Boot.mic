@@ -1,0 +1,10 @@
+module Boot [level=5] // mounts the boot volumes of the statically linked system
+
+// The volumes are mounted here, before the first module above the file system runs
+
+import Modules, SDDisks, OFSDiskVolumes, OFSAosFiles, OFSBoot
+
+begin
+  Modules.Register("Boot", nil)
+  OFSBoot.OpenVolumes()
+end Boot.

@@ -1,0 +1,126 @@
+module SDDisks [level=5]
+
+// New module, uses the SD card of the rv32vm emulator as a disks device via SPI
+
+import Kernel, Disks, Modules
+
+const
+  Header = "SDDisks: "
+  BS = 512 // the block size of the card
+
+type
+  Device = pointer to DeviceDesc
+
+  DeviceDesc = object (Disks.DeviceDesc)
+    offset: int32 // first block of the device on the card
+    cardSize: int32 // size of the device in blocks
+  end
+
+var
+  dev0: Device
+
+procedure Transfer(d: Disks.Device; op, block, num: int32; data: pointer to array of char;
+                   data_len: int32; ofs: int32; res: pointer to int32)
+  var
+    sd: Device
+    i: int32
+    p: Kernel.AnyPtr
+begin
+  sd := d(Device)
+  if (block < 0) or (num < 0) or (block + num > sd.cardSize) then
+    res^ := Disks.Unsupported
+    return
+  end
+  if ofs + num * BS > data_len then
+    res^ := Disks.Unsupported
+    return
+  end
+  p := cast(Kernel.AnyPtr, @data[ofs])
+  i := 0
+  while i < num do
+    if op = Disks.Read then
+      Kernel.ReadBlock(sd.offset + block + i, p)
+    elsif op = Disks.Write then
+      Kernel.WriteBlock(sd.offset + block + i, p)
+    else
+      res^ := Disks.Unsupported
+      return
+    end
+    inc(p, BS)
+    inc(i)
+  end
+  res^ := Disks.Ok
+end Transfer
+
+procedure GetSize(d: Disks.Device; size_, res: pointer to int32)
+  var
+    sd: Device
+begin
+  sd := d(Device)
+  size_^ := sd.cardSize
+  res^ := Disks.Ok
+end GetSize
+
+procedure Handle(d: Disks.Device; msg: pointer to Disks.Message; res: pointer to int32)
+begin
+  res^ := Disks.Unsupported
+end Handle
+
+procedure lba(const mbr: pointer to array of char; ofs: int32): int32
+begin
+  return val(int32, ord(mbr[ofs])) + val(int32, ord(mbr[ofs + 1])) * 100H +
+         val(int32, ord(mbr[ofs + 2])) * 10000H + val(int32, ord(mbr[ofs + 3])) * 1000000H
+end lba
+
+procedure DetectPartition(sd: Device)
+  // the Aos partition of the master boot record, if there is one
+  var
+    mbr: array 512 of char
+    i, o, type_: int32
+begin
+  sd.offset := 0
+  Kernel.ReadBlock(0, cast(Kernel.AnyPtr, @mbr[0]))
+  if (ord(mbr[510]) # 55H) or (ord(mbr[511]) # 0AAH) then
+    Kernel.WriteString(Header) Kernel.WriteString("no MBR, using the whole card") Kernel.WriteLn()
+    return
+  end
+  for i := 0 to 3 do
+    o := 446 + i * 16
+    type_ := val(int32, ord(mbr[o + 4]))
+    if (type_ # 0) & (type_ # 1) & (type_ # 4) & (type_ # 6) & (type_ # 0BH) &
+       (type_ # 0CH) & (type_ # 0EH) & (type_ # 0EEH) then
+      sd.offset := lba(@mbr, o + 8)
+      sd.cardSize := lba(@mbr, o + 12)
+      if sd.offset > 0 then
+        Kernel.WriteString(Header) Kernel.WriteString("Aos partition at ")
+        Kernel.WriteInt(sd.offset, 1) Kernel.WriteString(", ") Kernel.WriteInt(sd.cardSize, 1)
+        Kernel.WriteString(" blocks") Kernel.WriteLn()
+        return
+      end
+    end
+  end
+  Kernel.WriteString(Header) Kernel.WriteString("no Aos partition, using the whole card")
+  Kernel.WriteLn()
+end DetectPartition
+
+procedure Init()
+begin
+  newgc(dev0)
+  Disks.InitDevice(dev0, "SD0")
+  copy(@dev0.desc, "rv32vm SPI SD card", 64)
+  dev0.blockSize := BS
+  dev0.flags := {}
+  dev0.offset := 0
+  dev0.cardSize := 262144 // 128 MB in blocks; the emulator does not report a size
+  dev0.transfer := Transfer
+  dev0.getSize := GetSize
+  dev0.handle := Handle
+  DetectPartition(dev0)
+  Disks.Register(dev0)
+  Kernel.WriteString(Header) Kernel.WriteString("SD0 registered") Kernel.WriteLn()
+end Init
+
+begin
+  Modules.Register("SDDisks", nil)
+  Init()
+end SDDisks.

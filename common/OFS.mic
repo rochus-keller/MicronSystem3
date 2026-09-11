@@ -1,0 +1,850 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module OFS [level=5]
+
+import Kernel, Modules
+// non-portable
+// pjm/bsm/be
+
+// Oberon file system base - Support for file system and volume implementations.
+
+const
+  ReadOnly* = 0 // Volume property flags
+  Removable* = 1
+  Boot* = 2
+
+  // Enumerate flags supported by OFS.
+  EnumSize* = 0 // enable size parameter of EntryHandler.
+  EnumTime* = 1 // enable time and data parameters of EntryHandler.
+  EnumRecursive* = 2 // enumerate recursively into subdirectories.
+  EnumStop* = 15 // stop enumeration (can be set in EntryHandler).
+  EnumUserMin* = 16 // flags from EnumUserMin..EnumUserMax can be used by OFS clients.
+  EnumUserMax* = 31
+
+  // return values for a FileSystem's handler procedure
+  Ok* = 0
+  Unsupported* = -1
+
+  Reserved = 32 // Blocks reserved for system on Boot volumes
+
+  PreLength = 16i1
+  LocalLength = 128i2
+  FileNameLength = PreLength + LocalLength
+
+  Trace = false
+
+// All record fields are read-only for users, and read-write for extenders.
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  Address* = int32 // Volume block address [1..size]
+
+  // Volume is the base type of all volumes.  It provides operations on an abstract array of file system data blocks 
+  // of blockSize bytes, numbered from 1 to size.
+
+  Volume* = pointer to VolumeDesc
+  AllocProc* = procedure(vol: Volume; hint: int32; adr: pointer to int32)
+  FreeMarkProc* = procedure(vol: Volume; adr: int32)
+  MarkedProc* = procedure(vol: Volume; adr: int32): boolean
+  AvailableProc* = procedure(vol: Volume): int32
+  GetPutProc* = procedure(vol: Volume; adr: int32; blk: pointer to array of byte; blk_len: int32)
+  FinalizeVolProc* = procedure(vol: Volume)
+  SyncProc* = procedure(vol: Volume)
+
+  // Block allocation table
+  // used blocks
+
+  // descriptive name - e.g. for matching with Partitions.Show
+  // block size in bytes
+  // size in blocks
+  // ReadOnly, Removable, Boot
+
+  Prefix* = array 16 (* PreLength *) of char
+  LocalName* = array 128 (* LocalLength *) of char
+  FileName* = array 144 (* FileNameLength *) of char
+
+  FileSystem* = pointer to FileSystemDesc
+  File* = pointer to FileDesc
+  Hint* = pointer to HintDesc
+
+  Rider* = record
+    eof*: boolean // has end of file been passed
+    res*: int32 // leftover byte count for ReadBytes/WriteBytes
+    // private fields for implementors
+    apos*, bpos*: int32
+    hint*: Hint
+    file*: File
+    fs*: FileSystem
+  end
+
+  FileDesc* = object
+    next: File // list of all files, for garbage collection
+    // private fields for implementors
+    key*: int32 // unique id for registered file, never 0
+    fs*: FileSystem // file system containing file
+  end
+
+  EntryHandler* = procedure(const name: pointer to array of char; time: int32; date: int32; size_: int32; flags: pointer to set)
+
+  FileKeyProc* = procedure(fs: FileSystem; const name: pointer to array of char): int32
+  NewOldProc* = procedure(fs: FileSystem; const name: pointer to array of char): File
+  DeleteProc* = procedure(fs: FileSystem; const name: pointer to array of char; key: pointer to int32; res: pointer to int16)
+  RenameProc* = procedure(fs: FileSystem; const old: pointer to array of char; const new_: pointer to array of char; res: pointer to int16)
+  EnumerateProc* = procedure(fs: FileSystem; const mask: pointer to array of char; flags: pointer to set; handler: EntryHandler)
+  CloseProc* = procedure(f: File)
+  RegisterProc* = procedure(f: File; res: pointer to int16)
+  LengthProc* = procedure(f: File): int32
+  GetDateProc* = procedure(f: File; t: pointer to int32; d: pointer to int32)
+  SetDateProc* = procedure(f: File; t: int32; d: int32)
+  GetNameProc* = procedure(f: File; name: pointer to array of char; name_len: int32)
+  SetProc* = procedure(r: pointer to Rider; f: File; pos: int32)
+  PosProc* = procedure(r: pointer to Rider): int32
+  ReadProc* = procedure(r: pointer to Rider; x: pointer to byte)
+  WriteProc* = procedure(r: pointer to Rider; x: byte)
+  ReadWriteBytesProc* = procedure(r: pointer to Rider; x: pointer to array of byte; x_len: int32; n: int32)
+  FinalizeFSProc* = procedure(fs: FileSystem)
+  PurgeProc* = procedure(fs: FileSystem; f: File)
+  RegisteredProc* = procedure(fs: FileSystem; f: File): boolean
+
+  Message* = record
+  end
+  HandleProc* = procedure(fs: FileSystem; msg: pointer to Message; res: pointer to int32)
+
+  FileSystemDesc* = object
+    next: FileSystem // file system search path
+    link: FileSystem // list of mounted file systems
+    prefix*: Prefix // mount prefix
+    desc*: array 32 of char // description of file system
+    vol*: Volume // underlying volume, if any (a boot FS must have a volume)
+    FileKey*: FileKeyProc
+    New*, Old*: NewOldProc
+    Delete*: DeleteProc
+    Rename*: RenameProc
+    Enumerate*: EnumerateProc
+    Close*: CloseProc
+    Register*: RegisterProc
+    Length*: LengthProc
+    GetDate*: GetDateProc
+    SetDate*: SetDateProc
+    GetName*: GetNameProc
+    Set*: SetProc
+    Pos*: PosProc
+    Read*: ReadProc
+    Write*: WriteProc
+    ReadBytes*, WriteBytes*: ReadWriteBytesProc
+    Finalize*: FinalizeFSProc
+    Handle*: HandleProc
+    Purge*: PurgeProc
+    Registered*: RegisteredProc
+  end
+
+  HintDesc* = object
+  end
+
+  VolumeDesc* = object
+    map: pointer to array of set
+    used: int32
+
+    name*: array 32 of char
+    blockSize*, size_*: int32
+
+    flags*: set
+
+    AllocBlock*: AllocProc
+    FreeBlock*, MarkBlock*: FreeMarkProc
+    Marked*: MarkedProc
+    Available*: AvailableProc
+    GetBlock*, PutBlock*: GetPutProc
+    Finalize*: FinalizeVolProc
+    Sync*: SyncProc
+  end
+
+var
+  par: array 256 of char // Parameters for volume generators
+  pos: int32 // Read position within Par
+  NewVol*: Volume // Result of volume generators
+
+  fsroot: FileSystem // file system search path root
+  fsmount: FileSystem // list of known file systems
+  froot: File // list of known files, with dummy head
+
+// Predefined volume methods (need not be used).
+
+procedure AllocBlock*(vol: Volume; hint: int32; adr: pointer to int32)
+begin
+  if ReadOnly in vol.flags then
+    halt(21)
+  end
+  if (Boot in vol.flags) & (vol.size_ - vol.used <= Reserved) then
+    halt(20)
+  end
+  assert(hint >= 0)
+  if hint > vol.size_ then
+    hint := 0
+  end
+  adr^ := hint + 1
+  loop
+    if adr^ > vol.size_ then
+      adr^ := 0
+    end
+    if band(adr^, 31) in vol.map[asr(adr^, 5)] then
+      inc(adr^) // Block in use
+    else
+      vol.map[asr(adr^, 5)] := vol.map[asr(adr^, 5)] + {band(adr^, 31)}
+      exit
+    end
+
+    if adr^ = hint then
+      halt(20)
+    end
+  end
+
+  inc(vol.used)
+end AllocBlock
+
+procedure FreeBlock*(vol: Volume; adr: int32)
+begin
+  if (adr < 1) or (adr > vol.size_) then
+    halt(15)
+  end
+  if ReadOnly in vol.flags then
+    halt(21)
+  end
+  vol.map[asr(adr, 5)] := vol.map[asr(adr, 5)] - {band(adr, 31)}
+  dec(vol.used)
+end FreeBlock
+
+procedure MarkBlock*(vol: Volume; adr: int32)
+begin
+  if (adr < 1) or (adr > vol.size_) then
+    halt(15)
+  end
+  if ReadOnly in vol.flags then
+    halt(21)
+  end
+  vol.map[asr(adr, 5)] := vol.map[asr(adr, 5)] + {band(adr, 31)}
+  inc(vol.used)
+end MarkBlock
+
+procedure Marked*(vol: Volume; adr: int32): boolean
+begin
+  if (adr < 1) or (adr > vol.size_) then
+    halt(15)
+  end
+  if ReadOnly in vol.flags then
+    halt(21)
+  end
+  return band(adr, 31) in vol.map[asr(adr, 5)]
+end Marked
+
+procedure Available*(vol: Volume): int32
+begin
+  return vol.size_ - vol.used
+end Available
+
+procedure Sync*(vol: Volume)
+begin
+end Sync
+
+// Init procedure for private data of above methods only.  vol.flags and vol.size must be set before.
+procedure InitVol*(vol: Volume)
+  var
+    maplen: int32
+begin
+  if ~(ReadOnly in vol.flags) then
+    maplen := asr(vol.size_ + 1 + 31, 5)
+    newgc(vol.map, maplen)
+    while maplen > 0 do
+      dec(maplen)
+      vol.map[maplen] := {}
+    end
+    vol.map[0] := vol.map[0] + {0} // reserve sector 0 (illegal to use)
+    vol.used := 0
+  else
+    vol.used := vol.size_
+  end
+end InitVol
+
+// Finalize procedure for volumes.
+procedure FinalizeVol*(vol: Volume)
+begin
+  vol.map := nil
+  vol.AllocBlock := nil
+  vol.FreeBlock := nil
+  vol.MarkBlock := nil
+  vol.Marked := nil
+  vol.Available := nil
+  vol.GetBlock := nil
+  vol.PutBlock := nil
+  vol.Sync := nil
+  vol.Finalize := nil
+end FinalizeVol
+
+// Command parameter support
+
+// Set parameter string for a volume generator
+procedure SetPar*(const str: pointer to array of char)
+begin
+  copy(@par, str, 256)
+  pos := 0
+end SetPar
+
+// Read next character of parameter string. At the end (ch = 0X) the string is cleared
+procedure ReadPar*(ch: pointer to char)
+begin
+  ch^ := par[pos]
+  if ch^ = 0X then
+    pos := 0
+    par[0] := 0X
+  else
+    inc(pos)
+  end
+end ReadPar
+
+// File name prefix support.
+
+// Split fullname = ( prefix ":" name ) into prefix and name
+procedure SplitName*(const fullname: pointer to array of char; prefix: pointer to array of char; prefix_len: int32; 
+                          name: pointer to array of char; name_len: int32)
+  var
+    i, j: int32
+begin
+  i := 0
+  while (fullname[i] # ":") & (fullname[i] # 0X) do
+    inc(i)
+  end
+  if (fullname[i] # ":") or (i >= prefix_len) then
+    copy(prefix, "", prefix_len)
+    copy(name, fullname, name_len)
+  else
+    j := 0
+    while j # i do
+      prefix[j] := fullname[j]
+      inc(j)
+    end
+    prefix[j] := 0X
+    j := 0
+    repeat
+      inc(i)
+      name[j] := fullname[i]
+      inc(j)
+    until fullname[i] = 0X
+  end
+end SplitName
+
+// Join prefix and name to fullname = ( prefix ":" name )
+procedure JoinName*(const prefix, name: pointer to array of char; fullname: pointer to array of char)
+  var
+    i, j: int32
+begin
+  i := 0
+  while prefix[i] # 0X do
+    fullname[i] := prefix[i]
+    inc(i)
+  end
+  fullname[i] := ":"
+  inc(i)
+  j := 0
+  while name[j] # 0X do
+    fullname[i] := name[j]
+    inc(i)
+    inc(j)
+  end
+  fullname[i] := 0X
+end JoinName
+
+// File system list support.
+
+procedure WriteFS(fs: FileSystem)
+begin
+  if Trace then
+    if fs.vol # nil then
+      Kernel.WriteString(@fs.vol.name)
+      Kernel.WriteChar(" ")
+    end
+    Kernel.WriteString(@fs.desc)
+  end
+end WriteFS
+
+// Add file system at end of list, with specified prefix, which must be unique.
+procedure Add*(fs: FileSystem; const prefix: pointer to array of char)
+  var
+    p, c: FileSystem
+begin
+  if Trace then
+    Kernel.WriteString("OFS: Adding ")
+    WriteFS(fs)
+    Kernel.WriteLn()
+  end
+
+  copy(@fs.prefix, prefix, 16 (* PreLength *))
+  p := nil
+  c := fsroot
+  while c # nil do
+    assert((c # fs) & (c.prefix # fs.prefix)) // duplicate insertion not allowed
+    p := c
+    c := c.next
+  end
+
+  if p = nil then
+    fsroot := fs
+  else
+    p.next := fs
+  end
+  fs.next := nil
+  fs.link := fsmount // push on mount list
+  fsmount := fs
+end Add
+
+procedure DeleteFS(fs: FileSystem)
+  var
+    p, c: FileSystem
+begin
+  p := nil
+  c := fsroot
+  while c # fs do
+    p := c // fs must be in list
+    c := c.next
+  end
+  if p = nil then
+    fsroot := c.next
+  else
+    p.next := c.next
+  end
+  c.next := nil
+end DeleteFS
+
+// Promote fs to the start of the list.
+procedure Promote*(fs: FileSystem)
+begin
+  DeleteFS(fs)
+  fs.next := fsroot
+  fsroot := fs
+end Promote
+
+// Remove the file system and finalize it.
+procedure Remove*(fs: FileSystem)
+  var
+    f: File
+    count: int32
+    p, c: FileSystem
+begin
+  if Trace then
+    Kernel.WriteString("OFS: Removing ")
+    WriteFS(fs)
+    Kernel.WriteLn()
+  end
+
+  f := froot.next
+  count := 0
+  while f # nil do
+    if f.fs = fs then
+      inc(count)
+      fs.Close(f)
+      f.fs := nil
+    end
+    f := f.next
+  end
+
+  if count # 0 then
+    Kernel.WriteString("OFS: ")
+    Kernel.WriteInt(count, 1)
+    Kernel.WriteString(" open files")
+    if fs.vol # nil then
+      Kernel.WriteString(" on ")
+      Kernel.WriteString(@fs.vol.name)
+    end
+
+    Kernel.WriteLn()
+  end
+
+  fs.Finalize(fs)
+  DeleteFS(fs)
+  p := nil
+  c := fsmount
+  while c # fs do
+    p := c
+    c := c.link
+  end
+  if p = nil then
+    fsmount := c.link
+  else
+    p.link := c.link
+  end
+  c.link := nil
+end Remove
+
+// Find file system with specified prefix.
+procedure This*(const prefix: pointer to array of char): FileSystem
+  var
+    fs: FileSystem
+begin
+  fs := fsroot
+  while (fs # nil) & (fs.prefix # prefix^) do
+    fs := fs.next
+  end
+  return fs
+end This
+
+// Return first file system.
+procedure First*(): FileSystem
+begin
+  return fsroot
+end First
+
+// Return next file system.
+procedure Next*(fs: FileSystem): FileSystem
+begin
+  return fs.next
+end Next
+
+// File system auxillary procedures.
+
+procedure Collect(f: AnyPtr)
+begin
+   (* TODO o2m: the type test of the untyped pointer is not possible in Micron; Oberon: WITH f: File DO *)
+  if (cast(File, f).fs # nil) & (cast(File, f).fs.Registered # nil) & (cast(File, f).fs.vol # nil) then
+    if ~(ReadOnly in cast(File, f).fs.vol.flags) then
+      if ~cast(File, f).fs.Registered(cast(File, f).fs, cast(File, f)) then
+        cast(File, f).fs.Purge(cast(File, f).fs, cast(File, f))
+      end
+    end
+  end
+
+end Collect
+
+procedure FileCleanup(f: AnyPtr)
+  var
+    p, c: File
+begin
+   (* TODO o2m: the type test of the untyped pointer is not possible in Micron; Oberon: WITH f: File DO *)
+  if Trace then
+    Kernel.WriteString("OFS: Cleanup ")
+    Kernel.WriteInt(cast(File, f).key, 1)
+    Kernel.WriteChar(" ")
+    WriteFS(cast(File, f).fs)
+    Kernel.WriteLn()
+  end
+
+  p := froot
+  c := froot.next
+  while c # nil do
+    if c = cast(File, f) then
+      p.next := c.next
+    else
+      p := c
+    end
+    c := c.next
+  end
+
+end FileCleanup
+
+// Find file in open file list, or open and add it.
+procedure Open(fs: FileSystem; fname: pointer to array of char): File
+  var
+    f: File
+    key: int32
+begin
+  f := nil
+  if (fs # nil) & (fname^ # "") then
+    key := fs.FileKey(fs, fname)
+    if key # 0 then
+      f := froot.next
+      while (f # nil) & ((f.fs # fs) or (f.key # key)) do
+        f := f.next
+      end
+    end
+
+    if f = nil then
+      f := fs.Old(fs, fname)
+      if f # nil then
+        assert(f.key # 0) // key must be set
+        f.next := froot.next
+        froot.next := f
+        Kernel.RegisterObject(cast(AnyPtr, f), Collect, false)
+        Kernel.RegisterObject(cast(AnyPtr, f), FileCleanup, false)
+      end
+    end
+  end
+
+  return f
+end Open
+
+// Open an existing file, searching through the mounted file system list if no prefix is specified.
+procedure Old*(name: pointer to array of char): File
+  var
+    fs: FileSystem
+    f: File
+    prefix: Prefix
+    fname: LocalName
+begin
+  f := nil
+  SplitName(name, @prefix, 16 (* PreLength *), @fname, 128 (* LocalLength *))
+  if prefix = "" then
+    fs := First()
+    while (fs # nil) & (f = nil) do
+      f := Open(fs, @fname)
+      fs := Next(fs)
+    end
+
+  else
+    f := Open(This(@prefix), @fname)
+  end
+
+  return f
+end Old
+
+// Create a new file.  If no prefix is specified, create the file on the first file system in the mounted list.
+procedure New*(name: pointer to array of char): File
+  var
+    fs: FileSystem
+    f: File
+    prefix: Prefix
+    fname: LocalName
+begin
+  f := nil
+  SplitName(name, @prefix, 16 (* PreLength *), @fname, 128 (* LocalLength *))
+  if prefix = "" then
+    fs := First() // use default file system
+    if fname = "" then
+      // anonymous file on unspecified file system
+      while (fs # nil) & ((fs.vol = nil) or (fs.vol.flags * {Boot,ReadOnly} # {Boot})) do
+        fs := Next(fs) // find a writable boot file system
+      end
+
+      if fs = nil then
+        fs := First() // none found, relapse to default
+      end
+    end
+
+  else
+    fs := This(@prefix)
+  end
+
+  if fs # nil then
+    if (fs.vol = nil) or ~(ReadOnly in fs.vol.flags) then
+      f := fs.New(fs, @fname)
+      if f # nil then
+        Kernel.RegisterObject(cast(AnyPtr, f), Collect, false)
+      end
+    end
+  end
+
+  return f
+end New
+
+// Delete a file. res = 0 indicates success.
+procedure Delete*(name: pointer to array of char; res: pointer to int16)
+  var
+    fs: FileSystem
+    p, c: File
+    key: int32
+    prefix: Prefix
+    fname: LocalName
+begin
+  SplitName(name, @prefix, 16 (* PreLength *), @fname, 128 (* LocalLength *))
+  if prefix = "" then
+    fs := First()
+  else
+    fs := This(@prefix)
+  end
+  if fs # nil then
+    if (fs.vol = nil) or ~(ReadOnly in fs.vol.flags) then
+      fs.Delete(fs, @fname, @key, res)
+      if key # 0 then
+        p := froot
+        c := froot.next
+        while c # nil do
+          if (c.fs = fs) & (c.key = key) then
+            p.next := c.next
+          else
+            p := c
+          end
+          c := c.next
+        end
+      end
+    else
+      res^ := 3 // can not modify read-only volume
+    end
+  else
+    res^ := 2 // file system not found
+  end
+end Delete
+
+// Rename a file. res = 0 indicates success.
+procedure Rename*(old, new_: pointer to array of char; res: pointer to int16)
+  var
+    ofs, nfs: FileSystem
+    pold, pnew: Prefix
+    fold, fnew: LocalName
+begin
+  SplitName(old, @pold, 16 (* PreLength *), @fold, 128 (* LocalLength *))
+  SplitName(new_, @pnew, 16 (* PreLength *), @fnew, 128 (* LocalLength *))
+  if pold = "" then
+    ofs := First()
+  else
+    ofs := This(@pold)
+  end
+  if pnew = "" then
+    nfs := First()
+  else
+    nfs := This(@pnew)
+  end
+  if (nfs # nil) & (ofs = nfs) then
+    if (nfs.vol = nil) or ~(ReadOnly in nfs.vol.flags) then
+      nfs.Rename(nfs, @fold, @fnew, res)
+    else
+      res^ := 3 // can not modify read-only volume
+    end
+  else
+    res^ := 2
+  end
+end Rename
+
+// Register a file created with New in the directory, replacing the previous file in the directory with the same name. 
+// The file is automatically closed.
+procedure Register*(f: File)
+  var
+    res: int16
+begin
+  if f # nil then
+    f.fs.Register(f, @res)
+    if res = 0 then
+      // new file was registered
+      assert(f.key # 0)
+      f.next := froot.next
+      froot.next := f
+      Kernel.RegisterObject(cast(AnyPtr, f), FileCleanup, false)
+    else
+      if res = 1 then
+      // file was registered already
+      // skip
+      else
+        // error occured while registering
+        halt(17)
+      end
+    end
+  end
+end Register
+
+// Enumerates files matching mask by upcalling proc for every file.  If EnumSize flags is set, size parameter of proc upcall will be valid.  
+// If EnumTime is set, time and date will be valid.  All flags are passed through to the upcall in the flags parameter.
+procedure Enumerate*(mask: pointer to array of char; flags: pointer to set; proc_: EntryHandler)
+  var
+    fs: FileSystem
+    prefix: Prefix
+    fmask: LocalName
+begin
+  SplitName(mask, @prefix, 16 (* PreLength *), @fmask, 128 (* LocalLength *))
+  if prefix = "" then
+    fs := First()
+    while fs # nil do
+      flags^ := flags^ - {EnumStop}
+      fs.Enumerate(fs, @fmask, flags, proc_)
+      fs := Next(fs)
+    end
+  else
+    fs := This(@prefix)
+    if fs # nil then
+      fs.Enumerate(fs, @fmask, flags, proc_)
+    end
+  end
+end Enumerate
+
+// Find an open file.  Can also be used to see if a given file is open.  If it is not, then it is safe to purge its sectors 
+// when it is deleted or replaced (through rename).
+procedure FindOpenFile*(fs: FileSystem; key: int32): File
+  var
+    f: File
+begin
+  f := froot
+  repeat
+    f := f.next
+  until (f = nil) or (f.key = key) & (f.fs = fs)
+  return f
+end FindOpenFile
+
+// Checks if a file system has open files.
+procedure HasOpenFiles*(fs: FileSystem): boolean
+  var
+    f: File
+begin
+  f := froot
+  repeat
+    f := f.next
+  until (f = nil) or (f.fs = fs)
+  return f # nil
+end HasOpenFiles
+
+// Help procedures.
+
+// Append first string to second string, truncating on overflow.
+procedure AppendStr*(const from: pointer to array of char; to_: pointer to array of char; to_len: int32)
+  var
+    i, j, m: int32
+begin
+  j := 0
+  while to_[j] # 0X do
+    inc(j)
+  end
+  m := val(int32, val(int16, to_len) - 1)
+  i := 0
+  while (from[i] # 0X) & (j # m) do
+    to_[j] := from[i]
+    inc(i)
+    inc(j)
+  end
+  to_[j] := 0X
+end AppendStr
+
+// Append integer to string in ASCII format.
+procedure AppendInt*(x: int32; to_: pointer to array of char)
+  var
+    i, m: int32
+begin
+  i := 0
+  while to_[i] # 0X do
+    inc(i)
+  end
+  if x < 0 then
+    to_[i] := "-"
+    inc(i)
+    x := -x
+  end
+  if x # 0 then
+    m := 1000000000
+    while x < m do
+      m := obdiv(m, 10)
+    end
+    repeat
+      to_[i] := chr(48 + obmod(obdiv(x, m), 10))
+      inc(i)
+      m := obdiv(m, 10)
+    until m = 0
+  else
+    to_[i] := "0"
+    inc(i)
+  end
+
+  to_[i] := 0X
+end AppendInt
+
+// Clean up file systems when shutting down or unloading module.  File systems are cleaned up in reverse order of installation.
+procedure FSCleanup()
+begin
+  while fsmount # nil do
+    Remove(fsmount)
+  end
+end FSCleanup
+
+begin
+  Modules.Register("OFS", nil)
+  pos := 0
+  par[0] := 0X
+  fsroot := nil
+  fsmount := nil
+  newgc(froot)
+  froot.next := nil
+  Kernel.InstallTermHandler(FSCleanup)
+end OFS.

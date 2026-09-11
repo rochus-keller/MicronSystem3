@@ -1,0 +1,515 @@
+module Heaps [level=1] // heap and conservative collector
+
+// New module which keeps a contiguous heap in the area the Kernel of the target passes to Init
+
+import SYS, MIC
+
+const
+  HdrLen* = 16 // heap block header
+  SysBlk* = 2 // a block which lives as long as the system
+  GcBlk* = 3 // a block which the collector may reclaim
+  FreeBlk = -1
+  chunk = 1024 // heap chunk of the block map
+  mapLen = 16384 // block map entries; a chunk each, so they cover a heap of 16 MB
+  markLen = 1024 // marking stack; it may overflow
+  MaxFin = 1024 // registered objects
+
+type
+  AnyPtr* = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  AnyPtrPtr = pointer to AnyPtr // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int32Ptr = pointer to int32 // helper type for a variable reinterpreted by SYSTEM.VAL
+  Finalizer* = procedure(obj: AnyPtr)
+
+var
+  allocated*: int32
+  Collections*: int32
+  inGC*: boolean
+  heapOrg*: AnyPtr
+  heapLim*: int32
+
+  list0, list1, list2, list3: AnyPtr // free blocks of size n*256, 128, 64, 32
+  dataOrg: AnyPtr // start of the static data of the modules, a root area of the collector
+  stackOrg: AnyPtr
+  stackSize: int32
+  blockMap: array mapLen of int32 // offset of a block
+  markStack: array markLen of AnyPtr
+  markTop: int32
+  markOverflow: boolean
+
+  finObj: array MaxFin of AnyPtr // registered objects
+  finProc: array MaxFin of Finalizer
+  nofFin: int32
+
+procedure blkSize(p: AnyPtr): int32 inline
+  // the fields of the header of the block which begins at p
+begin
+  return cast(Int32Ptr, p)^
+end blkSize
+
+procedure blkKind(p: AnyPtr): int32 inline
+begin
+  return cast(Int32Ptr, ptroff(p, 4))^
+end blkKind
+
+procedure blkMark(p: AnyPtr): int32 inline
+  // the mark of a block; a free block keeps the link to the next one here
+begin
+  return cast(Int32Ptr, ptroff(p, 8))^
+end blkMark
+
+procedure setBlkMark(p: AnyPtr; m: int32) inline
+begin
+  cast(Int32Ptr, ptroff(p, 8))^ := m
+end setBlkMark
+
+procedure GetBlock(p: ^AnyPtr; len_: int32)
+  // len is multiple of 256
+  var q0, q1, q2: AnyPtr
+    size_: int32
+    done: boolean
+begin
+  q0 := nil
+  q1 := list0
+  done := false
+  while ~done & (q1 # nil) do
+    size_ := cast(Int32Ptr, q1)^
+    q2 := cast(AnyPtrPtr, ptroff(q1, 8))^
+    if size_ < len_ then
+      // no fit
+      q0 := q1
+      q1 := q2
+    elsif size_ = len_ then
+      // extract -> p
+      done := true
+      p^ := q1
+      if q0 # nil then
+        cast(AnyPtrPtr, ptroff(q0, 8))^ := q2
+      else
+        list0 := q2
+      end
+    else
+      // reduce size
+      done := true
+      p^ := q1
+      inc(q1, len_)
+      cast(Int32Ptr, q1)^ := size_ - len_
+      cast(Int32Ptr, ptroff(q1, 4))^ := -1
+      cast(AnyPtrPtr, ptroff(q1, 8))^ := q2
+      if q0 # nil then
+        cast(AnyPtrPtr, ptroff(q0, 8))^ := q1
+      else
+        list0 := q1
+      end
+    end
+  end
+  if ~done then
+    p^ := nil
+  end
+end GetBlock
+
+procedure GetBlock128(p: ^AnyPtr)
+  var q: AnyPtr
+begin
+  if list1 # nil then
+    p^ := list1
+    list1 := cast(AnyPtrPtr, ptroff(list1, 8))^
+  else
+    GetBlock(@q, 256)
+    if q # nil then
+      cast(Int32Ptr, ptroff(q, 128))^ := 128
+      cast(Int32Ptr, ptroff(q, 132))^ := -1
+      cast(AnyPtrPtr, ptroff(q, 136))^ := list1
+      list1 := q
+      inc(list1, 128)
+    end
+    p^ := q
+  end
+end GetBlock128
+
+procedure GetBlock64(p: ^AnyPtr)
+  var q: AnyPtr
+begin
+  if list2 # nil then
+    p^ := list2
+    list2 := cast(AnyPtrPtr, ptroff(list2, 8))^
+  else
+    GetBlock128(@q)
+    if q # nil then
+      cast(Int32Ptr, ptroff(q, 64))^ := 64
+      cast(Int32Ptr, ptroff(q, 68))^ := -1
+      cast(AnyPtrPtr, ptroff(q, 72))^ := list2
+      list2 := q
+      inc(list2, 64)
+    end
+    p^ := q
+  end
+end GetBlock64
+
+procedure GetBlock32(p: ^AnyPtr)
+  var q: AnyPtr
+begin
+  if list3 # nil then
+    p^ := list3
+    list3 := cast(AnyPtrPtr, ptroff(list3, 8))^
+  else
+    GetBlock64(@q)
+    if q # nil then
+      cast(Int32Ptr, ptroff(q, 32))^ := 32
+      cast(Int32Ptr, ptroff(q, 36))^ := -1
+      cast(AnyPtrPtr, ptroff(q, 40))^ := list3
+      list3 := q
+      inc(list3, 32)
+    end
+    p^ := q
+  end
+end GetBlock32
+
+procedure New*(ptr: ^AnyPtr; kind, len_: int32)
+  // the block carries a 16 bytes header; free blocks keep Wirth's layout
+  var p: AnyPtr
+    size_: int32
+    lim: AnyPtr
+begin
+  size_ := (len_ + HdrLen + 7) div 8 * 8
+  if size_ <= 32 then
+    size_ := 32
+    GetBlock32(@p)
+  elsif size_ <= 64 then
+    size_ := 64
+    GetBlock64(@p)
+  elsif size_ <= 128 then
+    size_ := 128
+    GetBlock128(@p)
+  else
+    size_ := (size_ + 255) div 256 * 256
+    GetBlock(@p, size_)
+  end
+  if p = nil then
+    ptr^ := nil
+  else
+    ptr^ := p
+    inc(ptr^, HdrLen)
+    cast(Int32Ptr, p)^ := size_
+    cast(Int32Ptr, ptroff(p, 4))^ := kind
+    cast(Int32Ptr, ptroff(p, 8))^ := 0
+    cast(Int32Ptr, ptroff(p, 12))^ := 0
+    lim := p
+    inc(lim, size_)
+    inc(p, HdrLen)
+    inc(allocated, size_)
+    while ord(p) < ord(lim) do
+      cast(Int32Ptr, p)^ := 0
+      inc(p, 4)
+    end
+  end
+end New
+
+// ---------- Garbage collector ----------
+
+procedure HeapSize*(): int32 inline
+  // size of the heap in bytes
+begin
+  return heapLim - val(int32, ord(heapOrg))
+end HeapSize
+
+procedure Available*(): int32 inline
+  // free heap space in bytes
+begin
+  return HeapSize() - allocated
+end Available
+
+procedure Used*(): int32 inline
+begin
+  return allocated
+end Used
+
+procedure mapBlocks()
+  // for each chunk of the heap the block which covers its first byte
+  var p: AnyPtr
+    off, lim, size_, c: int32
+begin
+  p := heapOrg
+  off := 0
+  lim := HeapSize()
+  c := 0
+  while off < lim do
+    size_ := blkSize(p)
+    while (c < mapLen) & (c * chunk < off + size_) do
+      blockMap[c] := off
+      inc(c)
+    end
+    inc(off, size_)
+    inc(p, size_)
+  end
+end mapBlocks
+
+procedure blockOf(a: AnyPtr): AnyPtr
+  // the block which contains the address a, or NIL if there is none
+  var off, size_: int32
+    p, res: AnyPtr
+begin
+  res := nil
+  off := val(int32, ord(a)) - val(int32, ord(heapOrg))
+  if (off >= HdrLen) & (val(int32, ord(a)) < heapLim) then
+    p := ptroff(heapOrg, blockMap[off div chunk])
+    size_ := blkSize(p)
+    while (size_ > 0) & (size_ mod 8 = 0) & (val(int32, ord(p)) + size_ <= val(int32, ord(a))) do
+      inc(p, size_)
+      size_ := blkSize(p) // a block whose size is no positive multiple of 8 ends the walk
+    end
+    if (size_ > 0) & (size_ mod 8 = 0) & (val(int32, ord(a)) >= val(int32, ord(p)) + HdrLen) then
+      res := p // an address in the header does not count as a reference
+    end
+  end
+  return res
+end blockOf
+
+procedure push(p: AnyPtr)
+begin
+  if markTop < markLen then
+    markStack[markTop] := p
+    inc(markTop)
+  else
+    markOverflow := true // the block waits with mark 1
+  end
+end push
+
+procedure markCandidate(a: AnyPtr)
+  // a word which addresses a block keeps it alive
+  var p: AnyPtr
+begin
+  p := blockOf(a)
+  if (p # nil) & (blkKind(p) # FreeBlk) & (blkMark(p) = 0) then
+    setBlkMark(p, 1)
+    push(p)
+  end
+end markCandidate
+
+procedure markArea(from_, lim: AnyPtr)
+  // every word of the area is a candidate
+  var p: AnyPtr
+begin
+  p := from_
+  while ord(p) < ord(lim) do
+    markCandidate(cast(AnyPtrPtr, p)^)
+    inc(p, 4)
+  end
+end markArea
+
+procedure markReachable()
+  // the transitive closure; a block waits with mark 1 and is done with mark 2
+  var p: AnyPtr
+begin
+  repeat
+    while markTop > 0 do
+      dec(markTop)
+      p := markStack[markTop]
+      setBlkMark(p, 2)
+      markArea(ptroff(p, HdrLen), ptroff(p, blkSize(p)))
+    end
+    if markOverflow then
+      // the marking stack was too small: find the blocks which still wait
+      markOverflow := false
+      p := heapOrg
+      while val(int32, ord(p)) < heapLim do
+        if (blkKind(p) # FreeBlk) & (blkMark(p) = 1) then
+          push(p)
+        end
+        inc(p, blkSize(p))
+      end
+    end
+  until (markTop = 0) & ~markOverflow
+end markReachable
+
+procedure freeArea(from_, lim: AnyPtr)
+  // the space between two live blocks becomes blocks of 32, 64, 128 and n*256 bytes
+  var q: AnyPtr
+    size_: int32
+begin
+  q := from_
+  size_ := val(int32, ord(lim)) - val(int32, ord(q))
+  if size_ mod 64 # 0 then
+    cast(Int32Ptr, q)^ := 32
+    cast(Int32Ptr, ptroff(q, 4))^ := FreeBlk
+    cast(AnyPtrPtr, ptroff(q, 8))^ := list3
+    list3 := q
+    inc(q, 32)
+    dec(size_, 32)
+  end
+  if size_ mod 128 # 0 then
+    cast(Int32Ptr, q)^ := 64
+    cast(Int32Ptr, ptroff(q, 4))^ := FreeBlk
+    cast(AnyPtrPtr, ptroff(q, 8))^ := list2
+    list2 := q
+    inc(q, 64)
+    dec(size_, 64)
+  end
+  if size_ mod 256 # 0 then
+    cast(Int32Ptr, q)^ := 128
+    cast(Int32Ptr, ptroff(q, 4))^ := FreeBlk
+    cast(AnyPtrPtr, ptroff(q, 8))^ := list1
+    list1 := q
+    inc(q, 128)
+    dec(size_, 128)
+  end
+  if size_ > 0 then
+    cast(Int32Ptr, q)^ := size_
+    cast(Int32Ptr, ptroff(q, 4))^ := FreeBlk
+    cast(AnyPtrPtr, ptroff(q, 8))^ := list0
+    list0 := q
+  end
+end freeArea
+
+procedure GC*()
+  // a conservative mark and sweep over the whole heap
+  var p, run, lim: AnyPtr
+    size_: int32
+    free: boolean
+    regs: array SYS.NofRegs of uint32 // the registers of the callers saved by SYS.spillRegs
+begin
+  inc(Collections)
+  inGC := true
+  SYS.spillRegs(@regs) // a pointer may be in a register
+  mapBlocks()
+  markTop := 0
+  markOverflow := false
+  markArea(cast(AnyPtr, @regs[0]), cast(AnyPtr, ptroff(@regs[0], SYS.NofRegs)))
+  markArea(dataOrg, ptroff(stackOrg, -stackSize)) // the global variables of the modules
+  markArea(ptroff(stackOrg, -stackSize), stackOrg) // the whole stack
+  markReachable()
+
+  // sweep: the unmarked blocks and the space which was free already become free lists
+  list0 := nil
+  list1 := nil
+  list2 := nil
+  list3 := nil
+  allocated := 0
+  lim := ptroff(heapOrg, HeapSize())
+  p := heapOrg
+  run := nil
+  while ord(p) < ord(lim) do
+    size_ := blkSize(p)
+    free := (blkKind(p) = FreeBlk) or ((blkKind(p) = GcBlk) & (blkMark(p) = 0))
+    if free then
+      if run = nil then
+        run := p
+      end
+    else
+      if run # nil then
+        freeArea(run, p)
+        run := nil
+      end
+      setBlkMark(p, 0)
+      inc(allocated, size_)
+    end
+    inc(p, size_)
+  end
+  if run # nil then
+    freeArea(run, lim)
+  end
+  inGC := false
+end GC
+
+procedure LargestAvailable*(): AnyPtr
+  // the largest free block, as an address for System.Watch
+  var p: AnyPtr
+    max_: int32
+begin
+  max_ := 0
+  p := list0
+  while p # nil do
+    if cast(Int32Ptr, p)^ > max_ then
+      max_ := cast(Int32Ptr, p)^
+    end
+    p := cast(AnyPtrPtr, ptroff(p, 8))^
+  end
+  return ptroff(AnyPtr{0}, max_)
+end LargestAvailable
+
+procedure newSys(size_: int32): AnyPtr
+  // installed in the runtime by Init: a block which lives as long as the system
+  var p: AnyPtr
+begin
+  New(@p, SysBlk, size_)
+  return p
+end newSys
+
+procedure newGc(size_: int32): AnyPtr
+  // installed in the runtime by Init: a block the collector may reclaim
+  var p: AnyPtr
+begin
+  New(@p, GcBlk, size_)
+  if p = nil then
+    GC()
+    New(@p, GcBlk, size_)
+  end
+  return p
+end newGc
+
+procedure NewSys*(p: ^AnyPtr; size_: int32)
+  // an untraced block for a port module, see the System 3 Kernel
+begin
+  p^ := newSys(size_)
+end NewSys
+
+
+procedure RegisterObject*(obj: AnyPtr; fin: Finalizer; basic: boolean)
+  // the object is remembered, but the collector does not sweep finalizers here,
+  // so a finalizer only runs at shutdown
+begin
+  if nofFin < MaxFin then
+    finObj[nofFin] := obj
+    finProc[nofFin] := fin
+    inc(nofFin)
+  end
+end RegisterObject
+
+procedure FinalizeAll*()
+  var i: int32
+begin
+  i := 0
+  while i < nofFin do
+    if finProc[i] # nil then
+      finProc[i](finObj[i])
+    end
+    inc(i)
+  end
+  nofFin := 0
+end FinalizeAll
+
+
+procedure Init*(org: AnyPtr; lim: int32; data, stack: AnyPtr; stkSize: int32)
+  // the heap covers org to lim, the roots are the static data and the stack
+begin
+  heapOrg := org
+  heapLim := lim
+  dataOrg := data
+  stackOrg := stack
+  stackSize := stkSize
+  if HeapSize() > sigl(mapLen * chunk) then
+    heapLim := val(int32, ord(heapOrg)) + sigl(mapLen * chunk) // as far as the block map reaches
+  end
+  list1 := nil
+  list2 := nil
+  list3 := nil
+  list0 := heapOrg
+  cast(Int32Ptr, list0)^ := heapLim - val(int32, ord(heapOrg))
+  cast(Int32Ptr, ptroff(list0, 4))^ := -1
+  cast(Int32Ptr, ptroff(list0, 8))^ := 0
+  allocated := 0
+  Collections := 0
+  inGC := false
+  nofFin := 0
+  MIC.Install(newSys, newGc) // the runtime allocates through this module from now on
+end Init
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "GC" end return GC end
+  if i = 1 then if name # nil then name^ := "FinalizeAll" end return FinalizeAll end
+  return nil
+end cmd_
+
+end Heaps.

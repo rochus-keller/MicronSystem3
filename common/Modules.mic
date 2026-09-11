@@ -1,0 +1,205 @@
+module Modules [level=5] // ETH Oberon System 3 module manager, static variant
+
+// New module with reduced features compared to original Oberon system
+// there is no loader, all modules are linked statically, bodies already run and called Modules.Register
+
+import Kernel
+
+const
+  done* = 0
+  fileNotFound* = 1
+  moduleNotFound* = 2
+  cmdNotFound* = 5
+  MaxMods = 512 // see Register
+
+type
+  Module* = Kernel.Module
+  Command* = Kernel.Proc
+  ModuleName* = array 32 of char
+  CmdLookup* = procedure(i: int32; name: ^ModuleName): Command
+
+  ModEntry = record
+    mod_: Module
+    cmds: CmdLookup
+  end
+
+var
+  res*: int16 // error code of ThisMod and ThisCommand; 0 means success
+  resMsg*: array 256 of char
+  importing*, imported*: ModuleName
+  extension*: array 8 of char
+
+  modTab: array MaxMods of ModEntry // see Register
+  nofMods*: int32
+
+procedure Clear*()
+begin
+  resMsg[0] := 0X
+end Clear
+
+procedure err(n: int16; const msg: pointer to array of char; const name: pointer to array of char)
+  var i, j: int32
+begin
+  res := n
+  i := 0
+  while (msg[i] # 0X) & (i < 255) do
+    resMsg[i] := msg[i]
+    inc(i)
+  end
+  j := 0
+  while (name[j] # 0X) & (i < 255) do
+    resMsg[i] := name[j]
+    inc(i)
+    inc(j)
+  end
+  resMsg[i] := 0X
+  copy(@importing, name, 32)
+end err
+
+procedure FindMod*(const name: pointer to array of char): Module
+  var m: Module
+begin
+  m := Kernel.modules
+  while (m # nil) & (m.name # name^) do
+    m := m.next
+  end
+  return m
+end FindMod
+
+procedure ThisModule*(const name: pointer to array of char): Module
+  // the descriptor of a statically linked module, created on demand
+  var m, last: Module
+begin
+  m := Kernel.modules
+  last := nil
+  while (m # nil) & (m.name # name^) do
+    last := m
+    m := m.next
+  end
+  if m = nil then
+    newgc(m) // the descriptor is cleared, so only the name has to be set
+    copy(@m.name, name, 32)
+    m.init := true
+    if last = nil then
+      Kernel.modules := m
+    else
+      last.next := m
+    end
+  end
+  return m
+end ThisModule
+
+procedure ThisMod*(const name: pointer to array of char): Module
+  // a module which has commands or a descriptor is present, everything else is unknown
+  var m: Module
+begin
+  res := done
+  Clear()
+  m := FindMod(name)
+  if m = nil then
+    err(moduleNotFound, "module not linked: ", name)
+  end
+  return m
+end ThisMod
+
+procedure Register*(const modname: pointer to array of char; cmds: CmdLookup)
+  // each module registers itself as the first statement of its body, which
+  // reproduces the load order of the original dynamic loader; modules without
+  // commands pass nil
+begin
+  if nofMods < MaxMods then
+    modTab[nofMods].mod_ := ThisModule(modname)
+    modTab[nofMods].cmds := cmds
+    inc(nofMods)
+  end
+end Register
+
+procedure Commands*(mod_: Module): CmdLookup
+  // the generated cmd_ procedure of a module, enumerating its commands
+  var i: int32
+begin
+  i := 0
+  while i < nofMods do
+    if modTab[i].mod_ = mod_ then
+      return modTab[i].cmds
+    end
+    inc(i)
+  end
+  return nil
+end Commands
+
+procedure ThisCommand*(mod_: Module; const name: pointer to array of char): Command
+  // the address of a command is a procedure here
+  var i: int32
+    cmds: CmdLookup
+    w, c: Command
+    nm: ModuleName
+begin
+  res := cmdNotFound
+  w := nil
+  cmds := Commands(mod_)
+  if cmds # nil then
+    i := 0
+    repeat
+      c := cmds(i, @nm)
+      if (c # nil) & (nm = name^) then
+        res := done
+        Clear()
+        w := c
+      end
+      inc(i)
+    until (c = nil) or (w # nil)
+  end
+  if res # done then
+    if mod_ # nil then
+      copy(@imported, @mod_.name, 32)
+    end
+    err(cmdNotFound, "command not found: ", name)
+  end
+  return w
+end ThisCommand
+
+procedure ThisCommandName*(const modname, cmdname: pointer to array of char): Command
+  var m: Module
+begin
+  m := ThisMod(modname)
+  if m = nil then
+    return nil
+  end
+  return ThisCommand(m, cmdname)
+end ThisCommandName
+
+procedure Free*(const name: pointer to array of char; all: boolean)
+  // a statically linked module cannot be unloaded
+  var m: Module
+begin
+  res := done
+  Clear()
+  m := FindMod(name)
+  if m = nil then
+    err(moduleNotFound, "module not linked: ", name)
+  else
+    Kernel.FinalizeModule(m)
+  end
+end Free
+
+procedure InstallTermHandler*(h: Kernel.Proc)
+begin
+  Kernel.InstallTermHandler(h)
+end InstallTermHandler
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Clear" end return Clear end
+  return nil
+end cmd_
+
+begin
+  res := done
+  nofMods := 0
+  resMsg[0] := 0X
+  copy(@extension, ".Obj", 8)
+  Register("Modules", cmd_)
+end Modules.

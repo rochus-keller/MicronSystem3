@@ -1,0 +1,314 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module OFSBoot [level=5]
+
+import Kernel, OFS, Modules, OFSCacheVolumes
+// pjm
+
+(*
+Generic boot module.  Mounts configured file systems and then executes a configured command.
+
+Config strings:
+BootVol# = prefix [hash] [cache] alias [par] . (* # is empty or "1".."9" *)
+alias = gen gen . (* defines a volume and file system generator *)
+gen = mod "." cmd .
+
+Examples:
+BootVol="SYS 500 1000 NatFS IDE0#2"
+BootVol1="RAM RamFS -50 2048"
+
+NatFS="OFSDiskVolumes.New OFSN2KFiles.NewFS"
+AosFS="OFSDiskVolumes.New OFSAosFiles.NewFS"
+RamFS="OFSRAMVolumes.New OFSN2KFiles.NewFS"
+ISOFS="OFSISO9660Volumes.New OFSISO9660Files.NewFS"
+DosBasedFS="OFSDosBasedVolumes.New OFSN2KFiles.NewFS"
+*)
+
+const
+  DefaultSystem = "System.Init"
+
+type 
+  Array2dOfChar* = record len0*, len1*: int32; data*: pointer to array of char end // descriptor for ARRAY OF ARRAY OF char
+  
+procedure Call(const cmd: pointer to array of char; protect: boolean): boolean
+  var
+    cmd0: array 256 of char
+    cmd0_i: int32
+    i, j: int32
+    m: Modules.Module
+    c: Modules.Command
+begin
+  cmd0_i := 0
+  while (cmd0_i < 255) & (cmd[cmd0_i] # 0X) do cmd0[cmd0_i] := cmd[cmd0_i]; inc(cmd0_i) end
+  cmd0[cmd0_i] := 0X
+  m := nil
+  c := nil
+  i := 0
+  while (cmd0[i] # ".") & (cmd0[i] # 0X) do
+    inc(i)
+  end
+  if cmd0[i] = "." then
+    cmd0[i] := 0X
+    m := Modules.ThisMod(@cmd0)
+  end
+  if m # nil then
+    if protect then
+      inc(m.refcnt) // disallow unloading of the module
+    end
+    j := 0
+    inc(i)
+    while cmd0[i] # 0X do
+      cmd0[j] := cmd0[i]
+      inc(i)
+      inc(j)
+    end
+    cmd0[j] := 0X
+    c := Modules.ThisCommand(m, @cmd0)
+    if c # nil then
+      c()
+    end
+  end
+
+  if Modules.res # 0 then
+    Kernel.WriteString("OFSBoot: ")
+    Kernel.WriteString(@Modules.resMsg)
+    Kernel.WriteLn()
+  end
+
+  return c # nil
+end Call
+
+procedure StrToInt(i: pointer to int32; s: pointer to array of char): int32
+  var
+    vd, vh, sgn, d: int32
+    hex: boolean
+begin
+  vd := 0
+  vh := 0
+  hex := false
+  if s[i^] = "-" then
+    sgn := -1
+    inc(i^)
+  else
+    sgn := 1
+  end
+  loop
+    if (s[i^] >= "0") & (s[i^] <= "9") then
+      d := val(int32, val(int16, ord(s[i^])) - val(int16, ord("0")))
+    elsif (val(int32, band(ord(s[i^]), 0DFH)) >= 41H) & (val(int32, band(ord(s[i^]), 0DFH)) <= 46H) then
+      d := val(int32, val(int16, ord(chr(band(ord(s[i^]), 0DFH)))) - val(int16, ord("A")) + 10)
+      hex := true
+    else
+      exit
+    end
+
+    vd := 10 * vd + d
+    vh := 16 * vh + d
+    inc(i^)
+  end
+
+  if val(int32, band(ord(s[i^]), 0DFH)) = 48H then
+    hex := true // optional H
+    inc(i^)
+  end
+  if hex then
+    vd := vh
+  end
+  return sgn * vd
+end StrToInt
+
+procedure GetString(i: pointer to int32; r, s: pointer to array of char): boolean
+  var
+    j: int32
+begin
+  while r[i^] = " " do
+    inc(i^)
+  end
+  j := 0
+  while r[i^] > " " do
+    s[j] := r[i^]
+    inc(j)
+    inc(i^)
+  end
+  s[j] := 0X
+  return j # 0
+end GetString
+
+procedure GetInt(i: pointer to int32; r: pointer to array of char; x: pointer to int32): boolean
+  var
+    ok: boolean
+begin
+  ok := false
+  x^ := 0
+  while r[i^] = " " do
+    inc(i^)
+  end
+  if (r[i^] >= "0") & (r[i^] <= "9") then
+    x^ := StrToInt(i, r)
+    ok := true
+  end
+
+  return ok
+end GetInt
+
+procedure Error(config, val_: pointer to array of char; i: int32)
+  var
+    j: int32
+    s: array 32 of char
+begin
+  copy(@s, "OFSBoot: Bad ", 32)
+  Kernel.WriteString(@s)
+  j := 0
+  while s[j] # 0X do
+    inc(j)
+  end
+  inc(i, j)
+  Kernel.WriteString(config)
+  j := 0
+  while config[j] # 0X do
+    inc(j)
+  end
+  inc(i, j)
+  Kernel.WriteChar("=")
+  Kernel.WriteChar(22X)
+  inc(i, 2)
+  Kernel.WriteString(val_)
+  Kernel.WriteChar(22X)
+  Kernel.WriteLn()
+  while i > 0 do
+    Kernel.WriteChar(" ")
+    dec(i)
+  end
+  Kernel.WriteChar("^")
+  Kernel.WriteLn()
+end Error
+
+procedure OpenVolume(const config: pointer to array of char; first: boolean)
+
+  var
+    i, j, hashsize, cachesize: int32
+    cache: OFSCacheVolumes.Volume
+    prefix, alias: OFS.Prefix
+    gen: array 64 of char
+    s: array 256 of char
+begin
+  Kernel.GetConfig(config, @s, 256) // s = prefix [hash] [cache] alias [par] .
+  if s = "" then
+    if first then
+      Kernel.WriteString("OFSBoot: No BootVol set!")
+      Kernel.WriteLn()
+    end
+    return
+  end
+
+  i := 0
+  if ~GetString(@i, @s, @prefix) then
+    Error(config, @s, i)
+    return
+  end
+  if ~GetInt(@i, @s, @hashsize) then
+    hashsize := 0
+  end
+  if ~GetInt(@i, @s, @cachesize) then
+    cachesize := hashsize
+  end
+  if ~GetString(@i, @s, @alias) then
+    Error(config, @s, i)
+    return
+  end
+  // set parameter string
+  if s[i] = " " then
+    inc(i)
+  end
+  j := 0
+  while s[i] # 0X do
+    s[j] := s[i]
+    inc(i)
+    inc(j)
+  end
+  s[j] := 0X
+  OFS.SetPar(@s)
+  // call volume generator
+  Kernel.GetConfig(@alias, @s, 256) // s = gen gen . ; gen = mod "." cmd .
+  i := 0
+  OFS.NewVol := nil
+  if ~GetString(@i, @s, @gen) then
+    Error(@alias, @s, i)
+    return
+  end
+  if Call(@gen, false) & (OFS.NewVol # nil) then
+    OFS.NewVol.flags := OFS.NewVol.flags + {OFS.Boot}
+    if cachesize # 0 then
+      // initialize cache
+      if cachesize >= 1000 then
+        hashsize := obdiv(cachesize, 5)
+      else
+        hashsize := cachesize
+      end
+      newgc(cache)
+      OFSCacheVolumes.Init(cache, OFS.NewVol, hashsize, cachesize)
+      OFS.NewVol := cache
+    end
+
+    // call file system generator
+    OFS.SetPar(@prefix)
+    if GetString(@i, @s, @gen) then
+      if Call(@gen, false) then
+        OFS.NewVol := nil
+      end
+    else
+      Error(@alias, @s, i)
+    end
+  end
+
+  if OFS.This(@prefix) = nil then
+    Kernel.WriteString("OFSBoot: Mount failed on ")
+    Kernel.WriteString(config)
+    Kernel.WriteLn()
+    if OFS.NewVol # nil then
+      OFS.NewVol.Finalize(OFS.NewVol) // unmount volume
+      OFS.NewVol := nil
+    end
+  end
+end OpenVolume
+
+procedure OpenVolumes*()
+  var
+    config: array 16 of char
+    i: int32
+begin
+  copy(@config, "BootVol", 16)
+  OpenVolume(@config, true)
+  for i := 1 to 9 do
+    config[7] := chr(val(int32, ord("0")) + i)
+    config[8] := 0X
+    OpenVolume(@config, false)
+  end
+end OpenVolumes
+
+procedure BootSystem*()
+  var
+    s: array 32 of char
+begin
+  Kernel.GetConfig("BootSystem", @s, 32)
+  if s = "" then
+    copy(@s, DefaultSystem, 32)
+  end
+  if Call(@s, true) then
+  end // ignore
+  // typically call will not return
+end BootSystem
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "OpenVolumes" end return OpenVolumes end
+  if i = 1 then if name # nil then name^ := "BootSystem" end return BootSystem end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("OFSBoot", cmd_)
+end OFSBoot.

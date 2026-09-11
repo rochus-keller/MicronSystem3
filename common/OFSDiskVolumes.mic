@@ -1,0 +1,429 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module OFSDiskVolumes [level=5]
+
+import Kernel, Disks, OFS, Modules
+
+// pjm
+
+// OFS.Volume implementation based on Disks.
+
+const
+  Header = "OFSDiskVolumes: "
+
+  BS = 512 // supported device block size
+  CDBS = 2048 // cd device block size
+
+  FSID = 559107905
+  FSVer = 1
+  AosSS = 4096
+  NSS = 2048
+
+type
+  Volume* = pointer to VolumeDesc
+
+  // file system start offset on device in terms of BS-byte sectors
+
+  DataBlock = array 2147483647 (* 2147483647 *) of char
+  PDataBlock = pointer to DataBlock
+
+  VolumeDesc* = object (OFS.VolumeDesc)
+    dev: Disks.Device
+    startfs: int32
+  end
+
+var
+  cdid: array 32 of char
+
+// Get block from adr [1..size] of volume vol
+procedure GetBlock*(vol: OFS.Volume; adr: int32; blk: pointer to array of byte; blk_len: int32)
+  var
+    res, dadr: int32
+    dev: Disks.Device
+begin
+  case vol of
+  | Volume:
+    if (adr < 1) or (adr > vol.size_) then
+      halt(15)
+    end
+    dev := vol.dev
+    assert(vol.startfs > 0) // startfs initialized
+    assert(blk_len >= vol.blockSize)
+    dadr := vol.startfs + (adr - 1) * asr(vol.blockSize, 9) // transfer position in terms of BS-sized blocks
+    if vol.dev.blockSize = BS then
+      dev.transfer(dev, Disks.Read, dadr, asr(vol.blockSize, 9), cast(PDataBlock, blk), 2147483647 (* 2147483647 *), 0, @res)
+    else
+      assert(vol.dev.blockSize = CDBS)
+      assert(band(dadr, 3) = 0) // volume blocks must be aligned on device blocks
+      assert(band(vol.blockSize, 2047) = 0) // volume blocks must be multiple of device blocks
+      dev.transfer(dev, Disks.Read, asr(dadr, 2), asr(vol.blockSize, 11), cast(PDataBlock, blk), 2147483647 (* 2147483647 *), 0, @res)
+    end
+
+    if res # Disks.Ok then
+      halt(17)
+    end
+  end
+end GetBlock
+
+// Put block to adr [1..size] of volume vol
+procedure PutBlock*(vol: OFS.Volume; adr: int32; blk: pointer to array of byte; blk_len: int32)
+  var
+    res, dadr: int32
+    dev: Disks.Device
+begin
+  case vol of
+  | Volume:
+    if (adr < 1) or (adr > vol.size_) then
+      halt(15)
+    end
+    dev := vol.dev
+    assert(vol.startfs > 0) // startfs initialized
+    assert(blk_len >= vol.blockSize)
+    dadr := vol.startfs + (adr - 1) * asr(vol.blockSize, 9) // transfer position in terms of BS-sized blocks
+    if vol.dev.blockSize = BS then
+      dev.transfer(dev, Disks.Write, dadr, asr(vol.blockSize, 9), cast(PDataBlock, blk), 2147483647 (* 2147483647 *), 0, @res)
+    else
+      assert(vol.dev.blockSize = CDBS)
+      assert(band(dadr, 3) = 0) // volume blocks must be aligned on device blocks
+      assert(band(vol.blockSize, 2047) = 0) // volume blocks must be multiple of device blocks
+      dev.transfer(dev, Disks.Read, asr(dadr, 2), asr(vol.blockSize, 11), cast(PDataBlock, blk), 2147483647 (* 2147483647 *), 0, @res)
+    end
+
+    if res # Disks.Ok then
+      halt(17)
+    end
+  end
+end PutBlock
+
+// Finalize a volume and close its device.
+procedure Finalize*(vol: OFS.Volume)
+  var
+    res, i, j: int32
+    ptable: Disks.PartitionTable
+begin
+  case vol of
+  | Volume:
+    i := 0
+    j := -1
+    ptable := vol.dev.table
+    while i # vol.dev.tableLen do
+      if (vol.startfs > ptable[i].start) & (vol.startfs < ptable[i].start + ptable[i].size_) then
+        j := i
+      end
+
+      inc(i)
+    end
+
+    if j # -1 then
+      assert(Disks.Mounted in ptable[j].flags)
+      ptable[j].flags := ptable[j].flags - {Disks.Mounted}
+    end
+
+    Disks.Close(vol.dev, @res) // ignore res
+    vol.dev := nil
+    OFS.FinalizeVol(vol)
+  end
+end Finalize
+
+procedure Get4(b: pointer to array of char; i: int32): int32
+begin
+  return val(int32, ord(b[i])) + val(int32, ord(b[i + 1])) * 100H +
+         val(int32, ord(b[i + 2])) * 10000H + val(int32, ord(b[i + 3])) * 1000000H
+end Get4
+
+// Get number of reserved disk blocks and size of file system in disk blocks
+procedure GetOberonFS(dev: Disks.Device; pstart, psize: int32; reserved, size_, vbs, res: pointer to int32)
+  var
+    i, bc, fsofs: int32
+    b: array 2048 (* CDBS *) of char
+begin
+  reserved^ := 0
+  size_^ := 0
+  vbs^ := 0
+  fsofs := 0
+  if (dev.blockSize = BS) & (psize > 0) then
+    dev.transfer(dev, Disks.Read, pstart, 1, @b, 2048 (* CDBS *), 0, res) // read boot block of partition/disk
+  elsif (dev.blockSize = CDBS) & (psize > 17) then
+    // typically pstart = 0
+    dev.transfer(dev, Disks.Read, pstart + 17, 1, @b, 2048 (* CDBS *), 0, res) // read El Torito boot record
+    if res^ = Disks.Ok then
+      bc := Get4(@b, 71) // boot catalog location
+      i := 0
+      while (i < 32) & (b[i] = cdid[i]) do
+        inc(i)
+      end
+      if (i = 32) & (bc > 0) & (bc < psize) then
+        dev.transfer(dev, Disks.Read, pstart + bc, 1, @b, 2048 (* CDBS *), 0, res) // read boot catalog
+        if (b[0] = 1X) & (b[30] = "U") & (b[31] = 0AAX) then
+          // validation entry ok (skip checksum)
+          fsofs := Get4(@b, 32i1 + 8i1) // start of virtual disk
+          if (fsofs > 0) & (fsofs < psize) then
+            dev.transfer(dev, Disks.Read, pstart + fsofs, 1, @b, 2048 (* CDBS *), 0, res) // read boot block of virtual disk
+            fsofs := pstart + fsofs * 4 // CDBS div BS
+          else
+            res^ := 3 // not bootable CD
+          end
+
+        else
+          res^ := 3 // not bootable CD
+        end
+
+      else
+        res^ := 3 // not bootable CD
+      end
+    end
+
+  else
+    res^ := 2 // unsupported device block size
+  end
+
+  if res^ = Disks.Ok then
+    // check boot sector
+    b[0] := "x"
+    b[1] := "x"
+    b[2] := "x"
+    b[9] := 0X
+    if (b[510] = "U") & (b[511] = 0AAX) then
+      if (Get4(@b, 504) = FSID) & (val(int32, ord(b[508])) = 1H) & (val(int32, shl(val(int32, 1i4), ord(b[509]))) = AosSS) then
+        // Aos boot block id found
+        vbs^ := AosSS
+        reserved^ := fsofs + Get4(@b, 496)
+        size_^ := Get4(@b, 500) * asr(vbs^, 9)
+        assert(obdiv(reserved^ + size_^, asr(dev.blockSize, 9)) <= psize)
+      elsif b = "xxxOBERON" then
+        // Oberon boot block id found
+        vbs^ := NSS
+        reserved^ := val(int32, ord(b[14])) + 256 * val(int32, val(int16, ord(b[15]))) // reserved
+        size_^ := val(int32, ord(b[19])) + 256 * val(int32, val(int16, ord(b[20]))) // small size
+        if size_^ = 0 then
+          size_^ := Get4(@b, 32) // large size
+        end
+        if size_^ > psize * asr(dev.blockSize, 9) then
+          // limit to partition/disk size
+          size_^ := psize * asr(dev.blockSize, 9)
+        end
+
+        dec(size_^, reserved^)
+        inc(reserved^, fsofs)
+      else
+        res^ := 1 // unknown file system
+      end
+
+    else
+      res^ := 1 // boot block id not found (unformatted?)
+    end
+  end
+end GetOberonFS
+
+procedure InitVol(vol: Volume; reserved, size_, vbs, part: int32; ptable: Disks.PartitionTable)
+begin
+  copy(@vol.name, @vol.dev.name, 32)
+  OFS.AppendStr("#", @vol.name, 32)
+  OFS.AppendInt(part, @vol.name)
+  assert(band(vbs, 511) = 0)
+  vol.blockSize := vbs
+  vol.size_ := obdiv(size_, asr(vbs, 9))
+  vol.startfs := ptable[part].start + reserved
+  vol.flags := {}
+  if Disks.ReadOnly in vol.dev.flags then
+    vol.flags := vol.flags + {OFS.ReadOnly}
+  end
+  if Disks.Removable in vol.dev.flags then
+    vol.flags := vol.flags + {OFS.Removable}
+  end
+  vol.AllocBlock := OFS.AllocBlock
+  vol.FreeBlock := OFS.FreeBlock
+  vol.MarkBlock := OFS.MarkBlock
+  vol.Marked := OFS.Marked
+  vol.Available := OFS.Available
+  vol.GetBlock := GetBlock
+  vol.PutBlock := PutBlock
+  vol.Sync := OFS.Sync
+  vol.Finalize := Finalize
+  ptable[part].flags := ptable[part].flags + {Disks.Mounted}
+end InitVol
+
+// Fetch positive integer parameter passed in OFS.Par
+
+procedure ScanInt(ch: pointer to char; x: pointer to int32)
+begin
+  x^ := 0
+  while ch^ = " " do
+    OFS.ReadPar(ch)
+  end
+  while (ch^ >= "0") & (ch^ <= "9") & (x^ < 2147483647i4 div 10i4) do
+    x^ := x^ * 10 + val(int32, val(int16, ord(ch^)) - val(int16, ord("0")))
+    OFS.ReadPar(ch)
+  end
+end ScanInt
+
+procedure GetParam(name: pointer to array of char; part: pointer to int32; readonly: pointer to boolean)
+  var
+    i: int32
+    ch: char
+begin
+  readonly^ := false
+  part^ := 0
+  repeat
+    OFS.ReadPar(@ch)
+  until ch # " "
+  i := 0
+  while (ch > " ") & (ch # "#") & (ch # ",") do
+    name[i] := ch
+    inc(i)
+    OFS.ReadPar(@ch)
+  end
+  name[i] := 0X
+  if (ch = "#") or (ch = " ") then
+    OFS.ReadPar(@ch)
+    ScanInt(@ch, part)
+  end
+  if ch = "," then
+    repeat
+      OFS.ReadPar(@ch)
+      if ch = "R" then
+        readonly^ := true
+      end
+    until ch <= " "
+  end
+end GetParam
+
+// Try to open the specified volume.  Sets OFS.NewVol # NIL on success.
+
+procedure TryOpen(dev: Disks.Device; part, dbs: int32; readonly: boolean)
+  var
+    vol: Volume
+    reserved, size_, vbs, res: int32
+    ptable: Disks.PartitionTable
+begin
+  Kernel.WriteString(Header)
+  Kernel.WriteString(@dev.name)
+  Disks.Open(dev, @res)
+  if res = Disks.Ok then
+    ptable := dev.table
+    if (dev.tableLen = 1) & (part = 0) or (part > 0) & (part < dev.tableLen) then
+      if (dbs = -1) or (dev.blockSize = dbs) then
+        Kernel.WriteChar("#")
+        Kernel.WriteInt(part, 1)
+        if ~(Disks.Mounted in ptable[part].flags) then
+          GetOberonFS(dev, ptable[part].start, ptable[part].size_, @reserved, @size_, @vbs, @res)
+          if (res = Disks.Ok) & (size_ > 0) & (obmod(vbs, dev.blockSize) = 0) then
+            newgc(vol)
+            vol.dev := dev
+            InitVol(vol, reserved, size_, vbs, part, ptable)
+            if readonly or (Disks.ReadOnly in dev.flags) then
+              vol.flags := vol.flags + {OFS.ReadOnly}
+            end
+            OFS.InitVol(vol)
+            OFS.NewVol := vol
+          else
+            case res of
+              1:
+              Kernel.WriteString(" partition not formatted")
+            | 2:
+              Kernel.WriteString(" bad block size")
+            else
+              Kernel.WriteString(" boot block error ")
+              Kernel.WriteInt(res, 1)
+              Kernel.WriteString(" reserved=")
+              Kernel.WriteInt(reserved, 1)
+              Kernel.WriteString(" size=")
+              Kernel.WriteInt(size_, 1)
+              Kernel.WriteString(" vbs=")
+              Kernel.WriteInt(vbs, 1)
+              Kernel.WriteString(" start=")
+              Kernel.WriteInt(ptable[part].start, 1)
+            end
+          end
+
+        else
+          Kernel.WriteString(" blocksize=")
+          Kernel.WriteInt(dev.blockSize, 1)
+        end
+
+      else
+        Kernel.WriteString(" wrong block size")
+      end
+
+    else
+      Kernel.WriteString(" invalid partition")
+    end
+
+    if OFS.NewVol = nil then
+      Disks.Close(dev, @res) // close again - ignore res
+    end
+  else
+    Kernel.WriteString(" error ")
+    Kernel.WriteInt(res, 1)
+  end
+end TryOpen
+
+// Generate a new disk volume object. OFS.Par: device ["#" part] [",R"]
+procedure New*()
+
+  var
+    part, i: int32
+    table: Disks.DeviceTable
+    readonly, retry: boolean
+    name: Disks.Name
+    s: array 64 of char
+begin
+  OFS.NewVol := nil
+  retry := false
+  GetParam(@name, @part, @readonly)
+  Disks.GetRegistered(@table)
+  Kernel.SetLogMark()
+  if table # nil then
+    if name # "" then
+      i := 0
+      while (i # Disks.NumRegistered()) & (table[i].name # name) do
+        inc(i)
+      end
+      if i # Disks.NumRegistered() then
+        TryOpen(table[i], part, -1, readonly)
+      else
+        Kernel.WriteString(Header)
+        Kernel.WriteString(@name)
+        Kernel.WriteString(" not found")
+      end
+
+    else
+      i := 0
+      loop
+        TryOpen(table[i], part, CDBS, readonly)
+        inc(i)
+        if (OFS.NewVol # nil) or (i >= Disks.NumRegistered()) then
+          exit
+        end
+        Kernel.WriteLn()
+        Kernel.SetLogMark()
+      end
+    end
+
+  else
+    Kernel.WriteString(Header)
+    Kernel.WriteString("no devices")
+  end
+
+  Kernel.WriteLn()
+  Kernel.GetMarkedLog(@s, 64)
+  OFS.SetPar(@s)
+end New
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "New" end return New end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("OFSDiskVolumes", cmd_)
+  copy(@cdid, "?CD001?EL TORITO SPECIFICATION?", 32)
+  cdid[0] := 0X
+  cdid[6] := 1X
+  cdid[30] := 0X
+  cdid[31] := 0X
+end OFSDiskVolumes.

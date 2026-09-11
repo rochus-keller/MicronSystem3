@@ -1,0 +1,2159 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module OFSAosFiles [level=5]
+
+import Kernel, OFS, SYS, Modules
+// pjm/bsm
+
+// Native version of Aos file system.
+
+const
+  DEBUG = false
+  thisModuleName = "OFSAosFiles" // used for kernel log messages
+
+  MinVolSize = 4
+
+  SF = 29i1 // SectorFactor
+  FnLength = 32 // includes 0X
+  STS = 128 // SecTabSize
+  SS = 4096i2 // SectorSize
+  XS = SS div 4i2 // IndexSize
+  HS = 568 // HeaderSize
+
+  DirRootAdr = 1i1 * SF
+  DirPgSize = 102i1
+  N = DirPgSize div 2i1
+
+  DirMark = val(int32, 2602476429)
+  HeaderMark = val(int32, 2611420550)
+
+  FillerSize = 4
+
+  MapIndexSize = (SS - 4i2) div 4i2
+  MapSize = SS div 4i2 // {MapSize MOD 32 = 0}
+  MapMark = val(int32, 2620364671)
+
+  MaxBufs = 4
+  InitHint = 200i2 * SF
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  BytesPtr = pointer to array of byte // helper type for VAR ARRAY OF SYSTEM.BYTE parameters
+  
+  DiskSector = array 4096 (* SS *) of byte
+  PDiskSector = pointer to DiskSector
+
+  DiskAdr = int32
+  FileName = array 32 (* FnLength *) of char
+  SectorTable = array 128 (* STS *) of int32
+
+  FileHeader = record
+    // allocated in the first page of each file on disk
+    mark: int32
+    name: FileName
+    aleng, bleng, date, time: int32
+
+    sec: SectorTable
+    ext: int32
+    data: array 3528 (* SS - HS *) of char
+  end
+
+  IndexSector = record
+    x: array 1024 (* XS *) of int32
+  end
+  PIndexSector = pointer to IndexSector
+
+  DataSector = record
+    B: array 4096 (* SS *) of byte
+  end
+  PDataSector = pointer to DataSector
+
+  DirEntry = record
+    // B-tree node
+    name: FileName
+    adr: int32 // sec no of file header
+    p: int32 // sec no of descendant in directory
+  end
+
+  DirPage = record
+    mark, m, p0: int32 // sec no of left descendant in directory
+    fill: array 4 (* FillerSize *) of char
+    e: array 102 (* DirPgSize *) of DirEntry
+  end
+  PDirPage = pointer to DirPage
+
+  MapIndex = record
+    mark: int32
+    index: array 1023 (* MapIndexSize *) of int32
+  end
+  PMapIndex = pointer to MapIndex
+
+  MapSector = record
+    map: array 1024 (* MapSize *) of set
+  end
+  PMapSector = pointer to MapSector
+
+  Buffer = pointer to BufferRecord
+  FileHd = pointer to FileHeader
+
+  File = pointer to FileDesc
+
+  BufferRecord = object (OFS.HintDesc)
+    apos, lim: int32
+    mod_: boolean
+    next: Buffer
+    data: DataSector
+  end
+
+  SuperIndex = pointer to SuperIndexDesc
+
+  SubIndex = pointer to SubIndexDesc
+
+  FileSystem = pointer to FileSystemDesc // our file system type
+
+  FileDesc = object (OFS.FileDesc)
+    aleng, bleng, nofbufs: int32
+
+    modH, registered: boolean
+    firstbuf: Buffer
+    sechint: int32
+    name: FileName
+    time, date: int32
+    ext: SuperIndex
+    sec: SectorTable
+  end
+
+  SuperIndexDesc = record
+
+    adr: int32
+    mod_: boolean
+    sub: array 1024 (* XS *) of SubIndex
+  end
+
+  SubIndexDesc = record
+
+    adr: int32
+    mod_: boolean
+    sec: IndexSector
+  end
+
+  FileSystemDesc = object (OFS.FileSystemDesc)
+  end
+
+var
+  hp: FileHd
+  fullname: OFS.FileName
+
+procedure ^ DirStartup(vol: OFS.Volume; init: pointer to boolean)
+procedure ^ PurgeOnDisk(fs: FileSystem; hdadr: int32)
+
+procedure GetSector(vol: OFS.Volume; src: int32; dest: pointer to DiskSector)
+begin
+  if obmod(src, SF) # 0 then
+    halt(15)
+  end
+  vol.GetBlock(vol, obdiv(src, SF), cast(BytesPtr, dest), SS)
+end GetSector
+
+procedure PutSector(vol: OFS.Volume; dest: int32; src: pointer to DiskSector)
+begin
+  assert(~(OFS.ReadOnly in vol.flags))
+  if obmod(dest, SF) # 0 then
+    halt(15)
+  end
+  vol.PutBlock(vol, obdiv(dest, SF), cast(BytesPtr, src), SS)
+end PutSector
+
+procedure AllocSector(vol: OFS.Volume; hint: int32; sec: pointer to int32)
+begin
+  assert(~(OFS.ReadOnly in vol.flags))
+  vol.AllocBlock(vol, obdiv(hint, SF), sec)
+  sec^ := sec^ * SF
+end AllocSector
+
+procedure MarkSector(vol: OFS.Volume; sec: int32)
+begin
+  assert(~(OFS.ReadOnly in vol.flags))
+  vol.MarkBlock(vol, obdiv(sec, SF))
+end MarkSector
+
+procedure FreeSector(vol: OFS.Volume; sec: int32)
+begin
+  assert(~(OFS.ReadOnly in vol.flags))
+  vol.FreeBlock(vol, obdiv(sec, SF))
+end FreeSector
+
+procedure Marked(vol: OFS.Volume; sec: int32): boolean
+begin
+  assert(~(OFS.ReadOnly in vol.flags))
+  return vol.Marked(vol, obdiv(sec, SF))
+end Marked
+
+procedure Size(vol: OFS.Volume): int32
+begin
+  assert(vol.size_ >= MinVolSize)
+  return vol.size_
+end Size
+
+procedure Search(vol: OFS.Volume; name: pointer to array of char; A: pointer to int32)
+  var
+    i, L, R, dadr: int32
+    a: DirPage
+begin
+  dadr := DirRootAdr
+  loop
+    GetSector(vol, dadr, cast(PDiskSector, @a))
+    assert(a.mark = DirMark)
+    L := 0 // binary search
+    R := a.m
+    while L < R do
+      i := asr(L + R, 1)
+      if name^ <= a.e[i].name then
+        R := i
+      else
+        L := i + 1
+      end
+    end
+
+    if (R < a.m) & (name^ = a.e[R].name) then
+      A^ := a.e[R].adr // found
+      exit
+    end
+
+    if R = 0 then
+      dadr := a.p0
+    else
+      dadr := a.e[R - 1].p
+    end
+    if dadr = 0 then
+      A^ := 0 // not found
+      exit
+    end
+  end
+end Search
+
+procedure insert(vol: OFS.Volume; name: pointer to array of char; dpg0: int32; h: pointer to boolean; 
+                      v: pointer to DirEntry; fad: int32; replacedFad: pointer to int32)
+  // gc
+  // h = "tree has become higher and v is ascending element"
+  var
+    ch: char
+    i, j, L, R, dpg1: int32
+    u: DirEntry
+    a: DirPage
+begin
+  // ~h
+  GetSector(vol, dpg0, cast(PDiskSector, @a))
+  L := 0 // binary search
+  R := a.m
+  while L < R do
+    i := asr(L + R, 1)
+    if name^ <= a.e[i].name then
+      R := i
+    else
+      L := i + 1
+    end
+  end
+
+  replacedFad^ := 0
+  if (R < a.m) & (name^ = a.e[R].name) then
+    replacedFad^ := a.e[R].adr // gc
+    a.e[R].adr := fad // replace
+    PutSector(vol, dpg0, cast(PDiskSector, @a))
+  else
+    // not on this page
+    if R = 0 then
+      dpg1 := a.p0
+    else
+      dpg1 := a.e[R - 1].p
+    end
+    if dpg1 = 0 then
+      // not in tree, insert
+      u.adr := fad
+      u.p := 0
+      h^ := true
+      j := 0
+      repeat
+        ch := name[j]
+        u.name[j] := ch
+        inc(j)
+      until ch = 0X
+
+      while j < FnLength do
+        u.name[j] := 0X
+        inc(j)
+      end
+    else
+      insert(vol, name, dpg1, h, @u, fad, replacedFad)
+    end
+
+    if h^ then
+      // insert u to the left of e[R]
+      if a.m < DirPgSize then
+        h^ := false
+        i := a.m
+        while i > R do
+          dec(i)
+          a.e[i + 1] := a.e[i]
+        end
+        a.e[R] := u
+        inc(a.m)
+      else
+        // split page and assign the middle element to v
+        a.m := N
+        a.mark := val(int32, DirMark)
+        if R < N then
+          // insert in left half
+          v^ := a.e[N - 1i1]
+          i := N - 1i1
+          while i > R do
+            dec(i)
+            a.e[i + 1] := a.e[i]
+          end
+          a.e[R] := u
+          PutSector(vol, dpg0, cast(PDiskSector, @a))
+          AllocSector(vol, dpg0, @dpg0)
+          i := 0
+          while i < N do
+            a.e[i] := a.e[i + N]
+            inc(i)
+          end
+        else
+          // insert in right half
+          PutSector(vol, dpg0, cast(PDiskSector, @a))
+          AllocSector(vol, dpg0, @dpg0)
+          dec(R, N)
+          i := 0
+          if R = 0 then
+            v^ := u
+          else
+            v^ := a.e[N]
+            while i < R - 1 do
+              a.e[i] := a.e[N + 1i1 + i]
+              inc(i)
+            end
+            a.e[i] := u
+            inc(i)
+          end
+
+          while i < N do
+            a.e[i] := a.e[N + i]
+            inc(i)
+          end
+        end
+
+        a.p0 := v.p
+        v.p := dpg0
+      end
+
+      PutSector(vol, dpg0, cast(PDiskSector, @a))
+    end
+  end
+end insert
+
+procedure Insert(vol: OFS.Volume; name: pointer to array of char; fad: int32; replacedFad: pointer to int32)
+  var
+    oldroot: int32
+    h: boolean
+    U: DirEntry
+    a: DirPage
+begin
+  h := false
+  insert(vol, name, DirRootAdr, @h, @U, fad, replacedFad) // gc
+  if h then
+    // root overflow
+    GetSector(vol, DirRootAdr, cast(PDiskSector, @a))
+    AllocSector(vol, DirRootAdr, @oldroot)
+    PutSector(vol, oldroot, cast(PDiskSector, @a))
+    a.mark := val(int32, DirMark)
+    a.m := 1
+    a.p0 := oldroot
+    a.e[0] := U
+    PutSector(vol, DirRootAdr, cast(PDiskSector, @a))
+  end
+end Insert
+
+procedure underflow(vol: OFS.Volume; c: pointer to DirPage; dpg0, s: int32; h: pointer to boolean)
+  // ancestor page
+  // insertion point in c
+  // c undersize
+  var
+    i: int32 // a := underflowing page, b := neighbouring page
+    k, dpg1: int32
+    a, b: DirPage
+begin
+  GetSector(vol, dpg0, cast(PDiskSector, @a))
+  // h & a.m = N-1 & dpg0 = c.e[s-1].p
+  if s < c.m then
+    // b := page to the right of a
+    dpg1 := c.e[s].p
+    GetSector(vol, dpg1, cast(PDiskSector, @b))
+    k := asr(b.m - N + 1, 1) // k = no. of items available on page b
+    a.e[N - 1i1] := c.e[s]
+    a.e[N - 1i1].p := b.p0
+    if k > 0 then
+      // move k-1 items from b to a, one to c
+      i := 0
+      while i < k - 1 do
+        a.e[i + N] := b.e[i]
+        inc(i)
+      end
+      c.e[s] := b.e[i]
+      b.p0 := c.e[s].p
+      c.e[s].p := dpg1
+      dec(b.m, k)
+      i := 0
+      while i < b.m do
+        b.e[i] := b.e[i + k]
+        inc(i)
+      end
+      PutSector(vol, dpg1, cast(PDiskSector, @b))
+      a.m := N - 1i1 + k
+      h^ := false
+    else
+      // merge pages a and b, discard b
+      i := 0
+      while i < N do
+        a.e[i + N] := b.e[i]
+        inc(i)
+      end
+      i := s
+      dec(c.m)
+      while i < c.m do
+        c.e[i] := c.e[i + 1]
+        inc(i)
+      end
+      a.m := 2i1 * N
+      h^ := c.m < N
+    end
+
+    PutSector(vol, dpg0, cast(PDiskSector, @a))
+  else
+    // b := page to the left of a
+    dec(s)
+    if s = 0 then
+      dpg1 := c.p0
+    else
+      dpg1 := c.e[s - 1].p
+    end
+    GetSector(vol, dpg1, cast(PDiskSector, @b))
+    k := asr(b.m - N + 1, 1) // k = no. of items available on page b
+    if k > 0 then
+      i := N - 1i1
+      while i > 0 do
+        dec(i)
+        a.e[i + k] := a.e[i]
+      end
+      i := k - 1
+      a.e[i] := c.e[s]
+      a.e[i].p := a.p0
+      // move k-1 items from b to a, one to c
+      dec(b.m, k)
+      while i > 0 do
+        dec(i)
+        a.e[i] := b.e[i + b.m + 1]
+      end
+      c.e[s] := b.e[b.m]
+      a.p0 := c.e[s].p
+      c.e[s].p := dpg0
+      a.m := N - 1i1 + k
+      h^ := false
+      PutSector(vol, dpg0, cast(PDiskSector, @a))
+    else
+      // merge pages a and b, discard a
+      c.e[s].p := a.p0
+      b.e[N] := c.e[s]
+      i := 0
+      while i < N - 1i1 do
+        b.e[i + N + 1] := a.e[i]
+        inc(i)
+      end
+      b.m := 2i1 * N
+      dec(c.m)
+      h^ := c.m < N
+    end
+
+    PutSector(vol, dpg1, cast(PDiskSector, @b))
+  end
+end underflow
+
+procedure delete(vol: OFS.Volume; name: pointer to array of char; dpg0: int32; h: pointer to boolean; fad: pointer to int32)
+  (*search and delete entry with key name; if a page underflow arises,
+  balance with adjacent page or merge; h := "page dpg0 is undersize"*)
+  var
+    i, L, R, dpg1: int32
+    a: DirPage
+
+  procedure del(dpg1: int32; h: pointer to boolean; R: pointer to int32; a: pointer to DirPage; vol: pointer to OFS.Volume)
+    var
+      dpg2: int32 // global: a, R
+      b: DirPage
+  begin
+    GetSector(vol^, dpg1, cast(PDiskSector, @b))
+    dpg2 := b.e[b.m - 1].p
+    if dpg2 # 0 then
+      del(dpg2, h, R, a, vol)
+      if h^ then
+        underflow(vol^, @b, dpg2, b.m, h)
+        PutSector(vol^, dpg1, cast(PDiskSector, @b))
+      end
+    else
+      b.e[b.m - 1].p := a.e[R^].p
+      a.e[R^] := b.e[b.m - 1]
+      dec(b.m)
+      h^ := b.m < N
+      PutSector(vol^, dpg1, cast(PDiskSector, @b))
+    end
+  end del
+begin
+  // ~h
+  GetSector(vol, dpg0, cast(PDiskSector, @a))
+  L := 0 // binary search
+  R := a.m
+  while L < R do
+    i := asr(L + R, 1)
+    if name^ <= a.e[i].name then
+      R := i
+    else
+      L := i + 1
+    end
+  end
+
+  if R = 0 then
+    dpg1 := a.p0
+  else
+    dpg1 := a.e[R - 1].p
+  end
+  if (R < a.m) & (name^ = a.e[R].name) then
+    // found, now delete
+    fad^ := a.e[R].adr
+    if dpg1 = 0 then
+      // a is a leaf page
+      dec(a.m)
+      h^ := a.m < N
+      i := R
+      while i < a.m do
+        a.e[i] := a.e[i + 1]
+        inc(i)
+      end
+    else
+      del(dpg1, h, @R, @a, @vol)
+      if h^ then
+        underflow(vol, @a, dpg1, R, h)
+      end
+    end
+
+    PutSector(vol, dpg0, cast(PDiskSector, @a))
+  elsif dpg1 # 0 then
+    delete(vol, name, dpg1, h, fad)
+    if h^ then
+      underflow(vol, @a, dpg1, R, h)
+      PutSector(vol, dpg0, cast(PDiskSector, @a))
+    end
+  else
+    // not in tree
+    fad^ := 0
+  end
+end delete
+
+procedure DirDelete(vol: OFS.Volume; name: pointer to array of char; fad: pointer to int32)
+  var
+    h: boolean
+    newroot: int32
+    a: DirPage
+begin
+  h := false
+  delete(vol, name, DirRootAdr, @h, fad)
+  if h then
+    // root underflow
+    GetSector(vol, DirRootAdr, cast(PDiskSector, @a))
+    if (a.m = 0) & (a.p0 # 0) then
+      newroot := a.p0
+      GetSector(vol, newroot, cast(PDiskSector, @a))
+      PutSector(vol, DirRootAdr, cast(PDiskSector, @a))
+    end
+  end
+end DirDelete
+
+procedure MatchPrefix(mask, name: pointer to array of char; pos, diff: pointer to int32)
+begin
+  pos^ := 0
+  loop
+    if mask[pos^] = 0X then
+      pos^ := -1
+      diff^ := 0
+      exit
+    elsif mask[pos^] = "*" then
+      if mask[pos^ + 1] = 0X then
+        pos^ := -1
+      end
+      diff^ := 0
+      exit
+    end
+
+    diff^ := val(int32, val(int16, ord(name[pos^])) - val(int16, ord(mask[pos^])))
+    if diff^ # 0 then
+      exit
+    end
+    inc(pos^)
+  end
+end MatchPrefix
+
+procedure Match(pos: int32; pat, name: pointer to array of char): boolean
+  var
+    i0, i1_, j0, j1: int32
+    f: boolean
+begin
+  f := true
+  if pos # -1 then
+    i0 := pos
+    j0 := pos
+    loop
+      if pat[i0] = "*" then
+        inc(i0)
+        if pat[i0] = 0X then
+          exit
+        end
+      (*ELSIF pat[i0] = 0X THEN
+      EXIT*)
+      else
+        if name[j0] # 0X then
+          f := false
+        end
+        exit
+      end
+
+      f := false
+      loop
+        if name[j0] = 0X then
+          exit
+        end
+        i1_ := i0
+        j1 := j0
+        loop
+          if (pat[i1_] = 0X) or (pat[i1_] = "*") then
+            f := true
+            exit
+          end
+          if pat[i1_] # name[j1] then
+            exit
+          end
+          inc(i1_)
+          inc(j1)
+        end
+
+        if f then
+          j0 := j1
+          i0 := i1_
+          exit
+        end
+        inc(j0)
+      end
+
+      if ~f then
+        exit
+      end
+    end
+  end
+
+  return f & (name[0] # 0X)
+end Match
+
+procedure enumerate(fs: OFS.FileSystem; mask: pointer to array of char; dpg: int32; flags: pointer to set; proc_: OFS.EntryHandler)
+  var
+    i, pos, diff, dpg1: int32
+    a: DirPage
+    time, date, size_: int32
+begin
+  GetSector(fs.vol, dpg, cast(PDiskSector, @a))
+  i := 0
+  while (i < a.m) & ~(OFS.EnumStop in flags^) do
+    MatchPrefix(mask, @a.e[i].name, @pos, @diff)
+    if i = 0 then
+      dpg1 := a.p0
+    else
+      dpg1 := a.e[i - 1].p
+    end
+    if diff >= 0 then
+      // matching prefix
+      if dpg1 # 0 then
+        enumerate(fs, mask, dpg1, flags, proc_)
+      end
+      if diff = 0 then
+        if ~(OFS.EnumStop in flags^) & Match(pos, mask, @a.e[i].name) then
+          if flags^ * {OFS.EnumSize,OFS.EnumTime} # {} then
+            GetSector(fs.vol, a.e[i].adr, cast(PDiskSector, hp))
+            time := hp.time
+            date := hp.date
+            size_ := hp.aleng * SS + hp.bleng - HS
+          else
+            time := 0
+            date := 0
+            size_ := (-2147483647-1)
+          end
+
+          if fs = OFS.First() then
+            proc_(@a.e[i].name, time, date, size_, flags)
+          else
+            OFS.JoinName(@fs.prefix, @a.e[i].name, @fullname)
+            proc_(@fullname, time, date, size_, flags)
+          end
+        end
+
+      else
+        flags^ := flags^ + {OFS.EnumStop}
+      end
+    end
+
+    inc(i)
+  end
+
+  if ~(OFS.EnumStop in flags^) & (i > 0) & (a.e[i - 1].p # 0) then
+    enumerate(fs, mask, a.e[i - 1].p, flags, proc_)
+  end
+end enumerate
+
+procedure Enumerate(fs: OFS.FileSystem; const mask: pointer to array of char; flags: pointer to set; proc_: OFS.EntryHandler)
+begin
+  enumerate(fs, mask, DirRootAdr, flags, proc_)
+end Enumerate
+
+procedure DirInit(vol: OFS.Volume; init: pointer to boolean)
+  var
+    k: int32
+    A: array 2000 of int32
+    files: int32
+    bad: boolean
+
+  procedure MarkSectors(A: pointer to array 2000 of int32; bad: pointer to boolean; files: pointer to int32; 
+                          k: pointer to int32; vol: pointer to OFS.Volume)
+    var
+      L, R, i, j, n, x: int32
+      hd: FileHeader
+      sup, sub: IndexSector
+
+    procedure sift(L, R: int32; A: pointer to array 2000 of int32)
+      var
+        i, j, x: int32
+    begin
+      j := L
+      x := A[j]
+      loop
+        i := j
+        j := 2 * j + 1
+        if (j + 1 < R) & (A[j] < A[j + 1]) then
+          inc(j)
+        end
+        if (j >= R) or (x > A[j]) then
+          exit
+        end
+        A[i] := A[j]
+      end
+
+      A[i] := x
+    end sift
+  begin
+    Kernel.WriteString(" marking")
+    L := asr(k^, 1) // heapsort
+    R := k^
+    while L > 0 do
+      dec(L)
+      sift(L, R, A)
+    end
+    while R > 0 do
+      dec(R)
+      x := A[0]
+      A[0] := A[R]
+      A[R] := x
+      sift(L, R, A)
+    end
+
+    while L < k^ do
+      bad^ := false
+      inc(files^)
+      if band(files^, 127) = 0 then
+        Kernel.WriteChar(".")
+      end
+      GetSector(vol^, A[L], cast(PDiskSector, @hd))
+      if hd.aleng < STS then
+        j := hd.aleng + 1
+        repeat
+          dec(j)
+          if hd.sec[j] # 0 then
+            MarkSector(vol^, hd.sec[j])
+          else
+            hd.aleng := j - 1
+            bad^ := true
+          end
+        until j = 0
+
+      else
+        j := STS
+        repeat
+          dec(j)
+          if hd.sec[j] # 0 then
+            MarkSector(vol^, hd.sec[j])
+          else
+            hd.aleng := j - 1
+            bad^ := true
+          end
+        until j = 0
+
+        if hd.ext = 0 then
+          hd.aleng := STS - 1i2
+          bad^ := true
+        end
+        if ~bad^ then
+          MarkSector(vol^, hd.ext)
+          GetSector(vol^, hd.ext, cast(PDiskSector, @sup))
+          n := asr(hd.aleng - STS, 10)
+          i := 0
+          while (i <= n) & ~bad^ do
+            if sup.x[i] # 0 then
+              MarkSector(vol^, sup.x[i])
+              GetSector(vol^, sup.x[i], cast(PDiskSector, @sub))
+              if i < n then
+                j := XS
+              else
+                j := band(hd.aleng - STS, 1023) + 1
+              end
+
+              repeat
+                dec(j)
+                if (obmod(sub.x[j], SF) = 0) & (sub.x[j] > 0) then
+                  MarkSector(vol^, sub.x[j])
+                else
+                  bad^ := true
+                end
+              until j = 0
+
+              inc(i)
+            else
+              bad^ := true
+            end
+
+            if bad^ then
+              if i = 0 then
+                hd.aleng := STS - 1i2
+              else
+                hd.aleng := STS + (i - 1) * XS
+              end
+            end
+          end
+        end
+      end
+
+      if bad^ then
+        Kernel.WriteLn()
+        Kernel.WriteString(@hd.name)
+        Kernel.WriteString(" truncated")
+        hd.bleng := SS // really bad
+        if hd.aleng < 0 then
+          hd.aleng := 0
+        end
+        PutSector(vol^, A[L], cast(PDiskSector, @hd))
+      end
+
+      inc(L)
+    end
+  end MarkSectors
+
+  procedure TraverseDir(dpg: int32; A: pointer to array 2000 of int32; bad: pointer to boolean; files: pointer to int32; 
+                          k: pointer to int32; vol: pointer to OFS.Volume)
+    var
+      i: int32
+      a: DirPage
+  begin
+    GetSector(vol^, dpg, cast(PDiskSector, @a))
+    MarkSector(vol^, dpg)
+    i := 0
+    while i < a.m do
+      A[k^] := a.e[i].adr
+      inc(k^)
+      inc(i)
+      if k^ = 2000 then
+        MarkSectors(A, bad, files, k, vol)
+        k^ := 0
+      end
+    end
+
+    if a.p0 # 0 then
+      TraverseDir(a.p0, A, bad, files, k, vol)
+      i := 0
+      while i < a.m do
+        TraverseDir(a.e[i].p, A, bad, files, k, vol)
+        inc(i)
+      end
+    end
+  end TraverseDir
+begin
+  if ~(OFS.ReadOnly in vol.flags) then
+    k := 0
+    init^ := false
+    DirStartup(vol, init)
+    if ~init^ then
+      files := 0
+      Kernel.WriteString(thisModuleName)
+      Kernel.WriteString(": Scanning ")
+      Kernel.WriteString(@vol.name)
+      Kernel.WriteString("...")
+      TraverseDir(DirRootAdr, @A, @bad, @files, @k, @vol)
+      MarkSectors(@A, @bad, @files, @k, @vol)
+      init^ := true
+      Kernel.WriteInt(files, 6)
+      Kernel.WriteString(" files")
+      Kernel.WriteLn()
+    end
+
+  else
+    init^ := true
+  end
+end DirInit
+
+procedure DirStartup(vol: OFS.Volume; init: pointer to boolean)
+
+  var
+    j, sec, size_, q, free, thres: int32
+    mi: MapIndex
+    ms: MapSector
+    s: array 10 of char
+    found: boolean
+begin
+  size_ := Size(vol)
+  init^ := false
+  found := false
+  if (vol.Available(vol) = size_) & (size_ # 0) then
+    // all sectors available
+    GetSector(vol, size_ * SF, cast(PDiskSector, @mi))
+    if mi.mark = MapMark then
+      j := 0 // check consistency of index
+      while (j # MapIndexSize) & (mi.index[j] >= 0) & (obmod(mi.index[j], SF) = 0) do
+        inc(j)
+      end
+
+      if j = MapIndexSize then
+        found := true
+        mi.mark := 0 // invalidate index
+        PutSector(vol, size_ * SF, cast(PDiskSector, @mi))
+        j := 0
+        sec := 1
+        q := 0
+        loop
+          if (j = MapIndexSize) or (mi.index[j] = 0) then
+            exit
+          end
+          GetSector(vol, mi.index[j], cast(PDiskSector, @ms))
+          repeat
+            if band(sec, 31) in ms.map[band(asr(sec, 5), 1023)] then
+              MarkSector(vol, sec * SF)
+              inc(q)
+            end
+
+            if sec = size_ then
+              exit
+            end
+            inc(sec)
+          until band(sec, 32767) = 0
+
+          inc(j)
+        end
+
+        Kernel.GetConfig("DiskGC", @s, 10)
+        thres := 0
+        j := 0
+        while s[j] # 0X do
+          thres := thres * 10 + val(int32, val(int16, ord(s[j])) - 48)
+          inc(j)
+        end
+        if thres < 10 then
+          thres := 10
+        elsif thres > 100 then
+          thres := 100
+        end
+
+        assert(q = size_ - vol.Available(vol))
+        free := obdiv(vol.Available(vol) * 100, size_)
+        if (free > thres) & (vol.Available(vol) * SS > 1048576) then
+          init^ := true
+        else
+          // undo
+          for j := SF to size_ * SF by SF do
+            if Marked(vol, j) then
+              FreeSector(vol, j)
+            end
+          end
+
+          assert(vol.Available(vol) = size_)
+          Kernel.WriteString(thisModuleName)
+          Kernel.WriteString(": ")
+          Kernel.WriteInt(free, 1)
+          Kernel.WriteString("% free, forcing disk GC on ")
+          Kernel.WriteString(@vol.name)
+          Kernel.WriteLn()
+        end
+      end
+    end
+
+    (*IF ~found THEN
+    Kernel.WriteString(thisModuleName);
+    Kernel.WriteString(": Index not found on ");
+    Kernel.WriteString(vol.name); Kernel.WriteLn
+    END*)
+  end
+end DirStartup
+
+procedure DirCleanup(vol: OFS.Volume)
+  var
+    i, j, p, q, sec, size_: int32
+    mi: MapIndex
+    ms: MapSector
+begin
+  size_ := Size(vol)
+  i := size_ * SF
+  if ~(OFS.ReadOnly in vol.flags) & ~Marked(vol, i) then
+    // last sector is free
+    j := 0
+    sec := 1
+    q := 0
+    loop
+      repeat
+        dec(i, SF) // find a free sector
+      until (i = 0) or ~Marked(vol, i)
+      if i = 0 then
+        return // no more space, don't commit
+      end
+      mi.index[j] := i
+      inc(j)
+      for p := 0 to MapSize - 1i2 do
+        ms.map[p] := {}
+      end
+      repeat
+        if Marked(vol, sec * SF) then
+          ms.map[band(asr(sec, 5), 1023)] := ms.map[band(asr(sec, 5), 1023)] + {band(sec, 31)}
+          inc(q)
+        end
+
+        if sec = size_ then
+          PutSector(vol, i, cast(PDiskSector, @ms))
+          exit
+        end
+
+        inc(sec)
+      until band(sec, 32767) = 0
+
+      PutSector(vol, i, cast(PDiskSector, @ms))
+    end
+
+    while j # MapIndexSize do
+      mi.index[j] := 0
+      inc(j)
+    end
+    mi.mark := val(int32, MapMark)
+    PutSector(vol, size_ * SF, cast(PDiskSector, @mi))
+    Kernel.WriteString(thisModuleName)
+    Kernel.WriteString(": Map saved on ")
+    Kernel.WriteString(@vol.name)
+    Kernel.WriteLn()
+  end
+end DirCleanup
+
+// Check a file name.
+
+procedure Check(s, name: pointer to array of char; res: pointer to int32)
+  var
+    i: int16
+    ch: char
+begin
+  ch := s[0]
+  i := 0
+  if (41H <= val(int32, band(ord(ch), 0DFH))) & (val(int32, band(ord(ch), 0DFH)) <= 5AH) then
+    loop
+      name[i] := ch
+      inc(i)
+      ch := s[i]
+      if ch = 0X then
+        while i < FnLength do
+          name[i] := 0X
+          inc(i)
+        end
+        res^ := 0
+        exit
+      end
+
+      if ~((41H <= val(int32, band(ord(ch), 0DFH))) & (val(int32, band(ord(ch), 0DFH)) <= 5AH) or ("0" <= ch) & (ch <= "9") or (ch = ".")) then
+        res^ := 3
+        exit
+      end
+
+      if i = FnLength - 1i1 then
+        res^ := 4
+        exit
+      end
+    end
+
+  elsif ch = 0X then
+    name[0] := 0X
+    res^ := -1
+  else
+    res^ := 3
+  end
+end Check
+
+// Creates a new file with the specified name.
+procedure New(fs: OFS.FileSystem; const name: pointer to array of char): OFS.File
+  var
+    i, res: int32
+    f: File
+    buf: Buffer
+    head: FileHd
+    namebuf: FileName
+begin
+  f := nil
+  Check(name, @namebuf, @res)
+  if res <= 0 then
+    newgc(buf)
+    buf.apos := 0
+    buf.mod_ := true
+    buf.lim := HS
+    buf.next := buf
+    head := cast(FileHd, cast(FileHd, @buf.data))
+    head.mark := val(int32, HeaderMark)
+    head.aleng := 0
+    head.bleng := HS
+    copy(@head.name, @namebuf, 32 (* FnLength *))
+    Kernel.GetClock(@head.time, @head.date)
+    newgc(f)
+    f.fs := fs
+    f.key := 0
+    f.aleng := 0
+    f.bleng := HS
+    f.modH := true
+    f.time := head.time
+    f.date := head.date
+    f.firstbuf := buf
+    f.nofbufs := 1
+    copy(@f.name, @namebuf, 32 (* FnLength *))
+    f.sechint := InitHint
+    f.registered := false
+    f.ext := nil
+    i := 0
+    repeat
+      f.sec[i] := 0
+      head.sec[i] := 0
+      inc(i)
+    until i = STS
+  end
+
+  return f
+end New
+
+procedure UpdateHeader(f: File; h: pointer to FileHeader)
+begin
+  h.aleng := f.aleng
+  h.bleng := f.bleng
+  h.sec := f.sec
+  if f.ext # nil then
+    h.ext := f.ext.adr
+  else
+    h.ext := 0
+  end
+  h.date := f.date
+  h.time := f.time
+end UpdateHeader
+
+procedure ReadBuf(f: File; buf: Buffer; pos: int32)
+  var
+    sec, xpos: int32
+begin
+  if pos < STS then
+    sec := f.sec[pos]
+  else
+    xpos := pos - STS
+    sec := f.ext.sub[asr(xpos, 10)].sec.x[band(xpos, 1023)]
+  end
+
+  GetSector(f.fs.vol, sec, cast(PDiskSector, @buf.data))
+  if pos < f.aleng then
+    buf.lim := SS
+  else
+    buf.lim := f.bleng
+  end
+  buf.apos := pos
+  buf.mod_ := false
+end ReadBuf
+
+procedure NewSuper(f: File)
+  var
+    i: int32
+    super: SuperIndex
+begin
+  newgc(super)
+  super.adr := 0
+  super.mod_ := true
+  f.modH := true
+  f.ext := super
+  for i := 0 to XS - 1i2 do
+    super.sub[i] := nil
+  end
+end NewSuper
+
+procedure WriteBuf(f: File; buf: Buffer)
+  var
+    i, k, xpos, secadr: int32
+    super: SuperIndex
+    sub: SubIndex
+    vol: OFS.Volume
+begin
+  vol := f.fs.vol
+  Kernel.GetClock(@f.time, @f.date)
+  f.modH := true
+  if buf.apos < STS then
+    secadr := f.sec[buf.apos]
+    if secadr = 0 then
+      AllocSector(vol, f.sechint, @secadr)
+      f.modH := true
+      f.sec[buf.apos] := secadr
+      f.sechint := secadr
+    end
+
+    if buf.apos = 0 then
+      UpdateHeader(f, cast(FileHd, @buf.data))
+      f.modH := false
+    end
+
+  else
+    super := f.ext
+    if super = nil then
+      NewSuper(f)
+      super := f.ext
+    end
+    xpos := buf.apos - STS
+    i := asr(xpos, 10)
+    sub := super.sub[i]
+    if sub = nil then
+      newgc(sub)
+      sub.adr := 0
+      sub.sec.x[0] := 0
+      super.sub[i] := sub
+      super.mod_ := true
+    end
+
+    k := band(xpos, 1023)
+    secadr := sub.sec.x[k]
+    if secadr = 0 then
+      AllocSector(vol, f.sechint, @secadr)
+      f.sechint := secadr
+      sub.mod_ := true
+      sub.sec.x[k] := secadr
+    end
+  end
+
+  PutSector(vol, secadr, cast(PDiskSector, @buf.data))
+  buf.mod_ := false
+end WriteBuf
+
+procedure SearchBuf(f: File; pos: int32): Buffer
+  var
+    buf: Buffer
+begin
+  buf := f.firstbuf
+  loop
+    if buf.apos = pos then
+      exit
+    end
+    buf := buf.next
+    if buf = f.firstbuf then
+      buf := nil
+      exit
+    end
+  end
+
+  return buf
+end SearchBuf
+
+procedure GetBuf(f: File; pos: int32): Buffer
+  var
+    buf: Buffer
+begin
+  buf := f.firstbuf
+  loop
+    if buf.apos = pos then
+      exit
+    end
+    if buf.next = f.firstbuf then
+      if f.nofbufs < MaxBufs then
+        // allocate new buffer
+        newgc(buf)
+        buf.next := f.firstbuf.next
+        f.firstbuf.next := buf
+        inc(f.nofbufs)
+      else
+        // take one of the buffers
+        f.firstbuf := buf
+        if buf.mod_ then
+          WriteBuf(f, buf)
+        end
+      end
+
+      buf.apos := pos
+      if pos <= f.aleng then
+        ReadBuf(f, buf, pos)
+      end
+      exit
+    end
+
+    buf := buf.next
+  end
+
+  return buf
+end GetBuf
+
+// Return unique id for file, or 0 if it does not exist.
+procedure FileKey(fs: OFS.FileSystem; const name: pointer to array of char): int32
+  var
+    res: int32
+    namebuf: FileName
+    header: int32
+begin
+  header := 0
+  Check(name, @namebuf, @res)
+  if res = 0 then
+    Search(fs.vol, @namebuf, @header)
+  end
+
+  return header
+end FileKey
+
+// Open an existing file.
+procedure Old(fs: OFS.FileSystem; const name: pointer to array of char): OFS.File
+
+  var
+    i, k, res: int32
+    f: File
+    header: int32
+    buf: Buffer
+    head: FileHd
+    namebuf: FileName
+    super: SuperIndex
+    sub: SubIndex
+    sec: IndexSector
+    vol: OFS.Volume
+begin
+  f := nil
+  Check(name, @namebuf, @res)
+  if res = 0 then
+    vol := fs.vol
+    Search(vol, @namebuf, @header)
+    if header # 0 then
+      if f = nil then
+        newgc(buf)
+        buf.apos := 0
+        buf.next := buf
+        buf.mod_ := false
+
+        GetSector(vol, header, cast(PDiskSector, @buf.data))
+        head := cast(FileHd, cast(FileHd, @buf.data))
+
+        newgc(f)
+        f.fs := fs
+        f.key := header
+        f.aleng := head.aleng
+        f.bleng := head.bleng
+        f.time := head.time
+        f.date := head.date
+        if f.aleng = 0 then
+          buf.lim := f.bleng
+        else
+          buf.lim := SS
+        end
+        f.firstbuf := buf
+        f.nofbufs := 1
+        copy(@f.name, @namebuf, 32 (* FnLength *))
+        f.registered := true
+        f.sec := head.sec
+        k := asr(f.aleng + (XS - STS), 10)
+        if k # 0 then
+          newgc(super)
+          super.adr := head.ext
+          super.mod_ := false
+          f.ext := super
+          GetSector(vol, super.adr, cast(PDiskSector, @sec))
+          i := 0
+          while i # k do
+            newgc(sub)
+            sub.adr := sec.x[i]
+            sub.mod_ := false
+            super.sub[i] := sub
+            GetSector(vol, sub.adr, cast(PDiskSector, @sub.sec))
+            inc(i)
+          end
+
+          while i # XS do
+            super.sub[i] := nil
+            inc(i)
+          end
+        else
+          f.ext := nil
+        end
+
+        f.sechint := header
+        f.modH := false
+      end
+    end
+  end
+
+  return f
+end Old
+
+procedure Unbuffer(f: File)
+  // f.sec
+
+  var
+    i, k: int32
+    buf: Buffer
+    super: SuperIndex
+    sub: SubIndex
+    head: FileHeader
+    sec: IndexSector
+    vol: OFS.Volume
+begin
+  vol := f.fs.vol
+  buf := f.firstbuf
+  repeat
+    if buf.mod_ then
+      WriteBuf(f, buf)
+    end
+    buf := buf.next
+  until buf = f.firstbuf
+
+  super := f.ext
+  if super # nil then
+    k := asr(f.aleng + (XS - STS), 10)
+    i := 0
+    while i # k do
+      sub := super.sub[i]
+      inc(i)
+      if sub.mod_ then
+        if sub.adr = 0 then
+          AllocSector(vol, f.sechint, @sub.adr)
+          f.sechint := sub.adr
+          super.mod_ := true
+        end
+
+        PutSector(vol, sub.adr, cast(PDiskSector, @sub.sec))
+        sub.mod_ := false
+      end
+    end
+
+    if super.mod_ then
+      if super.adr = 0 then
+        AllocSector(vol, f.sechint, @super.adr)
+        f.sechint := super.adr
+        f.modH := true
+      end
+
+      i := 0
+      while i # k do
+        sec.x[i] := super.sub[i].adr
+        inc(i)
+      end
+      while i # XS do
+        sec.x[i] := 0
+        inc(i)
+      end
+      PutSector(vol, super.adr, cast(PDiskSector, @sec))
+      super.mod_ := false
+    end
+  end
+
+  if f.modH then
+    GetSector(vol, f.sec[0], cast(PDiskSector, @head))
+    UpdateHeader(f, @head)
+    PutSector(vol, f.sec[0], cast(PDiskSector, @head))
+    f.modH := false
+  end
+end Unbuffer
+
+procedure Register(f: OFS.File; res: pointer to int16)
+  var
+    repAdr: int32 // address of the file replaced through register, 0 if no such file
+    repFile: OFS.File
+begin
+  case f of
+  | File:
+    Unbuffer(f)
+    if ~f.registered & (f.name # "") then
+      Insert(f.fs.vol, @f.name, f.sec[0], @repAdr)
+      f.registered := true
+      f.key := f.sec[0]
+      if (repAdr # 0) & (f.sec[0] # repAdr) then
+        repFile := OFS.FindOpenFile(f.fs, repAdr)
+        if repFile = nil then
+          PurgeOnDisk(f.fs(FileSystem), repAdr)
+        else
+          repFile(File).registered := false
+        end
+      end
+
+      res^ := 0
+    else
+      res^ := 1
+    end
+  end
+end Register
+
+procedure Close(f: OFS.File)
+begin
+  Unbuffer(f(File))
+end Close
+
+// Returns the current length of a file.
+procedure Length(f: OFS.File): int32
+begin
+  case f of
+  | File:
+    return f.aleng * SS + f.bleng - HS
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Length
+
+// Returns the time (t) and date (d) when a file was last modified.
+procedure GetDate(f: OFS.File; t, d: pointer to int32)
+begin
+  case f of
+  | File:
+    t^ := f.time
+    d^ := f.date
+  end
+end GetDate
+
+// Sets the modification time (t) and date (d) of a file.
+procedure SetDate(f: OFS.File; t, d: int32)
+begin
+  case f of
+  | File:
+    f.modH := true
+    f.time := t
+    f.date := d
+  end
+end SetDate
+
+// Positions a Rider at a certain position in a file. Multiple Riders can be positioned at different locations in a file. 
+// A Rider cannot be positioned beyond the end of a file.
+procedure Set(r: pointer to OFS.Rider; f: OFS.File; pos: int32)
+  var
+    a, b: int32
+begin
+  case f of
+  | File:
+    r.eof := false
+    r.res := 0
+    r.file := f
+    r.fs := f.fs
+    if pos < 0 then
+      a := 0
+      b := HS
+    elsif pos < f.aleng * SS + f.bleng - HS then
+      a := asr(pos + HS, 12)
+      b := band(pos + HS, 4095)
+    else
+      a := f.aleng
+      b := f.bleng
+    end
+
+    r.apos := a
+    r.bpos := b
+    r.hint := f.firstbuf
+  end
+end Set
+
+// Returns the offset of a Rider positioned on a file.
+procedure Pos(r: pointer to OFS.Rider): int32
+begin
+  return r.apos * SS + r.bpos - HS
+end Pos
+
+// Read a byte from a file, advancing the Rider one byte further.  R.eof indicates if the end of the file has been passed.
+procedure Read(r: pointer to OFS.Rider; x: pointer to byte)
+  var
+    buf: Buffer
+    f: File
+begin
+  buf := r.hint(Buffer)
+  f := r.file(File)
+  if r.apos # buf.apos then
+    buf := GetBuf(f, r.apos)
+    r.hint := buf
+  end
+  if r.bpos < buf.lim then
+    x^ := buf.data.B[r.bpos]
+    inc(r.bpos)
+  elsif r.apos < f.aleng then
+    inc(r.apos)
+    buf := SearchBuf(f, r.apos)
+    if buf = nil then
+      buf := r.hint(Buffer)
+      if buf.mod_ then
+        WriteBuf(f, buf)
+      end
+      ReadBuf(f, buf, r.apos)
+    else
+      r.hint := buf
+    end
+
+    x^ := buf.data.B[0]
+    r.bpos := 1
+  else
+    x^ := val(byte, ord(0X))
+    r.eof := true
+  end
+end Read
+
+// Reads a sequence of length n bytes into the buffer x, advancing the Rider. Less bytes will be read when reading over 
+// the end of the file. r.res indicates the number of unread bytes. x must be big enough to hold all the bytes.
+procedure ReadBytes(r: pointer to OFS.Rider; x: pointer to array of byte; x_len: int32; n: int32)
+  var
+    src, dst: AnyPtr
+    m: int32
+    buf: Buffer
+    f: File
+begin
+  if x_len < n then
+    halt(19)
+  end
+  if n > 0 then
+    dst := cast(AnyPtr, @x[0])
+    buf := r.hint(Buffer)
+    f := r.file(File)
+    if r.apos # buf.apos then
+      buf := GetBuf(f, r.apos)
+      r.hint := buf
+    end
+    loop
+      if n <= 0 then
+        exit
+      end
+      src := cast(AnyPtr, @buf.data.B[0])
+      inc(src, r.bpos)
+      m := r.bpos + n
+      if m <= buf.lim then
+        SYS.MOVE(src, dst, n)
+        r.bpos := m
+        r.res := 0
+        exit
+      elsif buf.lim = SS then
+        m := buf.lim - r.bpos
+        if m > 0 then
+          SYS.MOVE(src, dst, m)
+          inc(dst, m)
+          dec(n, m)
+        end
+        if r.apos < f.aleng then
+          inc(r.apos)
+          r.bpos := 0
+          buf := SearchBuf(f, r.apos)
+          if buf = nil then
+            buf := r.hint(Buffer)
+            if buf.mod_ then
+              WriteBuf(f, buf)
+            end
+            ReadBuf(f, buf, r.apos)
+          else
+            r.hint := buf
+          end
+
+        else
+          r.bpos := buf.lim
+          r.res := n
+          r.eof := true
+          exit
+        end
+
+      else
+        m := buf.lim - r.bpos
+        if m > 0 then
+          SYS.MOVE(src, dst, m)
+          r.bpos := buf.lim
+        end
+        r.res := n - m
+        r.eof := true
+        exit
+      end
+    end
+
+  else
+    r.res := 0
+  end
+end ReadBytes
+
+procedure NewSub(f: File)
+  var
+    i, k: int32
+    sub: SubIndex
+begin
+  k := asr(f.aleng - STS, 10)
+  if k = XS then
+    halt(18)
+  end
+  newgc(sub)
+  sub.adr := 0
+  sub.mod_ := true
+  for i := 0 to XS - 1i2 do
+    sub.sec.x[i] := 0
+  end
+  if f.ext = nil then
+    NewSuper(f)
+  end
+  f.ext.sub[k] := sub
+end NewSub
+
+// Writes a byte into the file at the Rider position, advancing the Rider by one.
+procedure Write(r: pointer to OFS.Rider; x: byte)
+  var
+    f: File
+    buf: Buffer
+begin
+  buf := r.hint(Buffer)
+  f := r.file(File)
+  if r.apos # buf.apos then
+    buf := GetBuf(f, r.apos)
+    r.hint := buf
+  end
+  if r.bpos >= buf.lim then
+    if r.bpos < SS then
+      inc(buf.lim)
+      inc(f.bleng)
+      f.modH := true
+    else
+      WriteBuf(f, buf)
+      inc(r.apos)
+      buf := SearchBuf(f, r.apos)
+      if buf = nil then
+        buf := r.hint(Buffer)
+        if r.apos <= f.aleng then
+          ReadBuf(f, buf, r.apos)
+        else
+          buf.apos := r.apos
+          buf.lim := 1
+          inc(f.aleng)
+          f.bleng := 1
+          f.modH := true
+          if band(f.aleng - STS, 1023) = 0 then
+            NewSub(f)
+          end
+        end
+
+      else
+        r.hint := buf
+      end
+
+      r.bpos := 0
+    end
+  end
+
+  buf.data.B[r.bpos] := x
+  inc(r.bpos)
+  buf.mod_ := true
+end Write
+
+// Writes the buffer x containing n bytes into a file at the Rider position.
+procedure WriteBytes(r: pointer to OFS.Rider; x: pointer to array of byte; x_len: int32; n: int32)
+  var
+    src, dst: AnyPtr
+    m: int32
+    f: File
+    buf: Buffer
+begin
+  if x_len < n then
+    halt(19)
+  end
+  if n > 0 then
+    src := cast(AnyPtr, @x[0])
+    buf := r.hint(Buffer)
+    f := r.file(File)
+    if r.apos # buf.apos then
+      buf := GetBuf(f, r.apos)
+      r.hint := buf
+    end
+    loop
+      if n <= 0 then
+        exit
+      end
+      buf.mod_ := true
+      dst := cast(AnyPtr, @buf.data.B[0])
+      inc(dst, r.bpos)
+      m := r.bpos + n
+      if m <= buf.lim then
+        SYS.MOVE(src, dst, n)
+        r.bpos := m
+        exit
+      elsif m <= SS then
+        SYS.MOVE(src, dst, n)
+        r.bpos := m
+        f.bleng := m
+        buf.lim := m
+        f.modH := true
+        exit
+      else
+        m := SS - r.bpos
+        if m > 0 then
+          SYS.MOVE(src, dst, m)
+          inc(src, m)
+          dec(n, m)
+        end
+        WriteBuf(f, buf)
+        inc(r.apos)
+        r.bpos := 0
+        buf := SearchBuf(f, r.apos)
+        if buf = nil then
+          buf := r.hint(Buffer)
+          if r.apos <= f.aleng then
+            ReadBuf(f, buf, r.apos)
+          else
+            buf.apos := r.apos
+            buf.lim := 0
+            inc(f.aleng)
+            f.bleng := 0
+            f.modH := true
+            if band(f.aleng - STS, 1023) = 0 then
+              NewSub(f)
+            end
+          end
+
+        else
+          r.hint := buf
+        end
+      end
+    end
+  end
+end WriteBytes
+
+procedure Free(vol: OFS.Volume; adr: int32)
+begin
+  if (adr # 0) & Marked(vol, adr) then
+    FreeSector(vol, adr)
+  end
+end Free
+
+procedure LogGC(const procname, prefix, name: pointer to array of char)
+begin
+  Kernel.WriteString(thisModuleName)
+  Kernel.WriteString(".")
+  Kernel.WriteString(procname)
+  Kernel.WriteString(" ")
+  Kernel.WriteString(prefix)
+  Kernel.WriteString(":")
+  Kernel.WriteString(name)
+  Kernel.WriteLn()
+end LogGC
+
+procedure Purge(fs: OFS.FileSystem; f: OFS.File)
+  // bsm
+
+  var
+    super: SuperIndex
+    sub: SubIndex
+    k, i, j, aleng, secCount: int32
+begin
+  assert(f.fs = fs)
+  case f of
+  | File:
+    if DEBUG then
+      LogGC("Purge", @fs.prefix, @f.name)
+    end
+    aleng := f.aleng
+    secCount := aleng + 1
+    if secCount > STS then
+      secCount := STS
+    end
+    for i := 0 to secCount - 1 do
+      Free(fs.vol, f.sec[i])
+    end
+
+    dec(aleng, secCount)
+    super := f.ext
+    if aleng >= 0 then
+      assert(super # nil)
+      while aleng >= 0 do
+        sub := super.sub[asr(aleng, 10)]
+        for i := 0 to band(aleng, 1023) do
+          Free(fs.vol, sub.sec.x[i])
+        end
+
+        Free(fs.vol, sub.adr)
+        aleng := aleng - (band(aleng, 1023) + 1)
+      end
+
+      Free(fs.vol, super.adr)
+    end
+  end
+end Purge
+
+procedure PurgeOnDisk(fs: FileSystem; hdadr: int32)
+  // bsm
+  var
+    hd: FileHeader
+    supi, subi: IndexSector
+    aleng, i, k, secCount, subAdr: int32
+    vol: OFS.Volume
+begin
+  assert(fs.vol # nil)
+  vol := fs.vol
+  GetSector(vol, hdadr, cast(PDiskSector, @hd))
+  if DEBUG then
+    LogGC("PurgeOnDisk", @fs.prefix, @hd.name)
+  end
+  aleng := hd.aleng
+  secCount := aleng + 1
+  if secCount > STS then
+    secCount := STS
+  end
+  for i := 0 to secCount - 1 do
+    Free(fs.vol, hd.sec[i])
+  end
+
+  dec(aleng, secCount)
+  if aleng >= 0 then
+    GetSector(vol, hd.ext, cast(PDiskSector, @supi))
+    while aleng >= 0 do
+      subAdr := supi.x[asr(aleng, 10)]
+      GetSector(vol, subAdr, cast(PDiskSector, @subi))
+      for i := 0 to band(aleng, 1023) do
+        Free(fs.vol, subi.x[i])
+      end
+
+      Free(fs.vol, subAdr)
+      aleng := aleng - (band(aleng, 1023) + 1)
+    end
+
+    Free(fs.vol, hd.ext)
+  end
+end PurgeOnDisk
+
+procedure Registered(fs: OFS.FileSystem; f: OFS.File): boolean
+begin
+  // bsm
+
+  assert(fs is FileSystem)
+  assert(f.fs = fs)
+  return f(File).registered
+end Registered
+
+// Deletes a file. res = 0 indicates success.
+procedure Delete(fs: OFS.FileSystem; const name: pointer to array of char; key: pointer to int32; res: pointer to int16)
+
+  var
+    adr: int32
+    namebuf: FileName
+    head: FileHeader
+    vol: OFS.Volume
+    r: int32
+    delFile: OFS.File // bsm
+begin
+  Check(name, @namebuf, @r)
+  res^ := val(int16, r)
+  if res^ = 0 then
+    vol := fs.vol
+    DirDelete(vol, @namebuf, @adr)
+    key^ := adr
+    if adr # 0 then
+      GetSector(vol, adr, cast(PDiskSector, @head))
+      head.mark := val(int32, val(int32, HeaderMark) + 1i4) // invalidate mark
+      PutSector(vol, adr, cast(PDiskSector, @head))
+      delFile := OFS.FindOpenFile(fs, key^)
+      if delFile = nil then
+        PurgeOnDisk(fs(FileSystem), adr)
+      else
+        delFile(File).registered := false
+      end
+
+    else
+      res^ := 2
+    end
+
+  else
+    key^ := 0
+  end
+end Delete
+
+// Renames a file. res = 0 indicates success.
+procedure Rename(fs: OFS.FileSystem; const old, new_: pointer to array of char; res: pointer to int16)
+
+  var
+    adr: int32
+    oldbuf, newbuf: FileName
+    head: FileHeader
+    vol: OFS.Volume
+    f: OFS.File
+    r: int32
+    repFile: OFS.File
+    repAdr: int32 // address of the file replaced through the rename, 0 if no such file
+begin
+  Check(old, @oldbuf, @r)
+  res^ := val(int16, r)
+  if res^ = 0 then
+    Check(new_, @newbuf, @r)
+    res^ := val(int16, r)
+    if res^ = 0 then
+      vol := fs.vol
+      DirDelete(vol, @oldbuf, @adr)
+      if adr # 0 then
+        f := OFS.FindOpenFile(fs, adr)
+        if f # nil then
+          copy(@f(File).name, @newbuf, 32 (* FnLength *))
+        end
+        Insert(vol, @newbuf, adr, @repAdr)
+        GetSector(vol, adr, cast(PDiskSector, @head))
+        copy(@head.name, @newbuf, 32 (* FnLength *))
+        PutSector(vol, adr, cast(PDiskSector, @head))
+        if (repAdr # 0) & (adr # repAdr) then
+          // bsm
+          repFile := OFS.FindOpenFile(fs, repAdr)
+          if repFile = nil then
+            PurgeOnDisk(fs(FileSystem), repAdr)
+          else
+            repFile(File).registered := false
+          end
+        end
+
+      else
+        res^ := 2
+      end
+    end
+  end
+end Rename
+
+procedure GetName(f: OFS.File; name: pointer to array of char; name_len: int32)
+begin
+  copy(name, @f(File).name, name_len)
+end GetName
+
+// File system initialization and finalization
+
+procedure Finalize(fs: OFS.FileSystem)
+begin
+  case fs of
+  | FileSystem:
+    DirCleanup(fs.vol)
+    fs.vol.Finalize(fs.vol)
+    fs.vol := nil // prevent access in case user still has file handles
+  end
+end Finalize
+
+// Generate a new file system object.  OFS.NewVol has volume parameter, OFS.Par has mount prefix.
+procedure NewFS*()
+
+  var
+    vol: OFS.Volume
+    fs: FileSystem
+    init: boolean
+    i: int32
+    ch: char
+    prefix: OFS.Prefix
+    s: array 64 of char
+begin
+  vol := OFS.NewVol
+  Kernel.SetLogMark()
+  repeat
+    OFS.ReadPar(@ch)
+  until ch # " "
+  i := 0
+  while (ch # 0X) & (ch # " ") do
+    prefix[i] := ch
+    inc(i)
+    OFS.ReadPar(@ch)
+  end
+  prefix[i] := 0X
+  if OFS.This(@prefix) = nil then
+    if (vol.blockSize = SS) & (vol.size_ >= MinVolSize) then
+      GetSector(vol, DirRootAdr, cast(PDiskSector, hp))
+      if hp.mark = DirMark then
+        // assume it is an Aos filesystem
+        newgc(fs)
+        fs.vol := vol
+        assert(vol.size_ < 2147483647i4 div SF)
+        copy(@fs.desc, "GCAosFS", 32)
+        fs.FileKey := FileKey
+        fs.New := New
+        fs.Old := Old
+        fs.Delete := Delete
+        fs.Rename := Rename
+        fs.Enumerate := Enumerate
+        fs.Close := Close
+        fs.Register := Register
+        fs.Length := Length
+        fs.GetDate := GetDate
+        fs.SetDate := SetDate
+        fs.GetName := GetName
+        fs.Set := Set
+        fs.Pos := Pos
+        fs.Read := Read
+        fs.Write := Write
+        fs.ReadBytes := ReadBytes
+        fs.WriteBytes := WriteBytes
+        fs.Finalize := Finalize
+        fs.Purge := Purge
+        fs.Registered := Registered
+        DirInit(vol, @init)
+        assert(init) // will have to undo changes to vol before continuing
+        OFS.Add(fs, @prefix)
+      else
+        Kernel.WriteString(thisModuleName)
+        Kernel.WriteString(": File system not found on ")
+        Kernel.WriteString(@vol.name)
+        Kernel.WriteLn()
+      end
+
+    else
+      Kernel.WriteString(thisModuleName)
+      Kernel.WriteString(": Bad volume size")
+      Kernel.WriteLn()
+    end
+
+  else
+    Kernel.WriteString(thisModuleName)
+    Kernel.WriteString(": ")
+    Kernel.WriteString(@prefix)
+    Kernel.WriteString(" already in use")
+    Kernel.WriteLn()
+  end
+
+  Kernel.GetMarkedLog(@s, 64)
+  OFS.SetPar(@s)
+end NewFS
+
+// Clean up when module freed.
+procedure Cleanup()
+  var
+    fs: OFS.FileSystem
+begin
+  if Kernel.shutdown = 0 then
+    repeat
+      // unmount all AosFSs
+      fs := OFS.First() // look for fs to unmount
+      while (fs # nil) & ~(fs is FileSystem) do
+        fs := OFS.Next(fs)
+      end
+
+      if fs # nil then
+        OFS.Remove(fs)
+      end
+    until fs = nil
+  end
+end Cleanup
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewFS" end return NewFS end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("OFSAosFiles", cmd_)
+
+  newgc(hp)
+  Kernel.InstallTermHandler(Cleanup)
+end OFSAosFiles.

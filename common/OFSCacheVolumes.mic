@@ -1,0 +1,283 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module OFSCacheVolumes [level=5]
+
+import OFS, SYS, Modules
+// pjm
+
+// Cache for arbitrary volumes.
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  Array2dOfChar* = record len0*, len1*: int32; data*: pointer to array of char end // descriptor for ARRAY OF ARRAY OF char
+  
+  Buffer = pointer to BufferDesc
+
+  Volume* = pointer to VolumeDesc
+
+  BufferDesc = record
+    adr, index: int32
+    nextHash, prevHash, nextLRU, prevLRU: Buffer
+  end
+
+  VolumeDesc* = object (OFS.VolumeDesc)
+
+    real_*: OFS.Volume
+    hashSize*, cacheSize*, getCount*, putCount*, getHitCount*, putHitCount*: int32
+
+    data: Array2dOfChar // use a single heap block to reduce GC overhead
+    hashTable: pointer to array of Buffer
+    lru: Buffer
+  end
+
+procedure FindBuffer(vol: Volume; adr: int32): Buffer
+  var
+    buf: Buffer
+begin
+  assert(adr > 0)
+  buf := vol.hashTable[obmod(adr, vol.hashSize)]
+  while (buf # nil) & (buf.adr # adr) do
+    buf := buf.nextHash
+  end
+  if buf # nil then
+    // move to end of lru list
+    buf.prevLRU.nextLRU := buf.nextLRU
+    buf.nextLRU.prevLRU := buf.prevLRU
+    buf.prevLRU := vol.lru.prevLRU
+    buf.nextLRU := vol.lru
+    buf.prevLRU.nextLRU := buf
+    buf.nextLRU.prevLRU := buf
+  end
+
+  return buf
+end FindBuffer
+
+procedure ReplaceBuffer(vol: Volume; adr: int32): Buffer
+  var
+    buf: Buffer
+    old, new_: int32
+begin
+  buf := vol.lru // re-use buffer and move to end of lru list
+  vol.lru := vol.lru.nextLRU
+  old := obmod(buf.adr, vol.hashSize)
+  new_ := obmod(adr, vol.hashSize)
+  buf.adr := adr
+  if old # new_ then
+    // remove
+    if buf.prevHash # nil then
+      buf.prevHash.nextHash := buf.nextHash
+    else
+      vol.hashTable[old] := buf.nextHash
+    end
+
+    if buf.nextHash # nil then
+      buf.nextHash.prevHash := buf.prevHash
+    end
+    // add in front
+    buf.prevHash := nil
+    buf.nextHash := vol.hashTable[new_]
+    vol.hashTable[new_] := buf
+    if buf.nextHash # nil then
+      buf.nextHash.prevHash := buf
+    end
+  end
+
+  return buf
+end ReplaceBuffer
+
+(*
+read-ahead experiment: speeds up Oberon-0 booting from 0:40 to 0:26, but might also slow it down significantly
+
+PROCEDURE ReadAhead(vol: Volume; adr: LONGINT; VAR blk: ARRAY OF SYSTEM.BYTE);
+CONST Num = 2*18*512 DIV 2048;
+VAR n: LONGINT; buf: Buffer;
+BEGIN
+ASSERT(vol.blockSize = 2048);
+DEC(adr, (adr-1) MOD Num); (* round down 1-based adr to start of Num-block region *)
+FOR n := 0 TO Num-1 DO
+buf := FindBuffer(vol, adr);
+IF buf = NIL THEN
+vol.real.GetBlock(vol.real, adr, blk);
+buf := ReplaceBuffer(vol, adr);
+SYSTEM.MOVE(SYSTEM.ADR(blk[0]), SYSTEM.ADR(vol.data[buf.index,0]), vol.blockSize)
+END;
+INC(adr)
+END
+END ReadAhead;
+*)
+
+procedure GetBlock(vol: OFS.Volume; adr: int32; blk: pointer to array of byte; blk_len: int32)
+  var
+    buf: Buffer
+begin
+  case vol of
+  | Volume:
+    (*IF (vol.cacheSize = 1440 DIV 2) & (vol.blockSize = 2048) THEN
+    ReadAhead(vol, adr, blk)
+    END;*)
+    inc(vol.getCount)
+    buf := FindBuffer(vol, adr)
+    if buf # nil then
+      // copy from cache
+      inc(vol.getHitCount)
+      SYS.MOVE(cast(AnyPtr, @vol.data.data[(buf.index) * vol.data.len1 + (0)]), cast(AnyPtr, @blk[0]), vol.blockSize)
+    else
+      // replace a buffer
+      vol.real_.GetBlock(vol.real_, adr, blk, blk_len)
+      buf := ReplaceBuffer(vol, adr)
+      SYS.MOVE(cast(AnyPtr, @blk[0]), cast(AnyPtr, @vol.data.data[(buf.index) * vol.data.len1 + (0)]), vol.blockSize)
+    end
+  end
+end GetBlock
+
+procedure PutBlock(vol: OFS.Volume; adr: int32; blk: pointer to array of byte; blk_len: int32)
+  var
+    buf: Buffer
+begin
+  case vol of
+  | Volume:
+    inc(vol.putCount)
+    buf := FindBuffer(vol, adr)
+    if buf # nil then
+      // refresh data
+      inc(vol.putHitCount)
+      SYS.MOVE(cast(AnyPtr, @blk[0]), cast(AnyPtr, @vol.data.data[(buf.index) * vol.data.len1 + (0)]), vol.blockSize)
+    end
+
+    vol.real_.PutBlock(vol.real_, adr, blk, blk_len)
+  end
+end PutBlock
+
+procedure AllocBlock(vol: OFS.Volume; hint: int32; adr: pointer to int32)
+begin
+  case vol of
+  | Volume:
+    vol.real_.AllocBlock(vol.real_, hint, adr)
+  end
+end AllocBlock
+
+procedure FreeBlock(vol: OFS.Volume; adr: int32)
+begin
+  case vol of
+  | Volume:
+    vol.real_.FreeBlock(vol.real_, adr)
+  end
+end FreeBlock
+
+procedure MarkBlock(vol: OFS.Volume; adr: int32)
+begin
+  case vol of
+  | Volume:
+    vol.real_.MarkBlock(vol.real_, adr)
+  end
+end MarkBlock
+
+procedure Marked(vol: OFS.Volume; adr: int32): boolean
+begin
+  case vol of
+  | Volume:
+    return vol.real_.Marked(vol.real_, adr)
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end Marked
+
+procedure Available(vol: OFS.Volume): int32
+begin
+  case vol of
+  | Volume:
+    return vol.real_.Available(vol.real_)
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Available
+
+// Write back any cached information to the real volume.
+procedure Update*(vol: Volume)
+begin
+end Update
+
+// write back
+
+// Write back any cached information to the real volume.
+procedure Sync*(vol: OFS.Volume)
+begin
+  Update(vol(Volume))
+end Sync
+
+procedure Finalize(vol: OFS.Volume)
+begin
+  case vol of
+  | Volume:
+    Update(vol)
+    vol.real_.Finalize(vol.real_)
+    vol.real_ := nil
+    vol.data.data := nil;
+    vol.data.len0 := 0;
+    vol.data.len1 := 0
+    vol.hashTable := nil
+    vol.lru := nil
+  end
+end Finalize
+
+// Initialize a cache volume with underlying volume "real".
+procedure Init*(vol: Volume; real_: OFS.Volume; hashSize, cacheSize: int32)
+  var
+    i, n: int32
+    buf: Buffer
+begin
+  assert(hashSize <= cacheSize)
+  copy(@vol.name, @real_.name, 32)
+  vol.blockSize := real_.blockSize
+  vol.size_ := real_.size_
+  vol.flags := real_.flags
+  vol.AllocBlock := AllocBlock
+  vol.FreeBlock := FreeBlock
+  vol.MarkBlock := MarkBlock
+  vol.Marked := Marked
+  vol.Available := Available
+  vol.GetBlock := GetBlock
+  vol.PutBlock := PutBlock
+  vol.Sync := Sync
+  vol.Finalize := Finalize
+  vol.real_ := real_
+  vol.hashSize := hashSize
+  vol.cacheSize := cacheSize
+  vol.getCount := 0
+  vol.putCount := 0
+  vol.getHitCount := 0
+  vol.putHitCount := 0
+  vol.data.len0 := cacheSize;
+  vol.data.len1 := vol.blockSize;
+  newgc(vol.data.data, vol.data.len0 * vol.data.len1)
+  newgc(vol.hashTable, hashSize)
+  for i := 0 to hashSize - 1 do
+    vol.hashTable[i] := nil
+  end
+  newgc(vol.lru) // dummy
+  vol.lru.nextLRU := vol.lru
+  vol.lru.prevLRU := vol.lru
+  for i := 0 to cacheSize - 1 do
+    newgc(buf)
+    buf.adr := -i
+    buf.index := i
+    n := obmod(buf.adr, vol.hashSize)
+    buf.prevHash := nil
+    buf.nextHash := vol.hashTable[n]
+    vol.hashTable[n] := buf
+    if buf.nextHash # nil then
+      buf.nextHash.prevHash := buf
+    end
+    buf.prevLRU := vol.lru.prevLRU
+    buf.nextLRU := vol.lru
+    buf.prevLRU.nextLRU := buf
+    buf.nextLRU.prevLRU := buf
+  end
+
+  vol.lru.prevLRU.nextLRU := vol.lru.nextLRU // remove dummy
+  vol.lru.nextLRU.prevLRU := vol.lru.prevLRU
+  vol.lru := vol.lru.nextLRU
+end Init
+
+begin
+  Modules.Register("OFSCacheVolumes", nil)
+end OFSCacheVolumes.

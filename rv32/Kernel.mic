@@ -1,0 +1,671 @@
+module Kernel [level=1] // ETH Oberon System 3 inner core for the RV32 emulator
+
+// New kernel for Micron RV32 imp
+// structure follows the Micron Project Oberon kernel
+
+import SYS, MIC, Heaps
+
+const
+  TimeUnit* = 1000 // ticks per second
+  LittleEndian* = true
+  LsbIs0* = true
+
+  timer = 0FFFFFFC0H
+  LEDadr = 0FFFFFFC4H
+  fbCtrl = 0FFFFFFA0H // the linear frame buffer of the emulator
+  fbAdr = 0FFFFFFA4H
+  fbDim = 0FFFFFFA8H
+  fbFmt = 0FFFFFFACH
+  fbPal = 0FFFFFFB0H
+  spiData = 0FFFFFFD0H
+  spiCtrl = 0FFFFFFD4H
+  CARD0 = 1
+  SPIFAST = 4
+
+  dataOrgAdr = 0CH // the machine stores the start of the writable data here
+
+  LogLen = 8192 // the kernel log is a ring buffer of this size
+  NofConfig = 16
+
+type
+  AnyPtr* = Heaps.AnyPtr
+  AnyPtrPtr = pointer to AnyPtr // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int32Ptr = pointer to int32 // helper type for a variable reinterpreted by SYSTEM.VAL
+  CharArrPtr = pointer to array of char
+  Int32ArrPtr = pointer to array of int32
+
+  Name* = array 32 of char
+  Proc* = procedure()
+
+  Cmd* = record
+    name*: Name
+    adr*: Proc 
+  end
+  Cmds* = pointer to array of Cmd
+
+  ArrayPtr* = pointer to array of int32
+
+  ExportPtr* = pointer to ExportDesc
+  ExportDesc* = record
+    fp*, adr*: int32
+    nofExp*: int16
+    dsc*: pointer to ExportDescArray
+  end
+  ExportDescArray* = array of ExportDesc
+
+  Module* = pointer to ModuleDesc
+  ModuleDesc* = record
+    next*: Module
+    name*: Name
+    init*, trapped*: boolean
+    refcnt*: int32
+    sb*: AnyPtr
+    entries*: pointer to array of AnyPtr
+    cmds*: Cmds
+    ptrTab*, tdescs*: pointer to array of AnyPtr
+    imports*: pointer to array of Module
+    data*, code*, refs*: pointer to array of char
+    publics*, privates*: int32
+    nofimp*: int16
+    import_*: ArrayPtr
+    nofstrc*: int16
+    struct*: ArrayPtr
+    nofreimp*: int16
+    reimp*: ArrayPtr
+    export*: ExportDesc
+    term*: Proc
+  end
+
+  TrapHandler* = procedure(err: int32; fp: AnyPtr; pc: int32; pf: int32)
+  Finalizer* = Heaps.Finalizer
+
+  MilliTimer* = record
+    target*: int32
+  end
+
+  Allocator* = procedure(size: int32): AnyPtr // the runtime asks for a block
+
+var
+  version*: array 32 of char
+  modules*: Module // the module list
+  StackOrg*: int32
+  copro*: boolean // no floating point coprocessor status register here
+  break*: boolean
+  shutdown*: int32
+  ticks*: int32
+  EnableGC*, DisableGC*: Proc
+  timerProc*: Proc
+
+  NofSectors*: int32
+  MemLim*: int32
+
+  clockTime, clockDate: int32
+  ctrl: int32 // SPI status
+  data: int32 // SPI data in
+
+  log: array LogLen of char // the ring buffer of the kernel log
+  logHead, logTail, logMark: int32
+
+
+  cfgName: array NofConfig of Name // the configuration strings
+  cfgVal: array NofConfig of array 64 of char
+  nofCfg: int32
+
+  trapHandler: TrapHandler
+  loopProc: Proc
+  termHandler: array 32 of Proc
+  nofTerm: int32
+
+  unknownName: Name
+  unknownCode: array 4 of char
+  unknownMod: ModuleDesc
+
+
+procedure HeapSize*(): int32 inline
+begin
+  return Heaps.HeapSize()
+end HeapSize
+
+procedure Available*(): int32 inline
+begin
+  return Heaps.Available()
+end Available
+
+procedure Used*(): int32 inline
+begin
+  return Heaps.Used()
+end Used
+
+procedure GC*()
+begin
+  Heaps.GC()
+end GC
+
+procedure LargestAvailable*(): AnyPtr
+begin
+  return Heaps.LargestAvailable()
+end LargestAvailable
+
+procedure NewSys*(p: ^AnyPtr; size_: int32)
+  // an untraced block for a port module, see the System 3 Kernel
+begin
+  Heaps.NewSys(p, size_)
+end NewSys
+
+procedure RegisterObject*(obj: AnyPtr; fin: Finalizer; basic: boolean)
+begin
+  Heaps.RegisterObject(obj, fin, basic)
+end RegisterObject
+
+procedure FinalizeAll*()
+begin
+  Heaps.FinalizeAll()
+end FinalizeAll
+
+procedure FinalizeModule*(m: Module)
+begin
+  if (m # nil) & (m.term # nil) then
+    m.term()
+  end
+end FinalizeModule
+
+procedure WriteChar*(c: char)
+begin
+  SYS.TRACE(c) // the RS232 interface serves as debug console
+  log[logHead] := c
+  logHead := (logHead + 1) mod LogLen
+  if logHead = logTail then
+    logTail := (logTail + 1) mod LogLen // the ring buffer drops the oldest char
+    if logMark = logTail then
+      logMark := (logMark + 1) mod LogLen
+    end
+  end
+end WriteChar
+
+procedure WriteString*(const s: pointer to array of char)
+  var i: int32
+begin
+  i := 0
+  while s[i] # 0X do
+    WriteChar(s[i])
+    inc(i)
+  end
+end WriteString
+
+procedure WriteLn*()
+begin
+  WriteChar(0DX)
+  WriteChar(0AX)
+end WriteLn
+
+procedure Hello*(const s: pointer to array of char)
+begin
+  WriteString(s)
+  WriteLn()
+end Hello
+
+procedure WriteInt*(x, w: int32)
+  var buf: array 12 of char
+    i, n: int32
+    neg: boolean
+begin
+  neg := x < 0
+  if neg then
+    n := -x
+  else
+    n := x
+  end
+  i := 0
+  repeat
+    buf[i] := chr(n mod 10 + 30H)
+    inc(i)
+    n := n div 10
+  until n = 0
+  if neg then
+    buf[i] := "-"
+    inc(i)
+  end
+  while w > i do
+    WriteChar(" ")
+    dec(w)
+  end
+  while i > 0 do
+    dec(i)
+    WriteChar(buf[i])
+  end
+end WriteInt
+
+procedure WriteHex*(x, w: int32)
+  var buf: array 8 of char
+    i, d: int32
+    u: uint32
+begin
+  u := usig(x)
+  i := 0
+  repeat
+    d := cast(int32, band(u, 0FH))
+    if d < 10 then
+      buf[i] := chr(d + 30H)
+    else
+      buf[i] := chr(d + 55)
+    end
+    u := shr(u, 4)
+    inc(i)
+  until u = 0
+  while w > i do
+    WriteChar(" ")
+    dec(w)
+  end
+  while i > 0 do
+    dec(i)
+    WriteChar(buf[i])
+  end
+end WriteHex
+
+procedure GetLog*(val_: pointer to array of char; val_len: int32)
+  // the oldest part of the log, up to val_len - 1 characters
+  var i, p: int32
+begin
+  i := 0
+  p := logTail
+  while (p # logHead) & (i < val_len - 1) do
+    val_[i] := log[p]
+    inc(i)
+    p := (p + 1) mod LogLen
+  end
+  val_[i] := 0X
+  logTail := p
+end GetLog
+
+procedure SetLogMark*()
+begin
+  logMark := logHead
+end SetLogMark
+
+procedure GetMarkedLog*(val_: pointer to array of char; val_len: int32)
+  var i, p: int32
+begin
+  i := 0
+  p := logMark
+  while (p # logHead) & (i < val_len - 1) do
+    val_[i] := log[p]
+    inc(i)
+    p := (p + 1) mod LogLen
+  end
+  val_[i] := 0X
+end GetMarkedLog
+
+
+procedure SetConfig*(const name, val_: pointer to array of char)
+begin
+  if nofCfg < NofConfig then
+    copy(@cfgName[nofCfg], name, 32)
+    copy(@cfgVal[nofCfg], val_, 64)
+    inc(nofCfg)
+  end
+end SetConfig
+
+procedure GetConfig*(const name: pointer to array of char; val_: pointer to array of char; val_len: int32)
+  var i, j: int32
+begin
+  i := 0
+  while (i < nofCfg) & (cfgName[i] # name^) do
+    inc(i)
+  end
+  if i < nofCfg then
+    j := 0
+    while (cfgVal[i][j] # 0X) & (j < val_len - 1) do
+      val_[j] := cfgVal[i][j]
+      inc(j)
+    end
+    val_[j] := 0X
+  else
+    val_[0] := 0X
+  end
+end GetConfig
+
+
+procedure GetMod*(pc: int32): Module
+  // the module which contains the code address pc; all modules are linked
+  // statically here and carry no code range, so the answer is a placeholder
+  var m: Module
+begin
+  m := modules
+  while (m # nil) & ~((m.code # nil) & (val(int32, ord(@m.code[0])) <= pc)) do
+    m := m.next
+  end
+  if m = nil then
+    m := cast(Module, @unknownMod)
+  end
+  return m
+end GetMod
+
+
+procedure InstallTrap*(p: TrapHandler)
+begin
+  trapHandler := p
+end InstallTrap
+
+procedure InstallLoop*(p: Proc)
+begin
+  loopProc := p
+end InstallLoop
+
+procedure InstallTermHandler*(h: Proc)
+begin
+  if nofTerm < 32 then
+    termHandler[nofTerm] := h
+    inc(nofTerm)
+  end
+end InstallTermHandler
+
+procedure Trap*(err: int32; fp: AnyPtr; pc, pf: int32)
+begin
+  if trapHandler # nil then
+    trapHandler(err, fp, pc, pf)
+  else
+    WriteString("TRAP ")
+    WriteInt(err, 1)
+    WriteLn()
+  end
+end Trap
+
+procedure Idle*(code: int32)
+begin
+  // there is nothing to wait for on this machine
+end Idle
+
+procedure Shutdown*(code: int32)
+  var i: int32
+begin
+  shutdown := code
+  i := 0
+  while i < nofTerm do
+    if termHandler[i] # nil then
+      termHandler[i]()
+    end
+    inc(i)
+  end
+  FinalizeAll()
+  WriteString("System halted")
+  WriteLn()
+  MIC.Halt(0)
+end Shutdown
+
+
+procedure GetTimer*(): int32
+  // milliseconds since start
+begin
+  return Int32Ptr{timer}^
+end GetTimer
+
+procedure SetTimer*(t: pointer to MilliTimer; ms: int32)
+begin
+  t.target := GetTimer() + ms
+end SetTimer
+
+procedure Expired*(t: pointer to MilliTimer): boolean
+begin
+  return GetTimer() - t.target >= 0
+end Expired
+
+procedure PollTimer*()
+begin
+  ticks := GetTimer()
+end PollTimer
+
+procedure GetClock*(t, d: pointer to int32)
+begin
+  t^ := clockTime
+  d^ := clockDate
+end GetClock
+
+procedure SetClock*(t, d: int32)
+begin
+  clockTime := t
+  clockDate := d
+end SetClock
+
+procedure LED*(n: int32)
+begin
+  Int32Ptr{LEDadr}^ := n
+end LED
+
+
+procedure SPIIdle(n: int32)
+begin
+  // send n FFs slowly with no card selected
+  Int32Ptr{spiCtrl}^ := 0
+  while n > 0 do
+    dec(n)
+    Int32Ptr{spiData}^ := -1
+    repeat
+      ctrl := Int32Ptr{spiCtrl}^
+    until ((ctrl mod 2) # 0)
+    data := Int32Ptr{spiData}^
+  end
+end SPIIdle
+
+procedure SPI(n: int32)
+begin
+  // send&rcv byte slowly with card selected
+  Int32Ptr{spiCtrl}^ := CARD0
+  Int32Ptr{spiData}^ := n
+  repeat
+    ctrl := Int32Ptr{spiCtrl}^
+  until ((ctrl mod 2) # 0)
+  data := Int32Ptr{spiData}^
+end SPI
+
+procedure SPICmd(n, arg: int32)
+  var i, crc: int32
+begin
+  // send cmd
+  repeat
+    SPIIdle(1) // flush while unselected
+  until data = 255
+  repeat
+    SPI(255) // flush while selected
+  until data = 255
+  if n = 8 then
+    crc := 135
+  elsif n = 0 then
+    crc := 149
+  else
+    crc := 255
+  end
+  SPI(n mod 64 + 64) // send command
+  for i := 24 to 0 by -8 do
+    SPI(SYS.ROT(arg, -i)) // send arg
+  end
+  SPI(crc)
+  i := 32
+  repeat
+    SPI(255)
+    dec(i)
+  until (data < 128) or (i = 0)
+end SPICmd
+
+procedure SDShift(n: ^int32)
+  var data: int32
+begin
+  SPICmd(58, 0) // CMD58 get card capacity bit
+  data := Int32Ptr{spiData}^
+  SPI(-1)
+  ctrl := Int32Ptr{spiData}^
+  if (data # 0) or ~((ctrl div 64 mod 2) # 0) then
+    n^ := n^ * 512 // non-SDHC card
+  end
+  SPI(-1) // flush response
+  SPI(-1)
+  SPIIdle(1)
+end SDShift
+
+procedure ReadBlock*(src: int32; dst: AnyPtr)
+  // one 512 byte block of the card into dst, see the Disks device of SDDisks
+  var i: int32
+begin
+  SDShift(@src) // CMD17 read one block
+  SPICmd(17, src)
+  assert(data = 0)
+  i := 0 // wait for start data marker
+  repeat
+    SPI(-1)
+    inc(i)
+  until data = 254
+  Int32Ptr{spiCtrl}^ := sigc(SPIFAST + CARD0)
+  for i := 0 to 508 by 4 do
+    Int32Ptr{spiData}^ := -1
+    repeat
+      ctrl := Int32Ptr{spiCtrl}^
+    until ((ctrl mod 2) # 0)
+    data := Int32Ptr{spiData}^
+    cast(Int32Ptr, dst)^ := data
+    inc(dst, 4)
+  end
+  SPI(255) // may be a checksum; deselect card
+  SPI(255)
+  SPIIdle(1)
+end ReadBlock
+
+procedure WriteBlock*(dst: int32; src: AnyPtr)
+  // src as one 512 byte block of the card, see the Disks device of SDDisks
+  var i, n: int32
+begin
+  SDShift(@dst) // CMD24 write one block
+  SPICmd(24, dst)
+  assert(data = 0)
+  SPI(254) // write start data marker
+  Int32Ptr{spiCtrl}^ := sigc(SPIFAST + CARD0)
+  for i := 0 to 508 by 4 do
+    n := cast(Int32Ptr, src)^
+    inc(src, 4)
+    Int32Ptr{spiData}^ := n
+    repeat
+      ctrl := Int32Ptr{spiCtrl}^
+    until ((ctrl mod 2) # 0)
+  end
+  SPI(255) // dummy checksum
+  SPI(255)
+  i := 0
+  repeat
+    SPI(-1)
+    inc(i)
+  until (data mod 32 = 5) or (i = 10000)
+  assert(data mod 32 = 5) // deselect card
+  SPIIdle(1)
+end WriteBlock
+
+
+procedure FBPresent*(): boolean
+  // the emulator was started with a linear frame buffer
+begin
+  return Int32Ptr{fbCtrl}^ # 0
+end FBPresent
+
+procedure FBAdr*(): int32
+begin
+  return Int32Ptr{fbAdr}^
+end FBAdr
+
+procedure FBWidth*(): int32
+begin
+  return band(Int32Ptr{fbDim}^, 0FFFFH)
+end FBWidth
+
+procedure FBHeight*(): int32
+begin
+  return band(Int32Ptr{fbDim}^, 07FFF0000H) div 10000H
+end FBHeight
+
+procedure FBFormat*(): int32
+  // bytes per pixel, one of the Displays formats
+begin
+  return band(Int32Ptr{fbFmt}^, 0FFH)
+end FBFormat
+
+procedure FBStride*(): int32
+  // bytes per line
+begin
+  return band(Int32Ptr{fbFmt}^, 07FFFFF00H) div 100H
+end FBStride
+
+procedure SetPalette*(index, col: int32)
+  // the color of a palette entry of an index8 frame buffer
+begin
+  Int32Ptr{fbPal}^ := sigc(shl(band(index, 0FFH), 24)) + band(col, 0FFFFFFH)
+end SetPalette
+
+
+procedure noop()
+begin
+end noop
+
+procedure Init*()
+  var dataOrg, heapOrg, stackOrg: AnyPtr
+    stackSize: int32
+begin
+  MemLim := Int32Ptr{010H}^
+  if FBPresent() & (FBAdr() # 0) & (FBAdr() < MemLim) then
+    MemLim := FBAdr() // the heap must stay below the frame buffer
+  end
+  dataOrg := AnyPtrPtr{dataOrgAdr}^
+  heapOrg := AnyPtrPtr{08H}^
+  stackSize := 262144
+  inc(heapOrg, stackSize)
+  stackOrg := heapOrg
+  StackOrg := val(int32, ord(stackOrg))
+  Heaps.Init(heapOrg, MemLim, dataOrg, stackOrg, stackSize)
+  clockTime := 0
+  clockDate := 0
+  shutdown := 0
+  copro := false
+  break := false
+  nofTerm := 0
+  nofCfg := 0
+  logHead := 0
+  logTail := 0
+  logMark := 0
+  EnableGC := noop
+  DisableGC := noop
+  timerProc := noop
+  copy(@version, "System 3 / Micron RV32", 32)
+  copy(@unknownName, "unknown", 32)
+  unknownMod.name := unknownName
+  unknownMod.code := cast(CharArrPtr, @unknownCode[0])
+  unknownMod.data := cast(CharArrPtr, @unknownCode[0])
+  modules := nil
+
+  // the configuration strings of this board, in place of the boot file of Native Oberon
+  SetConfig("DDriver", "DisplayLinear")
+  SetConfig("Display", "DisplayLinear")
+  SetConfig("Color", "1")
+  SetConfig("MB", "4")
+  SetConfig("ModExt", ".Obj")
+  SetConfig("BootSystem", "Static")
+  SetConfig("FontConv", "")
+  SetConfig("DiskGC", "")
+  SetConfig("TraceModules", "0")
+  SetConfig("Init", "")
+  // the AosFS volume of the emulated SD card, as in the boot string of Native Oberon
+  SetConfig("BootVol", "SYS AosFS SD0#0")
+  SetConfig("AosFS", "OFSDiskVolumes.New OFSAosFiles.NewFS")
+end Init
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "GC" end return GC end
+  if i = 1 then if name # nil then name^ := "FinalizeAll" end return FinalizeAll end
+  if i = 2 then if name # nil then name^ := "WriteLn" end return WriteLn end
+  if i = 3 then if name # nil then name^ := "SetLogMark" end return SetLogMark end
+  if i = 4 then if name # nil then name^ := "PollTimer" end return PollTimer end
+  if i = 5 then if name # nil then name^ := "Init" end return Init end
+  return nil
+end cmd_
+
+begin
+  // the body of the Kernel runs before the body of any module which imports it
+  Init()
+end Kernel.
