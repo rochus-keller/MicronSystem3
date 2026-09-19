@@ -1,0 +1,425 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module CLUTs [level=5]
+
+import Files, Modules
+// portable
+// eos   *
+
+(**
+Color lookup tables with reverse lookup
+**)
+
+const
+  colors* = 256
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  CLUT* = record
+    col*: array 256 (* colors *) of int32 // blue: bit 0..7; green: bit 8..15; red: bit 16..23 *
+    size_*: int16 // number of valid colors *
+    bits_: int16 // number of bits per component in color cube
+    cube: pointer to array of char // maps RGB triples to indices, size is (2^bits)^3
+  end
+
+// set CLUT entry to specific color (invalidates existing reverse lookup structure) *
+procedure Set*(clut: pointer to CLUT; n, col: int32)
+begin
+  assert((0 <= n) & (n < colors))
+  clut.col[n] := band(col, 16777215)
+  clut.bits_ := 0 // invalidate reverse lookup
+end Set
+
+// get CLUT entry *
+procedure Get*(clut: pointer to CLUT; n: int32; col: pointer to int32)
+begin
+  assert((0 <= n) & (n < colors))
+  col^ := clut.col[n]
+end Get
+
+// initialize CLUT with number of valid colors and number of bits per component for reverse lookup table *
+procedure Init*(clut: pointer to CLUT; size_, bits_: int32)
+
+  var
+    nbits, x, colormax, cur, rcol, gcol, bcol, col, xsqr, txsqr, rstride, gstride, bsize, i, rdist, gdist, bdist, cdist: int32
+
+    dbuf: pointer to array of int32
+    rcenter, gcenter, bcenter, ghere, bhere, gmin, bmin, gmax, bmax, incr, incg, incb, p, rp, gp, ginc, binc: int32
+
+  procedure blueloop(bhere: pointer to int32; binc: pointer to int32; bmax: pointer to int32; bmin: pointer to int32; 
+                      clut: pointer to CLUT; cur: pointer to int32; dbuf: pointer to pointer to array of int32; 
+                       gdist: pointer to int32; gp: pointer to int32; txsqr: pointer to int32): boolean
+    var
+      detect: boolean
+      blue, bp, bdist, bxx: int32
+  begin
+    detect := false
+    blue := bhere^
+    bp := gp^
+    bdist := gdist^
+    bxx := binc^
+    while (blue < bmax^) & (dbuf^[bp] <= bdist) do
+      inc(blue)
+      inc(bp)
+      inc(bdist, bxx)
+      inc(bxx, txsqr^)
+    end
+
+    if blue < bmax^ then
+      // found applicable cell
+      if blue > bhere^ then
+        bhere^ := blue
+        gp^ := bp
+        gdist^ := bdist
+        binc^ := bxx
+      end
+
+      detect := true
+      while (blue < bmax^) & (dbuf^[bp] > bdist) do
+        dbuf^[bp] := bdist
+        clut.cube[bp] := chr(cur^)
+        inc(blue)
+        inc(bp)
+        inc(bdist, bxx)
+        inc(bxx, txsqr^)
+      end
+    end
+
+    blue := bhere^ - 1
+    bp := gp^ - 1
+    bxx := binc^ - txsqr^
+    bdist := gdist^ - bxx
+    if ~detect then
+      while (blue >= bmin^) & (dbuf^[bp] <= bdist) do
+        dec(blue)
+        dec(bp)
+        dec(bxx, txsqr^)
+        dec(bdist, bxx)
+      end
+
+      if blue >= bmin^ then
+        bhere^ := blue
+        gp^ := bp
+        gdist^ := bdist
+        binc^ := bxx
+        detect := true
+      end
+    end
+
+    while (blue >= bmin^) & (dbuf^[bp] > bdist) do
+      dbuf^[bp] := bdist
+      clut.cube[bp] := chr(cur^)
+      dec(blue)
+      dec(bp)
+      dec(bxx, txsqr^)
+      dec(bdist, bxx)
+    end
+
+    return detect
+  end blueloop
+
+  procedure greenloop(bcenter: pointer to int32; bhere: pointer to int32; binc: pointer to int32; bmax: pointer to int32; 
+                      bmin: pointer to int32; clut: pointer to CLUT; colormax: pointer to int32; cur: pointer to int32; 
+                        dbuf: pointer to pointer to array of int32; gdist: pointer to int32; ghere: pointer to int32; 
+                        ginc: pointer to int32; gmax: pointer to int32; gmin: pointer to int32; gp: pointer to int32;
+                        gstride: pointer to int32; incb: pointer to int32; rdist: pointer to int32; rp: pointer to int32; 
+                        txsqr: pointer to int32): boolean
+    var
+      detect: boolean
+      green, ggp, ggdist, gxx: int32
+  begin
+    detect := false
+    bhere^ := bcenter^ // restart blueloop
+    bmin^ := 0
+    bmax^ := colormax^
+    binc^ := incb^
+    green := ghere^
+    gp^ := rp^
+    ggp := gp^
+    gdist^ := rdist^
+    ggdist := gdist^
+    gxx := ginc^
+    while green < gmax^ do
+      if blueloop(bhere, binc, bmax, bmin, clut, cur, dbuf, gdist, gp, txsqr) then
+        if ~detect then
+          if green > ghere^ then
+            ghere^ := green
+            rp^ := ggp
+            rdist^ := ggdist
+            ginc^ := gxx
+          end
+
+          detect := true
+        end
+
+        inc(green)
+        inc(gp^, gstride^)
+        inc(ggp, gstride^)
+        inc(gdist^, gxx)
+        inc(ggdist, gxx)
+        inc(gxx, txsqr^)
+      elsif ~detect then
+        green := gmax^
+      else
+        inc(green)
+        inc(gp^, gstride^)
+        inc(ggp, gstride^)
+        inc(gdist^, gxx)
+        inc(ggdist, gxx)
+        inc(gxx, txsqr^)
+      end
+    end
+
+    bhere^ := bcenter^ // restart blueloop
+    bmin^ := 0
+    bmax^ := colormax^
+    binc^ := incb^
+    green := ghere^ - 1
+    gp^ := rp^ - gstride^
+    ggp := gp^
+    gxx := ginc^ - txsqr^
+    gdist^ := rdist^ - gxx
+    ggdist := gdist^
+    while green >= gmin^ do
+      if blueloop(bhere, binc, bmax, bmin, clut, cur, dbuf, gdist, gp, txsqr) then
+        if ~detect then
+          ghere^ := green
+          rp^ := ggp
+          rdist^ := ggdist
+          ginc^ := gxx
+          detect := true
+        end
+
+        dec(green)
+        dec(gp^, gstride^)
+        dec(ggp, gstride^)
+        dec(gxx, txsqr^)
+        dec(gdist^, gxx)
+        dec(ggdist, gxx)
+      elsif ~detect then
+        green := gmin^ - 1
+      else
+        dec(green)
+        dec(gp^, gstride^)
+        dec(ggp, gstride^)
+        dec(gxx, txsqr^)
+        dec(gdist^, gxx)
+        dec(ggdist, gxx)
+      end
+    end
+
+    return detect
+  end greenloop
+
+  procedure redloop(bcenter: pointer to int32; bhere: pointer to int32; binc: pointer to int32; bmax: pointer to int32; 
+                    bmin: pointer to int32; cdist: pointer to int32; clut: pointer to CLUT; colormax: pointer to int32; 
+                     cur: pointer to int32; dbuf: pointer to pointer to array of int32; gcenter: pointer to int32; 
+                     gdist: pointer to int32; ghere: pointer to int32; ginc: pointer to int32; gmax: pointer to int32; 
+                     gmin: pointer to int32; gp: pointer to int32; gstride: pointer to int32; incb: pointer to int32; 
+                     incg: pointer to int32; incr: pointer to int32; p: pointer to int32; rcenter: pointer to int32; 
+                     rdist: pointer to int32; rp: pointer to int32; rstride: pointer to int32; txsqr: pointer to int32)
+    var
+      detect: boolean
+      red, rxx: int32
+  begin
+    // red up loop
+    detect := false
+    ghere^ := gcenter^ // restart greenloop
+    gmin^ := 0
+    gmax^ := colormax^
+    ginc^ := incg^
+    red := rcenter^
+    rp^ := p^
+    rdist^ := cdist^
+    rxx := incr^
+    while red < colormax^ do
+      if greenloop(bcenter, bhere, binc, bmax, bmin, clut, colormax, cur, dbuf, gdist, ghere, ginc, gmax, gmin, gp, 
+          gstride, incb, rdist, rp, txsqr) then
+        detect := true
+        inc(red)
+        inc(rp^, rstride^)
+        inc(rdist^, rxx)
+        inc(rxx, txsqr^)
+      elsif detect then
+        red := colormax^ // leave loop
+      else
+        inc(red)
+        inc(rp^, rstride^)
+        inc(rdist^, rxx)
+        inc(rxx, txsqr^)
+      end
+    end
+
+    // red down loop
+    ghere^ := gcenter^ // restart greenloop
+    gmin^ := 0
+    gmax^ := colormax^
+    ginc^ := incg^
+    red := rcenter^ - 1
+    rp^ := p^ - rstride^
+    rxx := incr^ - txsqr^
+    rdist^ := cdist^ - rxx
+    while red >= 0 do
+      if greenloop(bcenter, bhere, binc, bmax, bmin, clut, colormax, cur, dbuf, gdist, ghere, ginc, gmax, gmin, gp, gstride, 
+          incb, rdist, rp, txsqr) then
+        detect := true
+        dec(red)
+        dec(rp^, rstride^)
+        dec(rxx, txsqr^)
+        dec(rdist^, rxx)
+      elsif detect then
+        red := -1 // leave loop
+      else
+        dec(red)
+        dec(rp^, rstride^)
+        dec(rxx, txsqr^)
+        dec(rdist^, rxx)
+      end
+    end
+  end redloop
+begin
+  // uses Spencer W. Thomas' algorithm from Graphics Gems II (ugly as it is)
+  assert((2 <= size_) & (size_ <= colors))
+  clut.size_ := val(int16, size_)
+  if bits_ <= 0 then
+    return // no reverse lookup table
+  end
+
+  if bits_ > 6 then
+    bits_ := 6 // (2^6)^3 = 262144!
+  end
+  nbits := 8 - bits_
+  // bits_ is in 1..6 here, so nbits is in 2..7 and all the following shifts are to the left
+  x := val(int32, shl(val(uint32, 1), usig(nbits)))
+  xsqr := val(int32, shl(val(uint32, 1), usig(2 * nbits)))
+  txsqr := 2 * xsqr
+  colormax := val(int32, shl(val(uint32, 1), usig(bits_)))
+  rstride := val(int32, shl(val(uint32, 1), usig(2 * bits_)))
+  gstride := colormax
+
+  // fill buffer with maximal distance
+  bsize := val(int32, shl(val(uint32, 1), usig(3 * bits_)))
+  newgc(dbuf, bsize)
+  i := 0
+  while i < bsize do
+    dbuf[i] := 2147483647
+    inc(i)
+  end
+  newgc(clut.cube, bsize) // Oberon: IF (clut.cube = NIL) OR (LEN(clut.cube^) < bsize) THEN NEW(clut.cube, bsize) END
+
+  clut.bits_ := val(int16, bits_)
+
+  cur := 0
+  while cur < size_ do
+    col := clut.col[cur]
+    rcol := band(asr(col, 16), 255)
+    gcol := band(asr(col, 8), 255)
+    bcol := band(col, 255)
+    rcenter := val(int32, val(int16, asr(val(int32, rcol), usig(nbits))))
+    rdist := rcol - (rcenter * x + asr(x, 1))
+    gcenter := val(int32, val(int16, asr(val(int32, gcol), usig(nbits))))
+    gdist := gcol - (gcenter * x + asr(x, 1))
+    bcenter := val(int32, val(int16, asr(val(int32, bcol), usig(nbits))))
+    bdist := bcol - (bcenter * x + asr(x, 1))
+    cdist := rdist * rdist + gdist * gdist + bdist * bdist
+    incr := 2 * ((rcenter + 1) * xsqr - rcol * x)
+    incg := 2 * ((gcenter + 1) * xsqr - gcol * x)
+    incb := 2 * ((bcenter + 1) * xsqr - bcol * x)
+    p := rcenter * rstride + gcenter * gstride + bcenter
+    redloop(@bcenter, @bhere, @binc, @bmax, @bmin, @cdist, clut, @colormax, @cur, @dbuf, @gcenter, @gdist, @ghere, @ginc,
+               @gmax, @gmin, @gp, @gstride, @incb, @incg, @incr, @p, @rcenter, @rdist, @rp, @rstride, @txsqr)
+    inc(cur)
+  end
+end Init
+
+// return index of color that best matches the given RGB triple *
+procedure Match*(clut: pointer to CLUT; col: int32): int32
+  var
+    red, green, blue, n, best, err, r, g, b, e: int32
+    cbits, nbits: uint32
+begin
+  red := band(asr(col, 16), 255)
+  green := band(asr(col, 8), 255)
+  blue := band(col, 255)
+
+  if clut.bits_ # 0 then
+    // can do reverse lookup; Init keeps bits_ in 1..6, so each component is shifted right by 8-bits_
+    cbits := usig(val(int32, clut.bits_))
+    nbits := 8 - cbits
+    return val(int32, ord(clut.cube[shl(shr(usig(red), nbits), 2 * cbits) +
+                        shl(shr(usig(green), nbits), cbits) + shr(usig(blue), nbits)]))
+  end
+
+  // linear search
+  n := 0
+  best := 0
+  err := 2147483647
+  while n < clut.size_ do
+    e := clut.col[n]
+    if e = col then
+      return n
+    end
+    r := band(asr(e, 16), 255) - red
+    g := band(asr(e, 8), 255) - green
+    b := band(e, 255) - blue
+    e := r * r + g * g + b * b
+    if e < err then
+      err := e
+      best := n
+    end
+
+    inc(n)
+  end
+
+  return best
+end Match
+
+// copy color lookup table *
+procedure Copy*(from, to_: CLUT)
+  var
+    n: int32
+begin
+  to_.col := from.col
+  to_.size_ := from.size_
+  to_.bits_ := from.bits_
+  if from.cube = nil then
+    to_.cube := nil
+  else
+    newgc(to_.cube, val(int16, 0 (* TODO o2m: the length of this open array is not available; Oberon: NEW(to.cube, LEN(from.cube^)); *)))
+    for n := 0 to val(int16, 0 (* TODO o2m: the length of this open array is not available; Oberon: FOR n := 0 TO LEN(from.cube^)-1 DO *)) - 1 do
+      to_.cube[n] := from.cube[n]
+    end
+  end
+end Copy
+
+// write colors to file (only the color values themselves are written) *
+procedure Write*(r: pointer to Files.Rider; clut: pointer to CLUT)
+  var
+    n, col: int32
+begin
+  for n := 0 to clut.size_ - 1 do
+    col := clut.col[n]
+    Files.Write(r, val(byte, band(asr(col, 16), 255)))
+    Files.Write(r, val(byte, band(asr(col, 8), 255)))
+    Files.Write(r, val(byte, band(col, 255)))
+  end
+end Write
+
+// read up to size colors from file *
+procedure Read*(r: pointer to Files.Rider; clut: pointer to CLUT; size_: int32)
+  var
+    n: int32
+    red, green, blue: char
+begin
+  for n := 0 to size_ - 1 do
+    Files.Read(r, cast(BytePtr, @red))
+    Files.Read(r, cast(BytePtr, @green))
+    Files.Read(r, cast(BytePtr, @blue))
+    Set(clut, n, sigc(shl(val(int32, sigc(shl(val(int32, val(int16, ord(red))), 8)) + val(int32, ord(green))), 8)) + val(int32, ord(blue)))
+  end
+end Read
+
+begin
+  Modules.Register("CLUTs", nil)
+end CLUTs.

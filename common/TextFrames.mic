@@ -1,0 +1,1800 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module TextFrames [level=5]
+
+import Input, Modules, Objects, Display, Viewers, Fonts, Texts, Oberon, MenuViewers
+// portable
+// JG / pjm
+
+const
+  CR = 0DX
+  replace = Display.replace
+  paint = Display.paint
+  invert = Display.invert
+  extend = Display.extend
+  reduce = Display.reduce
+
+  StandardMenu = "System.Close System.Copy System.Grow Edit.Search Edit.Store"
+  LogMenu = "System.Clear Edit.Locate Edit.Search Edit.Store"
+  OpenCmd = "Edit.Open"
+
+  Modern = false // enable "modern" look
+  SmallDisplay = true // enable PDR's support for narrow displays
+  MoveArea = true // show "move" icon at top left, and use clipping for caret
+
+type
+  Line = pointer to LineDesc
+
+  LineDesc = record
+    len_: int32
+    wid: int16
+    eot: boolean
+    next: Line
+  end
+
+  Location* = record
+    org*, pos*: int32
+    dx*, x*, y*: int16
+    lin: Line
+  end
+
+  Frame* = pointer to FrameDesc
+
+  FrameDesc* = object (Display.FrameDesc)
+
+    text*: Texts.Text
+    org*: int32
+    col*, lsp*, left*, right*, top*, bot*, markH*: int16
+
+    time*: int32
+    mark*, car*, sel*: int16
+    carloc*, selbeg*, selend*: Location
+
+    trailer: Line
+  end
+
+(*mark < 0: arrow mark
+mark = 0: no mark
+mark > 0: position mark*)
+
+var
+  menuH*: int16 // standard sizes
+  barW*, left*, right*, top*, bot*, lsp*: int16
+  MarkColor, BarColor, MenuBG, TextBG, FullColor, mode, asr_, dsr, selH, markW, eolW: int16
+
+  ch: char
+  W: Texts.Writer // keyboard writer
+  KW: Texts.Writer
+  box: Fonts.Char
+  BoxPat: array 12 of set
+  hintPos: int32
+  saved: Oberon.CaretMsg
+
+procedure ^ RemoveMarks(F: Frame)
+
+procedure Min(i, j: int16): int16
+begin
+  if i >= j then
+    return j
+  else
+    return i
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+procedure Max(i, j: int32): int32
+begin
+  if i >= j then
+    return i
+  else
+    return j
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Max
+
+// ------------------display support------------------------
+
+procedure ReplConst(col: int16; F: Frame; X, Y, W, H, mode: int16)
+begin
+  if X + W <= F.X + F.W then
+    Display.ReplConst(col, X, Y, W, H, mode)
+  elsif X < F.X + F.W then
+    Display.ReplConst(col, X, Y, F.X + F.W - X, H, mode)
+  end
+end ReplConst
+
+procedure UpdateMark(F: Frame)
+  var
+    oldH: int16
+begin
+  oldH := F.markH
+  F.markH := val(int16, obdiv(F.org * F.H, F.text.len_ + 1))
+  if (F.mark > 0) & (F.left >= barW) & (F.markH # oldH) then
+    Display.ReplConst(F.col, F.X, F.Y + F.H - 1 - oldH, markW, 1, replace)
+    Display.ReplConst(MarkColor, F.X, F.Y + F.H - 1 - F.markH, markW, 1, replace)
+  end
+end UpdateMark
+
+procedure Width(R: pointer to Texts.Reader; len_: int32): int16
+  var
+    pos: int32
+    ox: int16
+    obj: Objects.Object
+begin
+  pos := 0
+  ox := 0
+  while pos # len_ do
+    R.lib.GetObj(R.lib, val(int16, ord(ch)), @obj)
+    if ~(obj is Fonts.Char) then
+      obj := box
+    end
+    ox := ox + obj(Fonts.Char).dx
+    inc(pos)
+    Texts.Read(R, @ch)
+  end
+
+  return ox
+end Width
+
+procedure DisplayLine(F: Frame; L: Line; R: pointer to Texts.Reader; X, Y: int16; len_: int32)
+
+  var
+    NX: int16
+    obj: Objects.Object
+begin
+  NX := F.X + F.W
+  while (ch # CR) & (R.lib # nil) do
+    if R.lib is Fonts.Font then
+      R.lib.GetObj(R.lib, val(int16, ord(ch)), @obj)
+    else
+      obj := box
+    end
+
+    case obj of
+    | Fonts.Char:
+      if X + obj.x + obj.w <= NX then
+        Display.CopyPattern(R.col, obj.pat 
+          (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; 
+             Oberon: Display.CopyPattern(R.col, obj.pat, X + obj.x, Y + obj.y, mode); *), X + obj.x, Y + obj.y, mode)
+        X := X + obj.dx
+      else
+        X := NX
+      end
+    end
+
+    inc(len_)
+    Texts.Read(R, @ch)
+  end
+
+  L.len_ := len_ + 1
+  L.wid := X + eolW - (F.X + F.left)
+  L.eot := R.eot
+  Texts.Read(R, @ch)
+end DisplayLine
+
+procedure Validate(T: Texts.Text; org: pointer to int32)
+  var
+    R: Texts.Reader
+    pos: int32
+begin
+  if org^ > T.len_ then
+    org^ := T.len_
+  elsif org^ > 0 then
+    Texts.OpenReader(@R, T, org^ - 1)
+    Texts.Read(@R, @ch)
+    if ch # CR then
+      pos := Max(org^ - 100, 0)
+      Texts.OpenReader(@R, T, pos)
+      repeat
+        Texts.Read(@R, @ch)
+        inc(pos)
+      until (pos = org^) or (ch = CR)
+      org^ := pos
+    end
+
+  else
+    org^ := 0
+  end
+end Validate
+
+procedure Mark*(F: Frame; mark: int16)
+begin
+  if (mark >= 0) & (F.mark < 0) & (F.H >= 16) then
+    Display.CopyPattern(F.col, Display.downArrow, F.X, F.Y, paint)
+  elsif (mark <= 0) & (F.mark > 0) & (F.H > 0) & (F.left >= barW) then
+    Display.ReplConst(F.col, F.X, F.Y + F.H - 1 - F.markH, markW, 1, replace)
+  end
+
+  if (mark > 0) & (F.H > 0) & (F.left >= barW) & (F.mark <= 0) then
+    Display.ReplConst(MarkColor, F.X, F.Y + F.H - 1 - F.markH, markW, 1, replace)
+  elsif (mark < 0) & (F.H >= 16) & (F.mark >= 0) then
+    Display.CopyPattern(MarkColor, Display.downArrow, F.X, F.Y, paint)
+  end
+
+  F.mark := mark
+end Mark
+
+procedure DrawIcon(F: Frame)
+begin
+  Display.ReplConst(MarkColor, F.X + 3, F.Y + F.H - 9, 6, 6, replace)
+  if Oberon.New then
+    Display.ReplConst(F.col, F.X + 5, F.Y + F.H - 7, 2, 2, replace)
+  end
+end DrawIcon
+
+procedure Restore*(F: Frame)
+  var
+    R: Texts.Reader
+    L: Line
+    curY, botY: int16
+begin
+  // F.mark = 0
+  Display.ReplConst(F.col, F.X, F.Y, F.W, F.H, replace)
+  if F.left >= barW then
+    Display.ReplConst(BarColor, F.X + barW - 1, F.Y, 1, F.H, replace)
+  elsif MoveArea then
+    DrawIcon(F)
+  end
+
+  Validate(F.text, @F.org)
+  botY := F.Y + F.bot + dsr
+  Texts.OpenReader(@R, F.text, F.org)
+  Texts.Read(@R, @ch)
+  L := F.trailer
+  curY := F.Y + F.H - F.top - asr_
+  while ~L.eot & (curY >= botY) do
+    newgc(L.next)
+    L := L.next
+    DisplayLine(F, L, @R, F.X + F.left, curY, 0)
+    curY := curY - lsp
+  end
+
+  L.next := F.trailer
+  F.markH := val(int16, obdiv(F.org * F.H, F.text.len_ + 1))
+end Restore
+
+procedure Suspend*(F: Frame)
+begin
+  // F.mark = 0
+  F.trailer.next := F.trailer
+end Suspend
+
+procedure Extend*(F: Frame; newY: int16)
+  var
+    R: Texts.Reader
+    L: Line
+    org: int32
+    curY, botY: int16
+begin
+  // F.mark = 0
+  Display.ReplConst(F.col, F.X, newY, F.W, F.Y - newY, replace)
+  if F.left >= barW then
+    Display.ReplConst(BarColor, F.X + barW - 1, newY, 1, F.Y - newY, replace)
+  elsif MoveArea then
+    DrawIcon(F)
+  end
+
+  F.H := F.H + F.Y - newY
+  F.Y := newY
+  if F.trailer.next = F.trailer then
+    Validate(F.text, @F.org)
+  end
+  L := F.trailer
+  org := F.org
+  curY := F.Y + F.H - F.top - asr_
+  while L.next # F.trailer do
+    L := L.next
+    org := org + L.len_
+    curY := curY - lsp
+  end
+
+  botY := F.Y + F.bot + dsr
+  Texts.OpenReader(@R, F.text, org)
+  Texts.Read(@R, @ch)
+  while ~L.eot & (curY >= botY) do
+    newgc(L.next)
+    L := L.next
+    DisplayLine(F, L, @R, F.X + F.left, curY, 0)
+    curY := curY - lsp
+  end
+
+  L.next := F.trailer
+  F.markH := val(int16, obdiv(F.org * F.H, F.text.len_ + 1))
+end Extend
+
+procedure Reduce*(F: Frame; newY: int16)
+  var
+    L: Line
+    curY, botY: int16
+begin
+  // F.mark = 0
+  F.H := F.H + F.Y - newY
+  F.Y := newY
+  botY := F.Y + F.bot + dsr
+  L := F.trailer
+  curY := F.Y + F.H - F.top - asr_
+  while (L.next # F.trailer) & (curY >= botY) do
+    L := L.next
+    curY := curY - lsp
+  end
+
+  L.next := F.trailer
+  if curY + asr_ > F.Y then
+    Display.ReplConst(F.col, F.X + F.left, F.Y, F.W - F.left, curY + asr_ - F.Y, replace)
+  end
+
+  F.markH := val(int16, obdiv(F.org * F.H, F.text.len_ + 1))
+  Mark(F, 1)
+end Reduce
+
+procedure Show*(F: Frame; pos: int32)
+  var
+    R: Texts.Reader
+    L: Line
+    org: int32
+    curY, botY, Y0: int16
+begin
+  if F.trailer.next # F.trailer then
+    Validate(F.text, @pos)
+    if pos < F.org then
+      Mark(F, 0)
+      Display.ReplConst(F.col, F.X + F.left, F.Y, F.W - F.left, F.H, replace)
+      botY := F.Y
+      F.Y := F.Y + F.H
+      F.H := 0
+      F.org := pos
+      F.trailer.next := F.trailer
+      Extend(F, botY)
+      Mark(F, 1)
+    elsif pos > F.org then
+      org := F.org
+      L := F.trailer.next
+      curY := F.Y + F.H - F.top - asr_
+      while (L.next # F.trailer) & (org # pos) do
+        org := org + L.len_
+        L := L.next
+        curY := curY - lsp
+      end
+
+      if org = pos then
+        F.org := org
+        F.trailer.next := L
+        Y0 := curY
+        while L.next # F.trailer do
+          org := org + L.len_
+          L := L.next
+          curY := curY - lsp
+        end
+
+        Display.CopyBlock(F.X + F.left, curY - dsr, F.W - F.left, Y0 + asr_ - (curY - dsr), F.X + F.left, 
+                          curY - dsr + F.Y + F.H - F.top - asr_ - Y0, replace)
+
+        curY := curY + F.Y + F.H - F.top - asr_ - Y0
+        Display.ReplConst(F.col, F.X + F.left, F.Y, F.W - F.left, curY - dsr - F.Y, replace)
+        botY := F.Y + F.bot + dsr
+        org := org + L.len_
+        curY := curY - lsp
+        Texts.OpenReader(@R, F.text, org)
+        Texts.Read(@R, @ch)
+        while ~L.eot & (curY >= botY) do
+          newgc(L.next)
+          L := L.next
+          DisplayLine(F, L, @R, F.X + F.left, curY, 0)
+          curY := curY - lsp
+        end
+
+        L.next := F.trailer
+        UpdateMark(F)
+      else
+        Mark(F, 0)
+        Display.ReplConst(F.col, F.X + F.left, F.Y, F.W - F.left, F.H, replace)
+        botY := F.Y
+        F.Y := F.Y + F.H
+        F.H := 0
+        F.org := pos
+        F.trailer.next := F.trailer
+        Extend(F, botY)
+        Mark(F, 1)
+      end
+    end
+  end
+end Show
+
+procedure LocateLine(F: Frame; y: int16; loc: pointer to Location)
+  var
+    L: Line
+    org: int32
+    cury: int16
+begin
+  org := F.org
+  L := F.trailer.next
+  cury := F.H - F.top - asr_
+  while (L.next # F.trailer) & (cury > y + dsr) do
+    org := org + L.len_
+    L := L.next
+    cury := cury - lsp
+  end
+
+  loc.org := org
+  loc.lin := L
+  loc.y := cury
+end LocateLine
+
+procedure LocateString(F: Frame; x, y: int16; loc: pointer to Location)
+  var
+    R: Texts.Reader
+    bpos, pos, lim: int32
+    bx, ex, ox: int16
+    obj: Objects.Object
+begin
+  LocateLine(F, y, loc)
+  lim := loc.org + loc.lin.len_ - 1
+  bpos := loc.org
+  bx := F.left
+  pos := loc.org
+  ox := F.left
+  Texts.OpenReader(@R, F.text, loc.org)
+  Texts.Read(@R, @ch)
+  loop
+    loop
+      // scan string
+      if (pos = lim) or (ch <= " ") then
+        exit
+      end
+      R.lib.GetObj(R.lib, val(int16, ord(ch)), @obj)
+      if ~(obj is Fonts.Char) then
+        obj := box
+      end
+      inc(pos)
+      ox := ox + obj(Fonts.Char).dx
+      Texts.Read(@R, @ch)
+    end
+
+    ex := ox
+    loop
+      // scan gap
+      if (pos = lim) or (ch > " ") then
+        exit
+      end
+      R.lib.GetObj(R.lib, val(int16, ord(ch)), @obj)
+      if ~(obj is Fonts.Char) then
+        obj := box
+      end
+      inc(pos)
+      ox := ox + obj(Fonts.Char).dx
+      Texts.Read(@R, @ch)
+    end
+
+    if (pos = lim) or (ox > x) then
+      exit
+    end
+    R.lib.GetObj(R.lib, val(int16, ord(ch)), @obj)
+    if ~(obj is Fonts.Char) then
+      obj := box
+    end
+    bpos := pos
+    bx := ox
+    inc(pos)
+    ox := ox + obj(Fonts.Char).dx
+    Texts.Read(@R, @ch)
+  end
+
+  loc.pos := bpos
+  loc.dx := ex - bx
+  loc.x := bx
+end LocateString
+
+procedure LocateChar(F: Frame; x, y: int16; loc: pointer to Location)
+  var
+    R: Texts.Reader
+    pos, lim: int32
+    ox, dx: int16
+    obj: Objects.Object
+begin
+  LocateLine(F, y, loc)
+  lim := loc.org + loc.lin.len_ - 1
+  pos := loc.org
+  ox := F.left
+  Texts.OpenReader(@R, F.text, loc.org)
+  Texts.Read(@R, @ch)
+  loop
+    if pos = lim then
+      dx := eolW
+      exit
+    end
+    R.lib.GetObj(R.lib, val(int16, ord(ch)), @obj)
+    if ~(obj is Fonts.Char) then
+      obj := box
+    end
+    dx := obj(Fonts.Char).dx
+    if ox + dx > x then
+      exit
+    end
+    inc(pos)
+    ox := ox + dx
+    Texts.Read(@R, @ch)
+  end
+
+  loc.pos := pos
+  loc.dx := dx
+  loc.x := ox
+end LocateChar
+
+procedure LocatePos(F: Frame; pos: int32; loc: pointer to Location)
+  var
+    R: Texts.Reader
+    L: Line
+    org: int32
+    cury: int16
+begin
+  org := F.org
+  L := F.trailer.next
+  cury := F.H - F.top - asr_
+  while (L.next # F.trailer) & (pos >= org + L.len_) do
+    org := org + L.len_
+    L := L.next
+    cury := cury - lsp
+  end
+
+  if pos < org then
+    pos := org
+  elsif pos >= org + L.len_ then
+    pos := org + L.len_ - 1
+  end
+
+  Texts.OpenReader(@R, F.text, org)
+  Texts.Read(@R, @ch)
+  loc.org := org
+  loc.pos := pos
+  loc.lin := L
+  loc.x := F.left + Width(@R, pos - org)
+  loc.y := cury
+end LocatePos
+
+procedure Pos*(F: Frame; X, Y: int16): int32
+  var
+    loc: Location
+begin
+  LocateChar(F, X - F.X, Y - F.Y, @loc)
+  return loc.pos
+end Pos
+
+procedure FlipCaret(F: Frame)
+  var
+    ox, oy, ow, oh: int16
+begin
+  if MoveArea then
+    Display.GetClip(@ox, @oy, @ow, @oh)
+    Display.SetClip(F.X, F.Y, F.W, F.H)
+    Display.CopyPattern(FullColor, Display.hook, F.X + F.carloc.x, F.Y + F.carloc.y - 10, invert)
+    Display.SetClip(ox, oy, ow, oh)
+  else
+    if (F.carloc.y >= 10) & (F.carloc.x + 12 < F.W) then
+      Display.CopyPattern(FullColor, Display.hook, F.X + F.carloc.x, F.Y + F.carloc.y - 10, invert)
+    end
+  end
+end FlipCaret
+
+procedure SetCaret*(F: Frame; pos: int32)
+begin
+  if F.car # 0 then
+    FlipCaret(F)
+    F.car := 0
+  end
+  LocatePos(F, pos, @F.carloc)
+  if F.carloc.pos = pos then
+    FlipCaret(F)
+    F.car := 1
+  else
+    RemoveMarks(F)
+    Oberon.RemoveMarks(F.X, F.Y, F.W, F.H)
+    Show(F, pos - 100)
+    LocatePos(F, pos, @F.carloc)
+    if F.carloc.pos = pos then
+      FlipCaret(F)
+      F.car := 1
+    end
+  end
+end SetCaret
+
+procedure TrackCaret*(F: Frame; X, Y: int16; keysum: pointer to set)
+  var
+    loc: Location
+    keys: set
+begin
+  if F.trailer.next # F.trailer then
+    LocateChar(F, X - F.X, Y - F.Y, @F.carloc)
+    FlipCaret(F)
+    keysum^ := {}
+    repeat
+      Input.Mouse(@keys, @X, @Y)
+      keysum^ := keysum^ + keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Mouse.marker, X, Y)
+      LocateChar(F, X - F.X, Y - F.Y, @loc)
+      if loc.pos # F.carloc.pos then
+        FlipCaret(F)
+        F.carloc := loc
+        FlipCaret(F)
+      end
+    until keys = {}
+
+    F.car := 1
+  end
+end TrackCaret
+
+procedure RemoveCaret*(F: Frame)
+begin
+  if F.car # 0 then
+    FlipCaret(F)
+    F.car := 0
+  end
+end RemoveCaret
+
+procedure FlipSelection(F: Frame; beg, end_: pointer to Location)
+  var
+    L: Line
+    Y: int16
+begin
+  L := beg.lin
+  Y := F.Y + beg.y - 2
+  if L = end_.lin then
+    ReplConst(FullColor, F, F.X + beg.x, Y, end_.x - beg.x, selH, invert)
+  else
+    ReplConst(FullColor, F, F.X + beg.x, Y, F.left + L.wid - beg.x, selH, invert)
+    loop
+      L := L.next
+      Y := Y - lsp
+      if L = end_.lin then
+        exit
+      end
+      ReplConst(FullColor, F, F.X + F.left, Y, L.wid, selH, invert)
+    end
+
+    ReplConst(FullColor, F, F.X + F.left, Y, end_.x - F.left, selH, invert)
+  end
+end FlipSelection
+
+procedure SetSelection*(F: Frame; beg, end_: int32)
+begin
+  if end_ <= beg then
+    end_ := beg + 1
+  end
+  if F.sel # 0 then
+    FlipSelection(F, @F.selbeg, @F.selend)
+  end
+  LocatePos(F, beg, @F.selbeg)
+  if F.selbeg.pos # beg then
+    Show(F, beg)
+    LocatePos(F, beg, @F.selbeg)
+  end
+  LocatePos(F, end_, @F.selend)
+  FlipSelection(F, @F.selbeg, @F.selend)
+  F.time := Input.Time()
+  F.sel := 1
+end SetSelection
+
+procedure TrackSelection*(F: Frame; X, Y: int16; keysum: pointer to set)
+  var
+    loc: Location
+    modKeys, keys: set
+    M: Oberon.SelectMsg
+begin
+  if F.trailer.next # F.trailer then
+    if F.sel # 0 then
+      FlipSelection(F, @F.selbeg, @F.selend)
+    end
+    LocateChar(F, X - F.X, Y - F.Y, @loc)
+    if (F.sel # 0) & (loc.pos = F.selbeg.pos) & (F.selend.pos = F.selbeg.pos + 1) then
+      LocateChar(F, F.left, Y - F.Y, @F.selbeg)
+    else
+      F.selbeg := loc
+    end
+
+    F.sel := 0
+    inc(loc.pos)
+    loc.x := loc.x + loc.dx
+    F.selend := loc
+    FlipSelection(F, @F.selbeg, @F.selend)
+    keysum^ := {}
+    repeat
+      Input.Mouse(@keys, @X, @Y)
+      keysum^ := keysum^ + keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Mouse.marker, X, Y)
+      LocateChar(F, X - F.X, Y - F.Y, @loc)
+      if loc.pos < F.selbeg.pos then
+        loc := F.selbeg
+      end
+      inc(loc.pos)
+      loc.x := loc.x + loc.dx
+      if loc.pos < F.selend.pos then
+        FlipSelection(F, @loc, @F.selend)
+        F.selend := loc
+      elsif loc.pos > F.selend.pos then
+        FlipSelection(F, @F.selend, @loc)
+        F.selend := loc
+      end
+    until keys = {}
+
+    // ps - 3.4.98
+    Input.KeyState(@modKeys)
+    if Input.SHIFT in modKeys then
+      M.id := Oberon.get
+      M.F := nil
+      M.sel := nil
+      M.text := nil
+      M.time := -1
+      Display.Broadcast(@M)
+      if (M.time # -1) & (M.text = F.text) & (M.sel is Frame) then
+        if M.beg > F.selbeg.pos then
+          M.beg := F.selbeg.pos
+        end
+        if M.end_ < F.selend.pos then
+          M.end_ := F.selend.pos
+        end
+        FlipSelection(F, @F.selbeg, @F.selend)
+        LocatePos(F, M.beg, @F.selbeg)
+        LocatePos(F, M.end_, @F.selend)
+        FlipSelection(F, @F.selbeg, @F.selend)
+        M.F := M.sel
+        M.id := Oberon.set_
+        Display.Broadcast(@M)
+      end
+    end
+
+    F.time := Input.Time()
+    F.sel := 1
+  end
+end TrackSelection
+
+procedure RemoveSelection*(F: Frame)
+begin
+  if F.sel # 0 then
+    FlipSelection(F, @F.selbeg, @F.selend)
+    F.sel := 0
+  end
+end RemoveSelection
+
+procedure TrackLine*(F: Frame; X, Y: int16; org: pointer to int32; keysum: pointer to set)
+  var
+    old, new_: Location
+    keys: set
+begin
+  if F.trailer.next # F.trailer then
+    LocateLine(F, Y - F.Y, @old)
+    ReplConst(FullColor, F, F.X + F.left, F.Y + old.y - dsr, old.lin.wid, 2, invert)
+    keysum^ := {}
+    repeat
+      Input.Mouse(@keys, @X, @Y)
+      keysum^ := keysum^ + keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Mouse.marker, X, Y)
+      LocateLine(F, Y - F.Y, @new_)
+      if new_.org # old.org then
+        ReplConst(FullColor, F, F.X + F.left, F.Y + old.y - dsr, old.lin.wid, 2, invert)
+        ReplConst(FullColor, F, F.X + F.left, F.Y + new_.y - dsr, new_.lin.wid, 2, invert)
+        old := new_
+      end
+    until keys = {}
+
+    ReplConst(FullColor, F, F.X + F.left, F.Y + new_.y - dsr, new_.lin.wid, 2, invert)
+    org^ := new_.org
+  else
+    org^ := -1
+  end
+end TrackLine
+
+procedure TrackWord*(F: Frame; X, Y: int16; pos: pointer to int32; keysum: pointer to set)
+  var
+    old, new_: Location
+    keys: set
+begin
+  if F.trailer.next # F.trailer then
+    LocateString(F, X - F.X, Y - F.Y, @old)
+    ReplConst(FullColor, F, F.X + old.x, F.Y + old.y - dsr, old.dx, 2, invert)
+    keysum^ := {}
+    repeat
+      Input.Mouse(@keys, @X, @Y)
+      keysum^ := keysum^ + keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Mouse.marker, X, Y)
+      LocateString(F, X - F.X, Y - F.Y, @new_)
+      if new_.pos # old.pos then
+        ReplConst(FullColor, F, F.X + old.x, F.Y + old.y - dsr, old.dx, 2, invert)
+        ReplConst(FullColor, F, F.X + new_.x, F.Y + new_.y - dsr, new_.dx, 2, invert)
+        old := new_
+      end
+    until keys = {}
+
+    ReplConst(FullColor, F, F.X + new_.x, F.Y + new_.y - dsr, new_.dx, 2, invert)
+    pos^ := new_.pos
+    hintPos := new_.org
+  else
+    pos^ := -1
+  end
+end TrackWord
+
+// ------------------message handling------------------------
+
+procedure RemoveMarks(F: Frame)
+begin
+  RemoveCaret(F)
+  RemoveSelection(F)
+end RemoveMarks
+
+procedure GetAttr*(F: Frame; s: pointer to array of char; s_len: int32)
+  var
+    S: Texts.Scanner
+begin
+  Texts.OpenScanner(@S, F.text, 0)
+  Texts.Scan(@S)
+  copy(s, @S.s, s_len)
+end GetAttr
+
+procedure CallCmd(const cmd: pointer to array of char; F: Frame; pos: int32; new_: boolean)
+  var
+    res: int16
+    par: Oberon.ParList
+begin
+  newgc(par)
+  par.vwr := Viewers.This(F.X, F.Y)
+  par.frame := F
+  par.text := F.text
+  par.pos := pos
+  Oberon.Call(cmd, par, new_, @res)
+  if res > 0 then
+    Texts.WriteString(@W, "Call error: ")
+    Texts.WriteString(@W, @Modules.resMsg)
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end
+end CallCmd
+
+procedure Call*(F: Frame; pos: int32; new_: boolean)
+  var
+    S: Texts.Scanner
+    i, h: int16
+    hint: array 32 of char
+begin
+  if SmallDisplay then
+    Texts.OpenScanner(@S, F.text, pos)
+    Texts.Scan(@S)
+    h := 0
+    if (S.class = Texts.Char) & (S.c = ".") or (S.class = Texts.Name) & (S.s[0] = ".") then
+      // find hint
+      Texts.OpenScanner(@S, F.text, hintPos)
+      repeat
+        Texts.Scan(@S)
+        if S.class = Texts.Name then
+          i := 0
+          while (i < S.len_) & (S.s[i] # ".") do
+            inc(i)
+          end
+          if (0 < i) & (i < S.len_) then
+            h := 0
+            repeat
+              hint[h] := S.s[h]
+              inc(h)
+            until h > i
+          end
+        end
+      until Texts.Pos(@S) > pos
+
+      if (S.class = Texts.Char) & (S.c = ".") then
+        Texts.Scan(@S)
+      end
+    end
+
+    if S.class = Texts.Name then
+      if h > 1 then
+        // use hint
+        i := S.len_
+        if S.s[0] = "." then
+          dec(h)
+        end
+        repeat
+          S.s[i + h] := S.s[i]
+          dec(i)
+        until (i = -1) or (S.s[i + 1] = ".")
+        repeat
+          dec(h)
+          S.s[h] := hint[h]
+        until h = 0
+      end
+
+      CallCmd(@S.s, F, pos + S.len_, new_)
+    end
+
+  else
+    Texts.OpenScanner(@S, F.text, pos)
+    Texts.Scan(@S)
+    if (S.line = 0) & (S.class = Texts.Name) then
+      CallCmd(@S.s, F, pos + S.len_, new_)
+    end
+  end
+end Call
+
+procedure Write*(F: Frame; ch: char; lib: Objects.Library; col, voff: int8)
+begin
+  // F.car # 0
+  if ch = 7FX then
+    if F.carloc.pos > F.org then
+      Texts.Delete(F.text, F.carloc.pos - 1, F.carloc.pos)
+      SetCaret(F, F.carloc.pos - 1)
+    end
+
+  elsif ch = 0C3X then
+    // right
+    if F.carloc.pos < F.text.len_ then
+      RemoveCaret(F)
+      SetCaret(F, F.carloc.pos + 1)
+    end
+
+  elsif ch = 0C4X then
+    // left
+    if F.carloc.pos > 0 then
+      RemoveCaret(F)
+      SetCaret(F, F.carloc.pos - 1)
+    end
+
+  elsif (ch >= 0C1X) & (ch <= 0C4X) then
+  elsif (ch >= 0A0X) & (ch <= 0A9X) then
+  elsif (ch >= 0F0X) & (ch <= 0FFX) then
+  else
+    KW.lib := lib
+    KW.col := col
+    KW.voff := voff
+    Texts.Write(@KW, ch)
+    Texts.Insert(F.text, F.carloc.pos, KW.buf)
+    SetCaret(F, F.carloc.pos + 1)
+  end
+end Write
+
+procedure Defocus*(F: Frame)
+begin
+  RemoveCaret(F)
+end Defocus
+
+procedure Neutralize*(F: Frame)
+begin
+  RemoveMarks(F)
+end Neutralize
+
+procedure Modify*(F: Frame; id, dY, Y, H: int16)
+begin
+  Mark(F, 0)
+  RemoveMarks(F)
+  if id = extend then
+    if dY > 0 then
+      Display.CopyBlock(F.X, F.Y, F.W, F.H, F.X, F.Y + dY, replace)
+      F.Y := F.Y + dY
+    end
+
+    Extend(F, Y)
+  elsif id = reduce then
+    Reduce(F, Y + dY)
+    if dY > 0 then
+      Display.CopyBlock(F.X, F.Y, F.W, F.H, F.X, Y, replace)
+      F.Y := Y
+    end
+  end
+
+  if F.H > 0 then
+    Mark(F, 1)
+  end
+end Modify
+
+procedure Open*(F: Frame; H: Objects.Handler; T: Texts.Text; org: int32; col, left, right, top, bot, lsp: int16)
+
+  var
+    L: Line
+begin
+  newgc(L)
+  L.len_ := 0
+  L.wid := 0
+  L.eot := false
+  L.next := L
+  F.handle := H
+  F.text := T
+  F.org := org
+  F.trailer := L
+  F.left := left
+  F.right := right
+  F.top := top
+  F.bot := bot
+  F.lsp := lsp
+  F.col := col
+  F.mark := 0
+  F.car := 0
+  F.sel := 0
+end Open
+
+procedure Copy*(F: Frame; F1: pointer to Frame)
+begin
+  newgc(F1^)
+  Open(F1^, F.handle, F.text, F.org, F.col, F.left, F.right, F.top, F.bot, F.lsp)
+end Copy
+
+procedure CopyOver*(F: Frame; text: Texts.Text; beg, end_: int32)
+  var
+    buf: Texts.Buffer
+begin
+  if F.car > 0 then
+    newgc(buf)
+    Texts.OpenBuf(buf)
+    Texts.Save(text, beg, end_, buf)
+    Texts.Insert(F.text, F.carloc.pos, buf)
+    SetCaret(F, F.carloc.pos + (end_ - beg))
+  end
+end CopyOver
+
+procedure GetSelection*(F: Frame; M: pointer to Oberon.SelectMsg)
+begin
+  if F.sel > 0 then
+    if (F.time - M.time > 0) or (M.time = -1) then
+      M.sel := F
+      M.time := F.time
+      M.text := F.text
+      M.beg := F.selbeg.pos
+      M.end_ := F.selend.pos
+      if M.end_ > M.text.len_ then
+        M.end_ := M.text.len_
+      end
+    (*
+    ELSIF (F.text = M.text) & (F.selbeg.pos < M.beg) & (M.sel IS Frame) THEN
+    IF (M.beg <= M.sel(Frame).org) & (F.selend.pos >= Pos(F, F.X+F.W, F.Y)) THEN
+    M.beg := F.selbeg.pos
+    END
+    *)
+    elsif F.text = M.text then
+      // extend selection over frame boundaries
+      // 7.4.98 - ps
+      if (F.selbeg.pos < M.beg) & (F.selend.pos >= Pos(F, F.X + F.W, F.Y)) then
+        M.beg := F.selbeg.pos
+      end
+      if (F.selend.pos > M.end_) & (F.selbeg.pos = F.org) then
+        M.end_ := F.selend.pos
+      end
+      if M.end_ > F.text.len_ then
+        M.end_ := F.text.len_
+      end
+    end
+  end
+end GetSelection
+
+procedure GetCaret*(F: Frame; M: pointer to Oberon.CaretMsg)
+begin
+  if F.car > 0 then
+    M.text := F.text
+    M.pos := F.carloc.pos
+    M.car := F
+    M.res := 0
+  end
+end GetCaret
+
+procedure LineLen(R: pointer to Texts.Reader): int32
+  var
+    len_: int32
+begin
+  len_ := 0
+  while (ch # CR) & (R.lib # nil) do
+    inc(len_)
+    Texts.Read(R, @ch)
+  end
+  Texts.Read(R, @ch)
+  return len_ + 1
+end LineLen
+
+procedure Update*(F: Frame; beg, end_, len_: int32)
+  var
+    R: Texts.Reader
+    L, LB, LR, LS: Line
+    done: boolean
+    org, orgB, orgS, off, Llen: int32
+    botY, Y, YB, YL, YR, YS, wid, H: int16
+begin
+  if end_ < F.org then
+    F.org := F.org - (end_ - beg) + len_
+  else
+    if beg < F.org then
+      F.trailer.next.len_ := F.trailer.next.len_ + (F.org - beg)
+      F.org := beg
+    end
+
+    botY := F.Y + F.bot + dsr
+    org := F.org
+    Y := F.Y + F.H - F.top - asr_
+    L := F.trailer.next
+    while (L # F.trailer) & (org + L.len_ <= beg) do
+      org := org + L.len_
+      Y := Y - lsp
+      L := L.next
+    end
+
+    if L # F.trailer then
+      done := false
+      RemoveMarks(F)
+      Oberon.RemoveMarks(F.X, F.Y, F.W, F.H)
+      orgB := org
+      YB := Y
+      LB := L
+      while (L # F.trailer) & (org + L.len_ <= end_) do
+        org := org + L.len_
+        Y := Y - lsp
+        L := L.next
+      end
+
+      if L # F.trailer then
+        org := org + L.len_
+        Y := Y - lsp
+        L := L.next
+        if L # F.trailer then
+          YR := Y
+          LR := L
+          org := orgB
+          Y := YB
+          Texts.OpenReader(@R, F.text, org)
+          Texts.Read(@R, @ch)
+          Llen := LineLen(@R)
+          while (org + Llen <= beg + len_) & (botY + lsp <= Y) do
+            org := org + Llen
+            Y := Y - lsp
+            Llen := LineLen(@R)
+          end
+
+          org := org + Llen
+          Y := Y - lsp
+          if botY <= Y then
+            // update with reusing lines
+            YL := Y
+            L := LR
+            while (L.next # F.trailer) & (botY + lsp <= Y) do
+              org := org + L.len_
+              Y := Y - lsp
+              L := L.next
+            end
+
+            orgS := org
+            YS := Y
+            LS := L
+            Display.CopyBlock(F.X + F.left, YS - dsr + (YR - YL), F.W - F.left, YL + lsp - YS, F.X + F.left, YS - dsr, replace)
+
+            org := orgB
+            Y := YB
+            L := LB
+            Texts.OpenReader(@R, F.text, org)
+            Texts.Read(@R, @ch)
+            off := beg - org
+            wid := Width(@R, off)
+            ReplConst(F.col, F, F.X + F.left + wid, Y - dsr, L.wid - wid, lsp, 0)
+            DisplayLine(F, L, @R, F.X + F.left + wid, Y, off)
+            while org + L.len_ <= beg + len_ do
+              org := org + L.len_
+              Y := Y - lsp
+              newgc(L.next)
+              L := L.next
+              Display.ReplConst(F.col, F.X + F.left, Y - dsr, F.W - F.left, lsp, replace)
+              DisplayLine(F, L, @R, F.X + F.left, Y, 0)
+            end
+
+            L.next := LR
+            org := orgS
+            Y := YS
+            L := LS
+            org := org + L.len_
+            Y := Y - lsp
+            Texts.OpenReader(@R, F.text, org)
+            Texts.Read(@R, @ch)
+            while ~L.eot & (botY <= Y) do
+              newgc(L.next)
+              L := L.next
+              Display.ReplConst(F.col, F.X + F.left, Y - dsr, F.W - F.left, lsp, replace)
+              DisplayLine(F, L, @R, F.X + F.left, Y, 0)
+              org := org + L.len_
+              Y := Y - lsp
+            end
+
+            L.next := F.trailer
+            if YR < YL then
+              H := Min(YL - YR, Y + lsp - dsr - F.Y)
+              Display.ReplConst(F.col, F.X + F.left, Y + lsp - dsr - H, F.W - F.left, H, replace)
+            end
+
+            done := true
+          end
+        end
+      end
+
+      if ~done then
+        // update without reusing lines
+        YR := Y
+        org := orgB
+        Y := YB
+        L := LB
+        Texts.OpenReader(@R, F.text, org)
+        Texts.Read(@R, @ch)
+        off := beg - org
+        wid := Width(@R, off)
+        ReplConst(F.col, F, F.X + F.left + wid, Y - dsr, L.wid - wid, lsp, 0)
+        DisplayLine(F, L, @R, F.X + F.left + wid, Y, off)
+        while ~L.eot & (botY + lsp <= Y) do
+          org := org + L.len_
+          Y := Y - lsp
+          newgc(L.next)
+          L := L.next
+          Display.ReplConst(F.col, F.X + F.left, Y - dsr, F.W - F.left, lsp, replace)
+          DisplayLine(F, L, @R, F.X + F.left, Y, 0)
+        end
+
+        org := org + L.len_
+        Y := Y - lsp
+        if (Y < botY) & (org <= beg + len_) & (beg + len_ < org + 500) then
+          // autoscroll
+          repeat
+            Display.CopyBlock(F.X + F.left, Y + lsp - dsr, F.W - F.left, F.Y + F.H - F.top - asr_ - Y - lsp, 
+                                F.X + F.left, Y + lsp - dsr + lsp, replace)
+
+            F.org := F.org + F.trailer.next.len_
+            L.next := F.trailer.next
+            F.trailer.next := F.trailer.next.next
+            L := L.next
+            Display.ReplConst(F.col, F.X + F.left, Y + lsp - dsr, F.W - F.left, lsp, replace)
+            DisplayLine(F, L, @R, F.X + F.left, Y + lsp, 0)
+            org := org + L.len_
+          until org > beg + len_
+        end
+
+        L.next := F.trailer
+        if YR < Y then
+          Display.ReplConst(F.col, F.X + F.left, YR + lsp - dsr, F.W - F.left, Y - YR, replace)
+        end
+      end
+    end
+  end
+
+  UpdateMark(F)
+end Update
+
+procedure Recall(F: Frame)
+  var
+    buf: Texts.Buffer
+    pos: int32
+begin
+  if F.car > 0 then
+    newgc(buf)
+    Texts.OpenBuf(buf)
+    Texts.Recall(@buf)
+    pos := F.carloc.pos + buf.len_
+    Texts.Insert(F.text, F.carloc.pos, buf)
+    SetCaret(F, pos)
+  end
+end Recall
+
+procedure SaveCaret()
+begin
+  saved.car := nil
+  saved.text := nil
+  saved.id := Oberon.get
+  Display.Broadcast(@saved)
+end SaveCaret
+
+procedure RestoreCaret()
+begin
+  if (saved.car # nil) & (saved.text # nil) then
+    saved.id := Oberon.set_
+    Display.Broadcast(@saved)
+  end
+end RestoreCaret
+
+procedure Edit*(F: Frame; X, Y: int16; Keys: set)
+
+  var
+    M: Oberon.ConsumeMsg
+    R: Texts.Reader
+    text: Texts.Text
+    buf: Texts.Buffer
+    time, pos, beg, end_: int32
+    keysum: set
+    ch: char
+begin
+  Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Arrow, X, Y)
+  if X < F.X + Min(F.left, barW) then
+    if (0 in Keys) or (1 in Keys) then
+      keysum := Keys
+      repeat
+        Input.Mouse(@Keys, @X, @Y)
+        keysum := keysum + Keys
+        Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Arrow, X, Y)
+      until Keys = {}
+
+      if ~(2 in keysum) then
+        RemoveMarks(F)
+        Oberon.RemoveMarks(F.X, F.Y, F.W, F.H)
+        if (0 in keysum) or (F.Y + F.H < Y) then
+          if 1 in keysum then
+            pos := 0
+          else
+            pos := Max(F.org - obdiv(val(int32, F.H * 25), lsp), 0)
+          end
+
+        else
+          pos := obdiv((F.Y + F.H - Y) * F.text.len_, F.H)
+        end
+
+        RemoveMarks(F)
+        Oberon.RemoveMarks(F.X, F.Y, F.W, F.H)
+        Show(F, pos)
+      elsif ~(0 in keysum) then
+        RemoveMarks(F)
+        Oberon.RemoveMarks(F.X, F.Y, F.W, F.H)
+        Show(F, F.text.len_)
+      end
+
+    elsif 2 in Keys then
+      TrackLine(F, X, Y, @pos, @keysum)
+      if (pos >= 0) & ~(0 in keysum) then
+        RemoveMarks(F)
+        Oberon.RemoveMarks(F.X, F.Y, F.W, F.H)
+        Show(F, pos)
+      end
+    end
+
+  else
+    if 0 in Keys then
+      TrackSelection(F, X, Y, @keysum)
+      if F.sel # 0 then
+        if (2 in keysum) & ~(1 in keysum) then
+          // delete text
+          Oberon.GetSelection(@text, @beg, @end_, @time)
+          Texts.Delete(text, beg, end_)
+          Oberon.Defocus()
+          SetCaret(F, beg)
+        elsif (1 in keysum) & ~(2 in keysum) then
+          // copy to focus
+          Oberon.GetSelection(@text, @beg, @end_, @time)
+          M.F := nil
+          M.text := text
+          M.beg := beg
+          M.end_ := end_
+          Display.Broadcast(@M)
+        end
+      end
+
+    elsif 1 in Keys then
+      TrackWord(F, X, Y, @pos, @keysum)
+      if 0 in keysum then
+        if (pos >= 0) & ~(2 in keysum) then
+          CallCmd(OpenCmd, F, pos, false)
+        end
+      else
+        if pos >= 0 then
+          Call(F, pos, 2 in keysum)
+        end
+      end
+
+    elsif 2 in Keys then
+      if Oberon.New & (F.car # 0) & (Pos(F, X, Y) = F.carloc.pos) then
+        // click on caret
+        Oberon.Defocus()
+        RestoreCaret()
+        TrackWord(F, X, Y, @pos, @keysum)
+        if 0 in keysum then
+          if (pos >= 0) & ~(1 in keysum) then
+            CallCmd(OpenCmd, F, pos, false)
+          end
+        else
+          if pos >= 0 then
+            Call(F, pos, false)
+          end
+        end
+
+      else
+        if Oberon.New then
+          SaveCaret()
+        end
+        Oberon.Defocus()
+        TrackCaret(F, X, Y, @keysum)
+        if F.car # 0 then
+          if (1 in keysum) & ~(0 in keysum) then
+            // copy from selection
+            Oberon.GetSelection(@text, @beg, @end_, @time)
+            if time # -1 then
+              newgc(buf)
+              Texts.OpenBuf(buf)
+              Texts.Save(text, beg, end_, buf)
+              Texts.Insert(F.text, F.carloc.pos, buf)
+              SetCaret(F, F.carloc.pos + (end_ - beg))
+            else
+              // copy from delete buffer
+              newgc(buf)
+              Texts.OpenBuf(buf)
+              Texts.Recall(@buf)
+              end_ := F.carloc.pos + buf.len_
+              Texts.Insert(F.text, F.carloc.pos, buf)
+              SetCaret(F, end_)
+            end
+
+          elsif (0 in keysum) & ~(1 in keysum) then
+            // copy font
+            Oberon.GetSelection(@text, @beg, @end_, @time)
+            if time # -1 then
+              Texts.OpenReader(@R, F.text, F.carloc.pos)
+              Texts.Read(@R, @ch)
+              if (R.lib # nil) & (R.lib is Fonts.Font) then
+                Texts.ChangeLooks(text, beg, end_, {0,1,2}, R.lib, R.col, R.voff)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end Edit
+
+procedure Handle*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    F1: Frame
+begin
+  case F of
+  | Frame:
+    case M of
+    | Texts.PUpdateMsg:
+      if F.text = M.text then
+        Update(F, M.beg, M.end_, M.len_)
+      end
+
+    | Oberon.PInputMsg:
+      if M.id = Oberon.track then
+        Edit(F, M.X, M.Y, M.keys)
+      elsif M.id = Oberon.consume then
+        if F.car # 0 then
+          Write(F, M.ch, M.fnt, M.col, M.voff)
+        end
+      end
+
+    | Oberon.PControlMsg:
+      if M.id = Oberon.defocus then
+        Defocus(F)
+      elsif M.id = Oberon.neutralize then
+        Neutralize(F)
+      end
+
+    | Oberon.PCaretMsg:
+      if M.id = Oberon.get then
+        GetCaret(F, M)
+      elsif (M.car = F) & (M.text = F.text) then
+        if M.id = Oberon.set_ then
+          SetCaret(F, M.pos)
+        elsif M.id = Oberon.reset then
+          RemoveCaret(F)
+        end
+      end
+
+    | Oberon.PSelectMsg:
+      if M.id = Oberon.get then
+        GetSelection(F, M)
+      elsif (M.sel = F) & (M.text = F.text) then
+        if M.id = Oberon.set_ then
+          SetSelection(F, M.beg, M.end_)
+        elsif M.id = Oberon.reset then
+          RemoveSelection(F)
+        end
+      end
+
+    | Oberon.PConsumeMsg:
+      CopyOver(F, M.text, M.beg, M.end_)
+
+    | Oberon.PRecallMsg:
+      Recall(F)
+
+    | Display.PModifyMsg:
+      if M.F = F then
+        Modify(F, M.id, M.dY, M.Y, M.H)
+      end
+
+    | Display.PLocateMsg:
+      if (F.X <= M.X) & (M.X < F.X + F.W) & (F.Y <= M.Y) & (M.Y < F.Y + F.H) then
+        M.loc := F
+        M.res := 0
+      end
+
+    | Objects.PAttrMsg:
+      GetAttr(F, @M.s, 64)
+      M.class := Objects.String
+      M.res := 0
+
+    | Objects.PCopyMsg:
+      Copy(F, @F1)
+      M.obj := F1
+
+    | Objects.PLinkMsg:
+      M.obj := F.text
+      M.res := 0
+
+    end
+  end
+end Handle
+
+// creation
+
+procedure Menu(const name: pointer to array of char; const commands: pointer to array of char; commands_len: int32): Texts.Text
+  var
+    commands0: array 1024 of char
+    commands0_i: int32
+    T: Texts.Text
+    mb, me, m, s, d, i: int16
+    ch: char
+begin
+  commands0_i := 0
+  while (commands0_i < 1023) & (commands[commands0_i] # 0X) do commands0[commands0_i] := commands[commands0_i]; inc(commands0_i) end
+  commands0[commands0_i] := 0X
+  if SmallDisplay & (Display.Width < 1024) then
+    mb := 0
+    me := 0
+    s := 0
+    d := 0
+    loop
+      // position to beginning of word
+      loop
+        if s >= val(int16, commands_len) then
+          exit
+        end
+        ch := commands0[s]
+        inc(s)
+        if ch = 0X then
+          exit
+        end
+        commands0[d] := ch
+        inc(d)
+        if (41H <= val(int32, band(ord(ch), 0DFH))) & (val(int32, band(ord(ch), 0DFH)) <= 5AH) then
+          exit
+        end
+      end
+
+      if (s >= val(int16, commands_len)) or (ch = 0X) then
+        exit
+      end
+      // scan first part of word, checking against last module name
+      m := mb
+      i := 0
+      loop
+        inc(i)
+        if (m < me) & (commands0[m] = ch) then
+          inc(m)
+        end
+        if s >= val(int16, commands_len) then
+          exit
+        end
+        ch := commands0[s]
+        inc(s)
+        if ch = 0X then
+          exit
+        end
+        commands0[d] := ch
+        inc(d)
+        if (ch < "0") or ("9" < ch) & (val(int32, band(ord(ch), 0DFH)) < 41H) or (val(int32, band(ord(ch), 0DFH)) > 5AH) then
+          exit
+        end
+      end
+
+      // check for match
+      if (s < val(int16, commands_len)) & (ch = ".") then
+        if m = mb + i then
+          // matches previous module name - compress
+          dec(d, i)
+          commands0[d - 1] := "."
+        else
+          // set new module name
+          mb := d - (i + 1)
+          me := d - 1
+        end
+
+        // and do last part of word
+        loop
+          if s >= val(int16, commands_len) then
+            exit
+          end
+          ch := commands0[s]
+          inc(s)
+          if ch = 0X then
+            exit
+          end
+          commands0[d] := ch
+          inc(d)
+          if (ch < "0") or ("9" < ch) & (val(int32, band(ord(ch), 0DFH)) < 41H) or (val(int32, band(ord(ch), 0DFH)) > 5AH) then
+            exit
+          end
+        end
+      end
+
+      if (s >= val(int16, commands_len)) or (ch = 0X) then
+        exit
+      end
+    end
+
+    if d < val(int16, commands_len) then
+      commands0[d] := 0X
+    end
+  end
+
+  newgc(T)
+  Texts.Open(T, "")
+  Texts.WriteString(@W, name)
+  Texts.WriteString(@W, " | ")
+  Texts.WriteString(@W, @commands0)
+  Texts.Append(T, W.buf)
+  return T
+end Menu
+
+procedure Text*(const name: pointer to array of char): Texts.Text
+  var
+    T: Texts.Text
+begin
+  newgc(T)
+  Texts.Open(T, name)
+  return T
+end Text
+
+procedure NewMenu*(const name: pointer to array of char; const commands: pointer to array of char; commands_len: int32): Frame
+  var
+    F: Frame
+    l: int16
+begin
+  newgc(F)
+  if MoveArea then
+    l := barW - 1
+  else
+    l := asr(left, 2)
+  end
+  if Modern then
+    Open(F, Handle, Menu(name, commands, commands_len), 0, MenuBG, l, 0, 3, 1, lsp)
+  else
+    Open(F, Handle, Menu(name, commands, commands_len), 0, MenuBG, l, 0, 1, 0, lsp)
+  end
+
+  return F
+end NewMenu
+
+procedure NewText*(text: Texts.Text; pos: int32): Frame
+  var
+    F: Frame
+begin
+  newgc(F)
+  Open(F, Handle, text, pos, TextBG, left, right, top, bot, lsp)
+  return F
+end NewText
+
+procedure ShowText(const title: pointer to array of char; T: Texts.Text; W, H: int16)
+  var
+    title0: array 256 of char
+    title0_i: int32
+    X, Y: int16
+    V: Viewers.Viewer
+    menu: array 100 of char
+begin
+  title0_i := 0
+  while (title0_i < 255) & (title[title0_i] # 0X) do title0[title0_i] := title[title0_i]; inc(title0_i) end
+  title0[title0_i] := 0X
+  X := 0
+  while (title0[X] # 0X) & (title0[X] # "|") do
+    inc(X)
+  end
+  if title0[X] = "|" then
+    title0[X] := 0X
+    inc(X)
+    Y := 0
+    while title0[X] # 0X do
+      menu[Y] := title0[X]
+      inc(X)
+      inc(Y)
+    end
+    menu[Y] := 0X
+  else
+    copy(@menu, "", 100)
+  end
+
+  if T = Oberon.Log then
+    Oberon.AllocateSystemViewer(0, @X, @Y)
+    if menu = "" then
+      copy(@menu, LogMenu, 100)
+    end
+    V := MenuViewers.New(NewMenu(@title0, @menu, 100), NewText(T, Max(T.len_ - 200, 0)), menuH, X, Y)
+  else
+    if W > asr(val(int32, Display.Width * 3), 3) then
+      Oberon.AllocateUserViewer(0, @X, @Y)
+    else
+      Oberon.AllocateSystemViewer(0, @X, @Y)
+    end
+
+    if menu = "" then
+      copy(@menu, StandardMenu, 100)
+    end
+    V := MenuViewers.New(NewMenu(@title0, @menu, 100), NewText(T, 0), menuH, X, Y)
+  end
+end ShowText
+
+// Replace the default system editor with a textframe.
+procedure ReplaceSystemEditor*()
+begin
+  Oberon.OpenText := ShowText
+end ReplaceSystemEditor
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "ReplaceSystemEditor" end return ReplaceSystemEditor end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("TextFrames", cmd_)
+  if Oberon.OpenText = nil then
+    Oberon.OpenText := ShowText
+  end
+
+  if Display.Depth(0) # 1 then
+    MarkColor := 12
+    MenuBG := 13
+    TextBG := 14
+    if Modern then
+      BarColor := 12
+      FullColor := Display.FG - TextBG
+    else
+      BarColor := 13
+      FullColor := Display.FG
+    end
+
+    mode := paint
+  else
+    MarkColor := Display.FG
+    BarColor := Display.FG
+    MenuBG := Display.FG
+    TextBG := Display.BG
+    FullColor := Display.FG
+    mode := invert
+  end
+
+  if Modern then
+    menuH := Fonts.Default.height + 8
+  else
+    menuH := Fonts.Default.height + 2
+  end
+
+  barW := Fonts.Default.height + 2
+  left := barW + asr(Fonts.Default.height, 1)
+  right := asr(Fonts.Default.height, 1)
+  if Modern then
+    top := obdiv(asr(Fonts.Default.height, 1) * 2, 3)
+  else
+    top := asr(Fonts.Default.height, 1)
+  end
+
+  bot := asr(Fonts.Default.height, 1)
+  asr_ := Fonts.Default.maxY
+  dsr := -Fonts.Default.minY
+  lsp := Fonts.Default.height
+  selH := Fonts.Default.height
+  markW := obdiv(Fonts.Default.height, 3) * 2
+  eolW := asr(Fonts.Default.height, 1)
+  Texts.OpenWriter(@W)
+  Texts.OpenWriter(@KW)
+  BoxPat[0] := {0..11}
+  BoxPat[1] := {0,11}
+  BoxPat[2] := {0,11}
+  BoxPat[3] := {0,11}
+  BoxPat[4] := {0,11}
+  BoxPat[5] := {0,11}
+  BoxPat[6] := {0,11}
+  BoxPat[7] := {0,11}
+  BoxPat[8] := {0,11}
+  BoxPat[9] := {0,11}
+  BoxPat[10] := {0,11}
+  BoxPat[11] := {0..11}
+  newgc(box)
+  box.dx := 12
+  box.x := 0
+  box.y := -3
+  box.w := 12
+  box.h := 12
+  box.pat (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; Oberon: box.pat := Display.NewPattern(12, 12, BoxPat) *) 
+    := Display.NewPattern(12, 12, @BoxPat)
+end TextFrames.

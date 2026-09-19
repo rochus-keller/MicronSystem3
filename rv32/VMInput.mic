@@ -1,0 +1,138 @@
+module VMInput [level=5] // keyboard and mouse of the RV32 emulator
+
+// New module which registers a mouse and a keyboard poller at Input
+// The emulator provides the mouse position and keys, and the keyboard as a PS/2 set 2 code FIFO, like Ceres-4
+
+import Kernel, Input, Modules
+
+const
+  msAdr = 0FFFFFFD8H
+  kbdAdr = 0FFFFFFDCH
+
+type
+  Int32Ptr = pointer to int32 // helper type for a variable reinterpreted by SYSTEM.VAL
+  CharPtr = pointer to char
+
+var
+  up, ext, shift, ctrl, alt: boolean
+  lastX, lastY: int32
+  lastKeys: set
+  first: boolean
+  KTab: array 256 of byte // keyboard code translation table
+  ETab: array 128 of byte // translation of the codes prefixed with E0
+
+procedure PollMouse(keys: pointer to set; dx, dy, dz: pointer to int16): boolean
+  var
+    w, x, y: int32
+    k: set
+begin
+  // mouse position reports are absolute
+  w := Int32Ptr{msAdr}^
+  x := w mod 1024
+  y := w div 4096 mod 1024 // the frame buffer counts the y axis from the top
+  k := bset(usig(w div 16777216 mod 8))
+  dx^ := val(int16, x)
+  dy^ := val(int16, y)
+  dz^ := 0
+  keys^ := k
+  if (x = lastX) & (y = lastY) & (k = lastKeys) & ~first then
+    return false
+  end
+  first := false
+  lastX := x
+  lastY := y
+  lastKeys := k
+  return true
+end PollMouse
+
+procedure PollKeyboard(ch: pointer to char; keys: pointer to set): boolean
+  var
+    code: int32
+    ok: boolean
+begin
+  ok := false
+  if Int32Ptr{msAdr}^ div 268435456 mod 2 # 0 then
+    code := val(int32, ord(CharPtr{kbdAdr}^))
+    if code = 240 then
+      up := true
+    elsif code = 224 then
+      ext := true
+    else
+      if (code = 18) or (code = 89) then
+        shift := ~up
+      elsif code = 20 then
+        ctrl := ~up
+      elsif code = 17 then
+        alt := ~up
+      elsif ~up then
+        if ext then
+          ch^ := chr(ETab[code mod 128])
+        else
+          if shift or ctrl then
+            inc(code, 128) // ctrl implies shift
+          end
+          ch^ := chr(KTab[code])
+          if ctrl then
+            ch^ := chr(ord(ch^) mod 32)
+          end
+        end
+        ok := ch^ # 0X
+      end
+      up := false
+      ext := false
+    end
+  end
+  keys^ := {}
+  if shift then
+    keys^ := keys^ + {Input.SHIFT}
+  end
+  if ctrl then
+    keys^ := keys^ + {Input.CTRL}
+  end
+  if alt then
+    keys^ := keys^ + {Input.ALT}
+  end
+  return ok
+end PollKeyboard
+
+procedure Init()
+begin
+  up := false
+  ext := false
+  shift := false
+  ctrl := false
+  alt := false
+  first := true
+  lastKeys := {}
+  KTab := $00 00 00 00 00 1A 00 00  00 00 00 00 00 09 60 00
+           00 00 00 00 00 71 31 00  00 00 7A 73 61 77 32 00
+           00 63 78 64 65 34 33 00  00 20 76 66 74 72 35 00
+           00 6E 62 68 67 79 36 00  00 00 6D 6A 75 37 38 00
+           00 2C 6B 69 6F 30 39 00  00 2E 2F 6C 3B 70 2D 00
+           00 00 27 00 5B 3D 00 00  00 00 0D 5D 00 5C 00 00
+           00 00 00 00 00 00 7F 00  00 00 00 00 00 00 00 00
+           00 7F 00 00 00 00 1B 00  00 00 00 00 00 00 00 00
+           00 00 00 00 00 00 00 00  00 00 00 00 00 09 7E 00
+           00 00 00 00 00 51 21 00  00 00 5A 53 41 57 40 00
+           00 43 58 44 45 24 23 00  00 20 56 46 54 52 25 00
+           00 4E 42 48 47 59 5E 00  00 00 4D 4A 55 26 2A 00
+           00 3C 4B 49 4F 29 28 00  00 3E 3F 4C 3A 50 5F 00
+           00 00 22 00 7B 2B 00 00  00 00 0D 7D 00 7C 00 00
+           00 00 00 00 00 00 7F 00  00 00 00 00 00 00 00 00
+           00 7F 00 00 00 00 1B 00  00 00 00 00 00 00 00 00$
+  ETab := $00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+           00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+           00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+           00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+           00 00 00 00 00 00 00 00  00 00 2F 00 00 00 00 00
+           00 00 00 00 00 00 00 00  00 00 0D 00 00 00 00 00
+           00 00 00 00 00 00 00 00  00 A9 00 C4 A8 00 00 00
+           A0 A1 C2 00 C3 C1 00 00  00 00 A3 00 00 A2 00 00$
+  Input.AddMouse(PollMouse)
+  Input.AddKeyboard(PollKeyboard)
+end Init
+
+begin
+  Modules.Register("VMInput", nil)
+  Init()
+end VMInput.

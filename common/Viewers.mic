@@ -1,0 +1,472 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Viewers [level=5]
+
+import Objects, Display, Modules
+// portable
+// JG 4.8.93
+
+(**
+The module viewers provide the data type for implementing the tiled viewers
+of the Oberon system. Each track of the Oberon system consists of a number of viewers.
+*)
+
+type
+  Viewer* = pointer to ViewerDesc
+  ViewerDesc* = object (Display.FrameDesc)
+    state*: int16
+  end
+  (** state > 1: displayed
+  state = 1: filler
+  state = 0: closed
+  state < 0: suspended.*)
+
+  Track = pointer to TrackDesc
+  TrackDesc = object (ViewerDesc)
+    under: Display.Frame
+  end
+
+var
+  curW*: int16 // Current width of the logical display.
+  minH*: int16 // Minimum viewer height.
+  DH: int16
+  FillerTrack: Track // for closed viewers
+  FillerViewer, buf: Viewer
+  bcF: Display.Frame
+  bcLev: int32
+
+// Open a new viewer V with top at Y in track X.
+procedure Open*(V: Viewer; X, Y: int16)
+  var
+    T, u, v: Display.Frame
+    M: Display.ControlMsg
+    N: Display.ModifyMsg
+begin
+  if (V.state = 0) & (X < 32767) then
+    if Y > DH then
+      Y := DH
+    end
+    T := FillerTrack.next
+    while X >= T.X + T.W do
+      T := T.next
+    end
+    u := T.dsc
+    v := u.next
+    while Y > v.Y + v.H do
+      u := v
+      v := u.next
+    end
+    if Y < v.Y + minH then
+      Y := v.Y + minH
+    end
+    if (v.next.Y # 0) & (Y > v.Y + v.H - minH) then
+      case v of
+      | Viewer:
+        V.X := T.X
+        V.W := T.W
+        V.Y := v.Y
+        V.H := v.H
+        M.F := nil
+        M.id := Display.suspend
+        v.handle(v, @M)
+        v.state := 0
+        buf := v
+        V.next := v.next
+        u.next := V
+        V.state := 2
+      end
+
+    else
+      V.X := T.X
+      V.W := T.W
+      V.Y := v.Y
+      V.H := Y - v.Y
+      N.F := v
+      N.id := Display.reduce
+      N.Y := Y
+      N.H := v.Y + v.H - Y
+      v.handle(v, @N)
+      v.Y := N.Y
+      v.H := N.H
+      V.next := v
+      u.next := V
+      V.state := 2
+    end
+  end
+end Open
+
+// Expand or shrink a viewer vertically to new top Y.
+procedure Change*(V: Viewer; Y: int16)
+  var
+    v: Display.Frame
+    M: Display.ModifyMsg
+begin
+  if V.state > 1 then
+    if Y > DH then
+      Y := DH
+    end
+    v := V.next
+    if (v.next.Y # 0) & (Y > v.Y + v.H - minH) then
+      Y := v.Y + v.H - minH
+    end
+
+    if Y > v.Y then
+      M.F := v
+      M.id := Display.reduce
+      M.Y := Y
+      M.H := v.Y + v.H - Y
+      v.handle(v, @M)
+      v.Y := M.Y
+      v.H := M.H
+      V.H := Y - V.Y
+    elsif Y >= V.Y + minH then
+      M.F := v
+      M.id := Display.extend
+      M.Y := Y
+      M.H := v.Y + v.H - Y
+      v.handle(v, @M)
+      v.Y := M.Y
+      v.H := M.H
+      V.H := Y - V.Y
+    end
+  end
+end Change
+
+procedure RestoreTrack(S: Display.Frame)
+  var
+    T, t, v: Display.Frame
+    M: Display.ControlMsg
+begin
+  case S of
+  | Track:
+    t := S.next
+    while t.next.X # S.X do
+      t := t.next
+    end
+    T := S.under
+    while T.next # nil do
+      T := T.next
+    end
+    t.next := S.under
+    T.next := S.next
+    M.F := nil
+    M.id := Display.restore
+    repeat
+      t := t.next
+      v := t.dsc
+      repeat
+        v := v.next
+        v.handle(v, @M)
+        case v of
+        | Viewer:
+          v.state := -v.state
+        end
+      until v = t.dsc
+    until t = T
+  end
+end RestoreTrack
+
+// Remove viewer V from the display.
+procedure Close*(V: Viewer)
+  var
+    T, U: Display.Frame
+    M: Display.ControlMsg
+    N: Display.ModifyMsg
+    safe: boolean
+begin
+  if V = nil then
+    // called from System.Trap
+    if (bcF = nil) or ~(bcF is Viewer) then
+      // can not do anything
+      bcF := nil
+      bcLev := 0
+      return
+    end
+
+    V := bcF(Viewer) // close the outermost viewer
+    safe := false
+    bcF := nil
+    bcLev := 0
+  else
+    safe := true // normal case
+  end
+
+  if V.state > 1 then
+    U := V.next
+    T := FillerTrack
+    repeat
+      T := T.next
+    until V.X < T.X + T.W
+    if (T(Track).under = nil) or (U.next # V) then
+      if safe then
+        M.F := nil
+        M.id := Display.suspend
+        V.handle(V, @M)
+      end
+
+      V.state := 0
+      buf := V
+      N.F := U
+      N.id := Display.extend
+      N.Y := V.Y
+      N.H := V.H + U.H
+      U.handle(U, @N)
+      U.Y := N.Y
+      U.H := N.H
+      while U.next # V do
+        U := U.next
+      end
+      U.next := V.next
+    else
+      // close track
+      M.F := nil
+      M.id := Display.suspend
+      if safe then
+        V.handle(V, @M)
+      end
+      V.state := 0
+      buf := V
+      U.handle(U, @M)
+      U(Viewer).state := 0
+      RestoreTrack(T)
+    end
+  end
+end Close
+
+// Recall most recently closed viewer.
+procedure Recall*(V: pointer to Viewer)
+begin
+  V^ := buf
+end Recall
+
+// Return viewer located at display coordinates X, Y.
+procedure This*(X, Y: int16): Viewer
+  var
+    T, V: Display.Frame
+begin
+  if (X < 32767) & (Y < DH) then
+    T := FillerTrack
+    repeat
+      T := T.next
+    until X < T.X + T.W
+    V := T.dsc
+    repeat
+      V := V.next
+    until Y < V.Y + V.H
+    return V(Viewer)
+  else
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end This
+
+// Return next upper neighbour of V in a track.
+procedure Next*(V: Viewer): Viewer
+begin
+  return V.next(Viewer)
+end Next
+
+(** In the track at X locate the following viewers: filler fil, bottom-most viewer, an
+alternative viewer alt of height >= H, and the viewer with the maximum height. *)
+procedure Locate*(X, H: int16; fil, bot, alt, max_: pointer to Display.Frame)
+  var
+    T, V: Display.Frame
+begin
+  if X < 32767 then
+    T := FillerTrack
+    repeat
+      T := T.next
+    until X < T.X + T.W
+    fil^ := T.dsc
+    bot^ := fil^.next
+    if bot^.next # fil^ then
+      alt^ := bot^.next
+      V := alt^.next
+      while (V # fil^) & (alt^.H < H) do
+        if V.H > alt^.H then
+          alt^ := V
+        end
+        V := V.next
+      end
+
+    else
+      alt^ := bot^
+    end
+
+    max_^ := T.dsc
+    V := max_^.next
+    while V # fil^ do
+      if V.H > max_^.H then
+        max_^ := V
+      end
+      V := V.next
+    end
+  end
+end Locate
+
+// Append to the current logical display and init track of width W and height H, and install filler.
+procedure InitTrack*(W, H: int16; Filler: Viewer)
+  var
+    S: Display.Frame
+    T: Track
+begin
+  if Filler.state = 0 then
+    Filler.X := curW
+    Filler.W := W
+    Filler.Y := 0
+    Filler.H := H
+    Filler.state := 1
+    Filler.next := Filler
+    newgc(T)
+    T.X := curW
+    T.W := W
+    T.Y := 0
+    T.H := H
+    T.dsc := Filler
+    T.under := nil
+    FillerViewer.X := curW + W
+    FillerViewer.W := 32767 - FillerViewer.X
+    FillerTrack.X := FillerViewer.X
+    FillerTrack.W := FillerViewer.W
+    S := FillerTrack
+    while S.next # FillerTrack do
+      S := S.next
+    end
+    S.next := T
+    T.next := FillerTrack
+    curW := curW + W
+  end
+end InitTrack
+
+// Open new track overlaying span of [X, X +W[.
+procedure OpenTrack*(X, W: int16; Filler: Viewer)
+  var
+    newT: Track
+    S, T, t, v: Display.Frame
+    M: Display.ControlMsg
+begin
+  if (X < 32767) & (Filler.state = 0) then
+    S := FillerTrack
+    T := S.next
+    while X >= T.X + T.W do
+      S := T
+      T := S.next
+    end
+    while X + W > T.X + T.W do
+      T := T.next
+    end
+    M.F := nil
+    M.id := Display.suspend
+    t := S
+    repeat
+      t := t.next
+      v := t.dsc
+      repeat
+        v := v.next
+        case v of
+        | Viewer:
+          v.state := -v.state
+          v.handle(v, @M)
+        end
+      until v = t.dsc
+    until t = T
+
+    Filler.X := S.next.X
+    Filler.W := T.X + T.W - S.next.X
+    Filler.Y := 0
+    Filler.H := DH
+    Filler.state := 1
+    Filler.next := Filler
+    newgc(newT)
+    newT.X := Filler.X
+    newT.W := Filler.W
+    newT.Y := 0
+    newT.H := DH
+    newT.dsc := Filler
+    newT.under := S.next
+    S.next := newT
+    newT.next := T.next
+    T.next := nil
+  end
+end OpenTrack
+
+// Close track at X and restore overlaid tracks.
+procedure CloseTrack*(X: int16)
+  var
+    T, V: Display.Frame
+    M: Display.ControlMsg
+begin
+  if X < 32767 then
+    T := FillerTrack
+    repeat
+      T := T.next
+    until X < T.X + T.W
+    if T(Track).under # nil then
+      M.F := nil
+      M.id := Display.suspend
+      V := T.dsc
+      repeat
+        V := V.next
+        V.handle(V, @M)
+        V(Viewer).state := 0
+      until V = T.dsc
+      RestoreTrack(T)
+    end
+  end
+end CloseTrack
+
+procedure Broadcast(M: pointer to Display.FrameMsg)
+  var
+    F, V: Display.Frame
+begin
+  M.res := (-32768i2)
+  Objects.Stamp(M)
+  Display.ResetClip()
+  F := FillerTrack.next
+  while (F # FillerTrack) & (M.res < 0) do
+    V := F.dsc
+    repeat
+      V := V.next
+      M.dlink := nil
+      M.x := 0
+      M.y := 0
+      if bcLev = 0 then
+        bcF := V // remember outermost frame
+      end
+      inc(bcLev)
+      V.handle(V, M)
+      dec(bcLev)
+    until (V = F.dsc) or (M.res >= 0)
+
+    F := F.next
+  end
+
+  if bcLev = 0 then
+    bcF := nil
+  end
+end Broadcast
+
+begin
+  Modules.Register("Viewers", nil)
+  DH := Display.Height
+  newgc(FillerViewer)
+  FillerViewer.X := 0
+  FillerViewer.W := 32767
+  FillerViewer.Y := 0
+  FillerViewer.H := DH
+  FillerViewer.next := FillerViewer
+  newgc(FillerTrack)
+  FillerTrack.X := 0
+  FillerTrack.W := 32767
+  FillerTrack.Y := 0
+  FillerTrack.H := DH
+  FillerTrack.dsc := FillerViewer
+  FillerTrack.next := FillerTrack
+  buf := nil
+  curW := 0
+  minH := 1
+  Display.Broadcast := Broadcast
+  bcF := nil
+  bcLev := 0
+end Viewers.

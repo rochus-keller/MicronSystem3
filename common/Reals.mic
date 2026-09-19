@@ -1,0 +1,375 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Reals [level=5]
+
+import Kernel, Modules
+// portable (with exceptions)
+
+(** Implementation of the non-portable components of IEEE REAL and
+LONGREAL manipulation. The routines here are required to do conversion
+of reals to strings and back.
+Implemented by Bernd Moesli, Seminar for Applied Mathematics,
+Swiss Federal Institute of Technology Zurich.
+*)
+
+(* Bernd Moesli
+Seminar for Applied Mathematics
+Swiss Federal Institute of Technology Zurich
+Copyright 1993
+
+Support module for IEEE floating-point numbers
+
+Please change constant definitions of H, L depending on byte ordering
+Use bm.TestReals.Do for testing the implementation.
+
+Expo, ExpoL return the shifted binary exponent (0 <= e < 256 (2048 resp.))
+SetExpo, SetExpoL set the shifted binary exponent
+Real, RealL convert hexadecimals to reals
+Int, IntL convert reals to hexadecimals
+Ten returns 10^e (e <= 308, 308 < e delivers NaN)
+
+2026 me@rochus-keller.ch VFX/ARM32 migration
+1993.4.22 IEEE format only, 32-bits LONGINTs only
+30.8.1993 mh: changed RealX to avoid compiler warnings;
+7.11.1995 jt: dynamic endianess test
+22.01.97 pjm: NaN stuff (using quiet NaNs only to avoid traps)
+05.01.98 prk: NaN with INF support
+*)
+
+type 
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  BooleanPtr = pointer to boolean // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int32Ptr = pointer to int32 // helper type for a variable reinterpreted by SYSTEM.VAL
+  RealPtr = pointer to real // helper type for a variable reinterpreted by SYSTEM.VAL
+
+var
+  DefaultFCR*: set
+  tene: array 23 of longreal // e = 0..22: exact values of 10^e
+  ten: array 27 of longreal
+  eq, gr: array 20 of set
+  H, L: int16
+
+// Returns the shifted binary exponent (0 <= e < 256).
+procedure Expo*(x: real): int32
+begin
+  return band(asr(cast(int32, x), 23), 255)
+end Expo
+
+// Returns the shifted binary exponent (0 <= e < 2048).
+procedure ExpoL*(x: longreal): int32
+  var
+    i: int32
+begin
+  i := cast(Int32Ptr, ptroff(@x, H))^
+  return band(asr(i, 20), 2047)
+end ExpoL
+
+// Sets the shifted binary exponent.
+procedure SetExpo*(e: int32; x: pointer to real)
+  var
+    i: int32
+begin
+  i := cast(Int32Ptr, x)^
+  i := sigc(shl(val(int32, sigc(shl(val(int32, asr(i, 31)), 8)) + band(e, 255)), 23)) + band(i, 8388607)
+  cast(Int32Ptr, x)^ := i
+end SetExpo
+
+// Sets the shifted binary exponent.
+procedure SetExpoL*(e: int32; x: pointer to longreal)
+  var
+    i: int32
+begin
+  i := cast(Int32Ptr, ptroff(x, H))^
+  i := sigc(shl(val(int32, sigc(shl(val(int32, asr(i, 31)), 11)) + band(e, 2047)), 20)) + band(i, 1048575)
+  cast(Int32Ptr, ptroff(x, H))^ := i
+end SetExpoL
+
+// Convert hexadecimal to REAL.
+procedure Real*(h: int32): real
+  var
+    x: real
+begin
+  cast(Int32Ptr, @x)^ := h
+  return x
+end Real
+
+// Convert hexadecimal to LONGREAL. h and l are the high and low parts.
+procedure RealL*(h, l: int32): longreal
+  var
+    x: longreal
+begin
+  cast(Int32Ptr, ptroff(@x, H))^ := h
+  cast(Int32Ptr, ptroff(@x, L))^ := l
+  return x
+end RealL
+
+// Convert REAL to hexadecimal.
+procedure Int*(x: real): int32
+  var
+    i: int32
+begin
+  cast(RealPtr, @i)^ := x
+  return i
+end Int
+
+// Convert LONGREAL to hexadecimal. h and l are the high and low parts.
+procedure IntL*(x: longreal; h, l: pointer to int32)
+begin
+  h^ := cast(Int32Ptr, ptroff(@x, H))^
+  l^ := cast(Int32Ptr, ptroff(@x, L))^
+end IntL
+
+// Returns 10^e (e <= 308, 308 < e delivers IEEE-code +INF).
+procedure Ten*(e: int32): longreal
+  var
+    E: int32
+    r: longreal
+begin
+  if e < -307 then
+    return val(longreal, 0)
+  elsif 308 < e then
+    return RealL(2146435072, 0)
+  end
+  inc(e, 307)
+  r := ten[obdiv(e, 23)] * tene[obmod(e, 23)]
+  if band(e, 31) in eq[asr(e, 5)] then
+    return r
+  else
+    E := ExpoL(r)
+    SetExpoL(1023i2 + 52i2, @r)
+    if band(e, 31) in gr[asr(e, 5)] then
+      r := r - val(longreal, 1)
+    else
+      r := r + val(longreal, 1)
+    end
+    SetExpoL(E, @r)
+    return r
+  end
+  return 0.0 // TODO o2m: Micron requires a result on all control paths
+end Ten
+
+// Returns the NaN code (0 <= c < 8399608) or -1 if not NaN/Infinite.
+procedure NaNCode*(x: real): int32
+begin
+  if band(asr(cast(int32, x), 23), 255) = 255 then
+    // Infinite or NaN
+    return band(cast(int32, x), 8388607) // lowest 23 bits
+  else
+    return -1
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end NaNCode
+
+// Returns the NaN code (0 <= h < 1048576, MIN(LONGINT) <= l <= MAX(LONGINT)) or (-1,-1) if not NaN/Infinite.
+procedure NaNCodeL*(x: longreal; h, l: pointer to int32)
+begin
+  h^ := cast(Int32Ptr, ptroff(@x, H))^
+  l^ := cast(Int32Ptr, ptroff(@x, L))^
+  if band(asr(h^, 20), 2047) = 2047 then
+    // Infinite or NaN
+    h^ := band(h^, 1048575) // lowest 20 bits
+  else
+    h^ := -1
+    l^ := -1
+  end
+end NaNCodeL
+
+// Returns TRUE iff x is NaN/Infinite.
+procedure IsNaN*(x: real): boolean
+begin
+  return band(asr(cast(int32, x), 23), 255) = 255
+end IsNaN
+
+// Returns TRUE iff x is NaN/Infinite.
+procedure IsNaNL*(x: longreal): boolean
+  var
+    h: int32
+begin
+  h := cast(Int32Ptr, ptroff(@x, H))^
+  return band(asr(h, 20), 2047) = 2047
+end IsNaNL
+
+// Returns NaN with specified code (0 <= l < 8399608).
+procedure NaN*(l: int32): real
+  var
+    x: real
+begin
+  cast(Int32Ptr, @x)^ := band(l, 8388607) + 2139095040
+  return x
+end NaN
+
+// Returns NaN with specified code (0 <= h < 1048576, MIN(LONGINT) <= l <= MAX(LONGINT)).
+procedure NaNL*(h, l: int32): longreal
+  var
+    x: longreal
+begin
+  h := band(h, 1048575) + 2146435072
+  cast(Int32Ptr, ptroff(@x, H))^ := h
+  cast(Int32Ptr, ptroff(@x, L))^ := l
+  return x
+end NaNL
+
+procedure fcr(): set
+begin
+  // TODO o2m: the following inline assembler needs manual translation
+  // CODE {SYSTEM.arm}
+  // DCW 0A10H, 0EEF1H (* VMRS R0, FPSCR *)
+  //
+  return {} // TODO o2m: the result is delivered by the assembler code above
+end fcr
+
+// Return state of the floating-point control register.
+procedure FCR*(): set
+begin
+  if Kernel.copro then
+    return fcr()
+  else
+    return DefaultFCR
+  end
+  return {} // TODO o2m: Micron requires a result on all control paths
+end FCR
+
+procedure setfcr(s: set)
+begin
+  // TODO o2m: the following inline assembler needs manual translation
+  // CODE {SYSTEM.arm}
+  // DCW 0008H, 0E59BH (* LDR R0, [R11, #8] ; load param s *)
+  // DCW 0A10H, 0EEE1H (* VMSR FPSCR, R0 *)
+  //
+end setfcr
+
+// Set state of floating-point control register.  Traps reset this to the default & ENTIER resets the rounding mode.
+procedure SetFCR*(s: set)
+begin
+  if Kernel.copro then
+    setfcr(s)
+  end
+end SetFCR
+
+procedure RealX(h, l: int32; adr: AnyPtr)
+begin
+  cast(Int32Ptr, ptroff(adr, H))^ := h
+  cast(Int32Ptr, ptroff(adr, L))^ := l
+end RealX
+
+procedure InitHL()
+  var
+    i: AnyPtr
+    dmy: int16
+    littleEndian: boolean
+begin
+  (* VFP hardware enable (CPACR+FPEXC) and FPSCR configuration are done by
+  the Kernel module body.  Here we only read back the current FPSCR as
+  DefaultFCR so that SetFCR callers have the correct baseline. *)
+  DefaultFCR := FCR()
+
+  dmy := 1
+  i := cast(AnyPtr, @dmy)
+  littleEndian := cast(BooleanPtr, i)^ // indirection via i avoids warning on SUN cc -O
+  if littleEndian then
+    H := 4
+    L := 0
+  else
+    H := 0
+    L := 4
+  end
+end InitHL
+
+begin
+  Modules.Register("Reals", nil)
+  InitHL()
+  RealX(1072693248, 0, cast(AnyPtr, @tene[0]))
+  RealX(1076101120, 0, cast(AnyPtr, @tene[1])) // 1
+  RealX(1079574528, 0, cast(AnyPtr, @tene[2])) // 2
+  RealX(1083129856, 0, cast(AnyPtr, @tene[3])) // 3
+  RealX(1086556160, 0, cast(AnyPtr, @tene[4])) // 4
+  RealX(1090021888, 0, cast(AnyPtr, @tene[5])) // 5
+  RealX(1093567616, 0, cast(AnyPtr, @tene[6])) // 6
+  RealX(1097011920, 0, cast(AnyPtr, @tene[7])) // 7
+  RealX(1100470148, 0, cast(AnyPtr, @tene[8])) // 8
+  RealX(1104006501, 0, cast(AnyPtr, @tene[9])) // 9
+  RealX(1107468383, 536870912, cast(AnyPtr, @tene[10])) // 10
+  RealX(1110919286, val(int32, val(int32, 3892314112)), cast(AnyPtr, @tene[11])) // 11
+  RealX(1114446484, val(int32, val(int32, 2717908992)), cast(AnyPtr, @tene[12])) // 12
+  RealX(1117925532, val(int32, val(int32, 3846176768)), cast(AnyPtr, @tene[13])) // 13
+  RealX(1121369284, 512753664, cast(AnyPtr, @tene[14])) // 14
+  RealX(1124887541, 640942080, cast(AnyPtr, @tene[15])) // 15
+  RealX(1128383353, 937459712, cast(AnyPtr, @tene[16])) // 16
+  RealX(1131820119, val(int32, val(int32, 2245566464)), cast(AnyPtr, @tene[17])) // 17
+  RealX(1135329645, 1733216256, cast(AnyPtr, @tene[18])) // 18
+  RealX(1138841828, 1620131072, cast(AnyPtr, @tene[19])) // 19
+  RealX(1142271773, 2025163840, cast(AnyPtr, @tene[20])) // 20
+  RealX(1145772772, val(int32, val(int32, 3605196624)), cast(AnyPtr, @tene[21])) // 21
+  RealX(1149300943, 105764242, cast(AnyPtr, @tene[22])) // 22
+
+  RealX(3275288, 742442509, cast(AnyPtr, @ten[0])) // -307
+  RealX(83348178, 1038626171, cast(AnyPtr, @ten[1])) // -284
+  RealX(163544354, val(int32, val(int32, 2200091381)), cast(AnyPtr, @ten[2])) // -261
+  RealX(243586665, 1528380408, cast(AnyPtr, @ten[3])) // -238
+  RealX(323720200, val(int32, val(int32, 4009666617)), cast(AnyPtr, @ten[4])) // -215
+  RealX(403849200, 1860863098, cast(AnyPtr, @ten[5])) // -192
+  RealX(483927874, val(int32, val(int32, 2445674075)), cast(AnyPtr, @ten[6])) // -169
+  RealX(564131705, val(int32, val(int32, 4247952569)), cast(AnyPtr, @ten[7])) // -146
+  RealX(644163422, val(int32, val(int32, 3638096748)), cast(AnyPtr, @ten[8])) // -123
+  RealX(724303662, val(int32, val(int32, 3834512688)), cast(AnyPtr, @ten[9])) // -100
+  RealX(804423384, 247566556, cast(AnyPtr, @ten[10])) // -77
+  RealX(884507930, 190090916, cast(AnyPtr, @ten[11])) // -54
+  RealX(964704726, 1703504000, cast(AnyPtr, @ten[12])) // -31
+  RealX(1044740494, val(int32, val(int32, 3794832442)), cast(AnyPtr, @ten[13])) // -8
+  RealX(1124887541, 640942080, cast(AnyPtr, @ten[14])) // 15
+  RealX(1204997843, 706126257, cast(AnyPtr, @ten[15])) // 38
+  RealX(1285088350, 502509589, cast(AnyPtr, @ten[16])) // 61
+  RealX(1365276897, 298014061, cast(AnyPtr, @ten[17])) // 84
+  RealX(1445317886, 1026938894, cast(AnyPtr, @ten[18])) // 107
+  RealX(1525471842, 89861534, cast(AnyPtr, @ten[19])) // 130
+  RealX(1605572581, val(int32, val(int32, 4013601575)), cast(AnyPtr, @ten[20])) // 153
+  RealX(1685669140, 1378923384, cast(AnyPtr, @ten[21])) // 176
+  RealX(1765849312, val(int32, val(int32, 2896973487)), cast(AnyPtr, @ten[22])) // 199
+  RealX(1845895601, val(int32, val(int32, 3263873548)), cast(AnyPtr, @ten[23])) // 222
+  RealX(1926056571, val(int32, val(int32, 3959042475)), cast(AnyPtr, @ten[24])) // 245
+  RealX(2006147604, val(int32, val(int32, 2629644838)), cast(AnyPtr, @ten[25])) // 268
+  RealX(2086250306, 1176012790, cast(AnyPtr, @ten[26])) // 291
+
+  eq[0] := {0,3,4,5,9,16,23,25,26,28,31}
+  eq[1] := {2,5,6,8,9,10,11,12,13,14,15,17,18,19,20,21,23,24,25,27,28,29,30,31}
+  eq[2] := {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28}
+  eq[3] := {0,1,2,3,5,6,7,8,9,11,14,15,16,17,18,19,20,22,27,28,29,30,31}
+  eq[4] := {0,6,7,10,11,12,13,14,15,18,19,20,21,22,23,24,25,26,27,28,29,30,31}
+  eq[5] := {0,1,5,6,7,8,9,10,11,12,13,14,15,16,17,19,20,21,22,23,24,25,26,27,28,29,30,31}
+  eq[6] := {0,1,4,5,7,8,10,14,15,16,18,20,21,23,24,25,26,28,29,30,31}
+  eq[7] := {0,1,3,4,5,6,7,8,9,10,11,12,13,14,16,17,18,19,23,24,26,28,29,30,31}
+  eq[8] := {0,1,2,3,4,5,6,8,9,10,11,14,16,17,18,19,20,21,24,25,26,29}
+  eq[9] := {1,2,4,6,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31}
+  eq[10] := {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30}
+  eq[11] := {0,1,2,3,4,5,6,7,8,10,12,13,14,15,16,19,20,21,22,23,27,28,29,30}
+  eq[12] := {0,1,2,3,4,5,7,8,9,10,12,14,15,16,17,18,19,20,21,23,26,27,29,30,31}
+  eq[13] := {0,1,2,3,4,5,6,7,9,10,11,13,14,15,16,17,18,20,21,23,24,27,28,29,30,31}
+  eq[14] := {0,1,2,3,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31}
+  eq[15] := {0,1,2,3,4,5,6,7,8,9,11,12,13,15,16,17,18,19,20,21,22,23,24,25,26,28}
+  eq[16] := {1,2,4,11,13,16,17,18,19,22,24,25,26,27,28,29,30,31}
+  eq[17] := {1,2,3,4,5,6,7,8,9,11,14,15,18,19,20,21,23,25,26,27,28,29,31}
+  eq[18] := {0,2,4,5,6,8,9,11,12,13,14,16,17,19,20,22,23,24,26,27,28,29}
+  eq[19] := {2,3,4,5,6,7}
+
+  gr[0] := {24,27,29,30}
+  gr[1] := {0,1,3,4,7}
+  gr[2] := {29,30,31}
+  gr[3] := {4,10,12,13,21,23,24,25,26}
+  gr[4] := {1,2,3,4,5,8,9,16,17}
+  gr[5] := {2,3,4,18}
+  gr[6] := {2,3,6,9,11,12,13,17,19,22,27}
+  gr[7] := {2}
+  gr[8] := {7,12,13,15,22,23,27,28,30,31}
+  gr[9] := {0,3,5,7,8}
+  gr[10] := {}
+  gr[11] := {}
+  gr[12] := {11,13,22,24,25,28}
+  gr[13] := {22,25,26}
+  gr[14] := {4,5}
+  gr[15] := {10,14,27,29,30,31}
+  gr[16] := {0,3,5,6,7,8,9,10,12,14,15,20,21,23}
+  gr[17] := {0,10,12,13,16,17,22,24,30}
+  gr[18] := {}
+  gr[19] := {}
+end Reals.

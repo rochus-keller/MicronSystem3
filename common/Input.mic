@@ -1,0 +1,411 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Input [level=5]
+
+import Kernel, Modules
+
+// portable
+// pjm / me@rochus-keller.ch
+
+(*
+Module Input is responsible for event timing, mouse and keyboard input.
+Reduced for ARM: all i386 PS/2 and serial mouse/keyboard hardware drivers removed.
+USB (or other) drivers register themselves via AddMouse/AddKeyboard.
+*)
+
+const
+  TimeUnit* = 1000 // portable, but VAR on other ports
+  // timer ticks per second (platform dependent).
+
+  SHIFT* = 0 // for KeyState
+  CTRL* = 1
+  ALT* = 2
+
+  BufSize = 32 // keyboard buffer size
+
+type
+  PollMouse* = procedure(keys: pointer to set; dx: pointer to int16; dy: pointer to int16; dz: pointer to int16): boolean // non-portable
+  PollKeyboard* = procedure(ch: pointer to char; keys: pointer to set): boolean // non-portable
+
+  MousePoller = pointer to MousePollerDesc
+
+  KeyboardPoller = pointer to KeyboardPollerDesc
+
+  MousePollerDesc = record
+    poll: PollMouse
+    next: MousePoller
+  end
+
+  KeyboardPollerDesc = record
+
+    poll: PollKeyboard
+    next: KeyboardPoller
+  end
+
+// mouse state
+
+var
+  mouse: MousePoller
+  minX, minY, maxX, maxY, mouseX, mouseY, height: int32
+  lastkeys: set
+  buttons: int8
+  mapkeys: array 8 of set
+
+  // keyboard state
+  keyboard: KeyboardPoller
+  buffer: array 33 (* 1i1 + BufSize *) of char // first byte not used (System.State security)
+  head, tail: int8
+  flags, pollkeys: set
+  breakproc: Kernel.Proc
+
+// DisableInterrupts - Disable IRQs and return original CPSR
+
+(*
+PROCEDURE -DisableInterrupts(): SET;
+CODE {SYSTEM.arm}
+DCW 00000H, 0E10FH  (* MRS R0, CPSR *)
+DCW 00080H, 0F10CH  (* CPSID i *)
+END DisableInterrupts;*)
+
+// RestoreInterrupts - Restore CPSR to previous state
+
+(*
+PROCEDURE -RestoreInterrupts(state: SET);
+CODE {SYSTEM.arm}
+LDR R0, [SP, #0]
+DCW 0F000H, 0E121H  (* MSR CPSR_c, R0 *)
+END RestoreInterrupts;*)
+
+// Returns the number of keystrokes in the keyboard input buffer.
+procedure Available*(): int16
+  var
+    state, keys: set
+    p: KeyboardPoller
+    x: int16
+    ch: char
+    i: int8
+begin
+  // poll all registered keyboards
+  p := keyboard
+  pollkeys := {}
+  while p # nil do
+    if p.poll(@ch, @keys) then
+      // state := DisableInterrupts();
+      // SYSTEM.CLI()
+      i := band(tail + 1, 31)
+      if i # head then
+        buffer[1 + tail] := ch
+        tail := i
+      end
+
+      // RestoreInterrupts(state)
+      // SYSTEM.STI()
+    end
+
+    pollkeys := pollkeys + keys
+    p := p.next
+  end
+
+  // check buffer
+  // state := DisableInterrupts();
+  // SYSTEM.CLI()
+  x := band(tail - head, 31)
+  // RestoreInterrupts(state);
+  // SYSTEM.STI()
+  return x
+end Available
+
+(* Reads the current mouse position x, y and the key state of the mouse buttons
+(also called keys). The mouse buttons are numbered from the right to the left as
+0, 1, 2 (i.e. 1 is the middle mouse button). For example, when the left and middle
+buttons are pressed, keys will be set to {1, 2}. *)
+procedure Mouse*(keys: pointer to set; x, y: pointer to int16)
+  var
+    dx, dy, dz: int16
+    ok: boolean
+    mousekeys, rawkeys: set
+    p: MousePoller
+begin
+  if Kernel.break then
+    Kernel.break := false
+    halt(13)
+  end
+  repeat
+    // get all available mouse events, or until keys change
+    p := mouse
+    rawkeys := {}
+    ok := false
+    while p # nil do
+      // poll all mice and sum keys and movements
+      if p.poll(@mousekeys, @dx, @dy, @dz) then
+        ok := true
+        rawkeys := rawkeys + mousekeys
+        // the poller reports absolute positions, so neither accumulation nor acceleration
+        mouseX := val(int32, dx)
+        mouseY := val(int32, dy)
+      end
+
+      p := p.next
+    end
+  until ~ok or (rawkeys # lastkeys)
+
+  if ok then
+    if ~(1 in lastkeys) & (1 in rawkeys) then
+      // mouse generated middle button
+      if buttons = -3 then
+        buttons := 3 // switch off emulation
+      end
+    end
+
+    lastkeys := rawkeys // save last known mouse key state
+  else
+    rawkeys := lastkeys // restore last known mouse key state
+  end
+
+  // middle button emulation
+  if buttons # 3 then
+    // -2, 2, -3
+    if buttons = 2 then
+      // 2 => Ctrl is middle button
+      if flags * {CTRL} # {} then
+        rawkeys := rawkeys + {1}
+      else
+        rawkeys := rawkeys - {1}
+      end
+
+    else
+      // -2 OR -3 => MM or Ctrl is middle button
+      if flags * {CTRL} # {} then
+        rawkeys := rawkeys + {1}
+      end
+    end
+  end
+
+  // key mapping
+  keys^ := mapkeys[val(int32, ord(rawkeys * {0,1,2}))]
+  if mouseX < minX then
+    mouseX := minX
+  elsif mouseX > maxX then
+    mouseX := maxX
+  end
+
+  if mouseY < minY then
+    mouseY := minY
+  elsif mouseY > maxY then
+    mouseY := maxY
+  end
+
+  x^ := val(int16, mouseX)
+  y^ := val(int16, height - 1 - mouseY)
+end Mouse
+
+// Read a character from the keyboard buffer. Blocks if no character is available.
+procedure Read*(ch: pointer to char)
+  var
+    state: set
+begin
+  repeat
+  until (Available() # 0) or Kernel.break // skip
+  if Kernel.break then
+    Kernel.break := false
+    halt(13)
+  end
+  // state := DisableInterrupts();
+  // SYSTEM.CLI()
+  ch^ := buffer[1 + head]
+  head := band(head + 1, 31)
+  // RestoreInterrupts(state);
+  // SYSTEM.STI()
+  (* --- Test (To be removed) ---
+  Kernel.WriteString("Input: Read [");
+  Kernel.WriteChar(ch);
+  Kernel.WriteString("]"); Kernel.WriteLn;
+  ----------------------- *)
+end Read
+
+// Returns the elapsed number of timer ticks from Oberon startup.
+procedure Time*(): int32
+begin
+  if Kernel.break then
+    Kernel.break := false
+    halt(13)
+  end
+  return Kernel.GetTimer()
+end Time
+
+// Return the state of the shift keys.
+procedure KeyState*(keys: pointer to set)
+begin
+  keys^ := pollkeys
+end KeyState
+
+// Restricts the extent of the mouse coordinates returned by Mouse.
+procedure SetMouseLimits*(x, y, w, h: int16)
+begin
+  // non-portable
+
+  if height = 0 then
+    height := h
+  end
+  y := val(int16, height - 1) - y
+  minX := x
+  maxY := y
+  maxX := x + w - 1
+  minY := y - (h - 1)
+  mouseX := minX + asr(maxX - minX, 1)
+  mouseY := minY + asr(maxY - minY, 1)
+end SetMouseLimits
+
+(* Add a mouse driver.  The poll procedure will be called from Mouse and should
+return the next mouse event, including the current key state.  It returns TRUE
+iff a mouse event is available. *)
+procedure AddMouse*(poll: PollMouse)
+  // non-portable
+  var
+    n: MousePoller
+begin
+  newgc(n)
+  n.poll := poll
+  n.next := mouse
+  mouse := n
+end AddMouse
+
+// Remove a mouse driver.
+procedure RemoveMouse*(poll: PollMouse)
+  // non-portable
+  var
+    p, n: MousePoller
+begin
+  p := nil
+  n := mouse
+  while (n # nil) & (n.poll # poll) do
+    p := n
+    n := n.next
+  end
+  if n # nil then
+    if p = nil then
+      mouse := n.next
+    else
+      p.next := n.next
+    end
+  end
+end RemoveMouse
+
+(* Add a keyboard driver.  The poll procedure will be called from Available and Read and
+should return the next ASCII character.  It returns TRUE iff a key is available.  The
+current shift state (SHIFT, CTRL, ALT) should always be returned, and will be added to KeyState. *)
+procedure AddKeyboard*(poll: PollKeyboard)
+  // non-portable
+  var
+    n: KeyboardPoller
+begin
+  newgc(n)
+  n.poll := poll
+  n.next := keyboard
+  keyboard := n
+end AddKeyboard
+
+// Remove a keyboard driver.
+procedure RemoveKeyboard*(poll: PollKeyboard)
+  // non-portable
+  var
+    p, n: KeyboardPoller
+begin
+  p := nil
+  n := keyboard
+  while (n # nil) & (n.poll # poll) do
+    p := n
+    n := n.next
+  end
+  if n # nil then
+    if p = nil then
+      keyboard := n.next
+    else
+      p.next := n.next
+    end
+  end
+end RemoveKeyboard
+
+// Configure input device parameters.  Normally only used by installation program.
+procedure Configure*(const config, value: pointer to array of char)
+  // non-portable
+  var
+    mk: array 3 of int32
+    i: int8
+begin
+  if config^ = "MB" then
+    // mouse buttons
+    if value^ = "2" then
+      buttons := 2
+    elsif value^ = "3" then
+      buttons := 3
+    elsif value^ = "-2" then
+      buttons := -2
+    else
+      buttons := -3 // default MM and Ctrl
+    end
+
+  elsif config^ = "MM" then
+    // mouse key remapping
+    mk[0] := 0
+    mk[1] := 1
+    mk[2] := 2
+    if value[0] # 0X then
+      mk[0] := val(int32, val(int16, ord(value[0])) - 48)
+      if value[1] # 0X then
+        mk[1] := val(int32, val(int16, ord(value[1])) - 48)
+        if value[2] # 0X then
+          mk[2] := val(int32, val(int16, ord(value[2])) - 48)
+        end
+      end
+    end
+
+    for i := 0 to 7 do
+      mapkeys[i] := {}
+      if 0 in bset(usig(i)) then
+        mapkeys[i] := mapkeys[i] + {mk[0]}
+      end
+      if 1 in bset(usig(i)) then
+        mapkeys[i] := mapkeys[i] + {mk[1]}
+      end
+      if 2 in bset(usig(i)) then
+        mapkeys[i] := mapkeys[i] + {mk[2]}
+      end
+    end
+
+  else
+  end
+  // unknown setting, ignore
+end Configure
+
+procedure Setting(const name: pointer to array of char)
+  var
+    s: array 32 of char
+begin
+  Kernel.GetConfig(name, @s, 32)
+  Configure(name, @s)
+end Setting
+
+procedure UnsafeBreak()
+begin
+  halt(13)
+end UnsafeBreak
+
+begin
+  Modules.Register("Input", nil)
+  mouse := nil
+  keyboard := nil
+  pollkeys := {}
+  head := 0
+  tail := 0
+  buffer[0] := 0X
+  flags := {}
+  lastkeys := {}
+  maxX := 0
+  height := 0
+  breakproc := UnsafeBreak
+  buttons := -3
+  Setting("MB")
+  Setting("MM")
+end Input.

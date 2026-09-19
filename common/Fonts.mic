@@ -1,0 +1,485 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Fonts [level=5]
+
+import Kernel, Files, Objects, Display, Modules
+// portable
+// JG 16.3.94
+
+(**
+The Module Fonts implement the Oberon font manager. Fonts are collections
+of characters, each character being a pattern and and metric data.
+*)
+
+const
+  MaxRuns = 32
+  IndexSize = 256i2 * 4i2
+  substitute* = -1 // Font types.
+  font* = 0
+  metric* = 1
+  TraceMissing = true
+  TraceAlias = false
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  CharPtr = pointer to char // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int8Ptr = pointer to int8 // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int32Ptr = pointer to int32 // helper type for a variable reinterpreted by SYSTEM.VAL
+  AnyPtrPtr = pointer to AnyPtr // helper type for a variable reinterpreted by SYSTEM.VAL
+
+  Char* = pointer to CharDesc
+  Font* = pointer to FontDesc
+
+  CharDesc* = object (Objects.ObjDesc)
+    // The objects in a font library.
+    // Note: offset used in GetCharObj
+    dx*: int16 // Character width, pattern offset (x, y), pattern size (w, h).
+    x*, y*, w*, h*: int16
+    pat*: AnyPtr // Character raster data.
+  end
+
+  FontDesc* = object (Objects.LibDesc)
+    type_*: int8 // Substitute, font, or metric.
+    height*: int16 // Font height, extremal values of characters in font.
+    minX*, maxX*, minY*, maxY*: int16
+  end
+
+  RunRec = record
+    beg, end_: int16
+  end
+
+  BoxRec = record
+    dx, x, y, w, h: int16
+  end
+
+var
+  FontId*: char // Initial character of font files (.Fnt).
+  Default*: Font // Default system screen font (typically Oberon10.Scn.Fnt).
+  theChar: Char
+  conv: boolean
+
+procedure Put1(a: pointer to AnyPtr; x: int16)
+  var
+    y: int8
+begin
+  y := val(int8, x)
+  cast(Int8Ptr, a^)^ := y
+  inc(a^)
+end Put1
+
+procedure Put2(a: pointer to AnyPtr; x: int32)
+  var
+    lo, hi: int8
+begin
+  (* VAR a is not guaranteed to be properly aligned which is an issue on ARM32;
+  so we access the individual bytes here as a work-around *)
+  lo := val(int8, val(int16, band(x, 255)))
+  hi := val(int8, val(int16, band(asr(x, 8), 255)))
+  cast(Int8Ptr, a^)^ := lo
+  cast(Int8Ptr, ptroff(a^, 1))^ := hi
+  inc(a^, 2)
+end Put2
+
+procedure Put4(a: pointer to AnyPtr; x: int32)
+begin
+  cast(Int32Ptr, a^)^ := x
+  inc(a^, 4)
+end Put4
+
+procedure ReadInt(R: pointer to Files.Rider; x: pointer to int16)
+  var
+    c0: char
+    s1: int8
+begin
+  Files.Read(R, cast(BytePtr, @c0))
+  Files.Read(R, cast(BytePtr, @s1))
+  x^ := s1
+  x^ := x^ * 256 + val(int16, ord(c0))
+end ReadInt
+
+(*
+(* i386 version *)
+PROCEDURE *GetCharObj (L: Objects.Library; ref: INTEGER; VAR obj: Objects.Object);
+CODE {SYSTEM.i386}
+MOV EAX, L[EBP]
+MOV EAX, 4[EAX] ; Objects.LibDesc ind
+MOVSX EBX, ref[EBP]
+MOV EAX, [EAX][EBX*4]
+MOV ECX, theChar
+MOVZX DX, BYTE -3[EAX] ;dx
+MOV 24[ECX], DX
+MOVSX DX, BYTE -2[EAX] ;x
+MOV 26[ECX], DX
+MOVSX DX, BYTE -1[EAX] ;y
+MOV 28[ECX], DX
+MOVZX DX, BYTE [EAX] ;w
+MOV 30[ECX], DX
+MOVZX DX, BYTE 1[EAX] ;h
+MOV 32[ECX], DX
+MOV 36[ECX], EAX
+MOV EAX, obj[EBP]
+MOV [EAX], ECX
+END GetCharObj;
+*)
+
+// portable version
+procedure GetCharObj(L: Objects.Library; ref: int16; obj: pointer to Objects.Object)
+  var
+    m: AnyPtr
+    h1: int8
+    h2: AnyPtr
+    ch: char
+begin
+  m := cast(AnyPtr, L.ind)
+  h2 := cast(AnyPtrPtr, ptroff(m, ref * val(int32, size(int32))))^ // pat adr
+  theChar.pat := h2
+  h1 := cast(Int8Ptr, ptroff(h2, -3))^
+  theChar.dx := h1
+  h1 := cast(Int8Ptr, ptroff(h2, -2))^
+  theChar.x := h1
+  h1 := cast(Int8Ptr, ptroff(h2, -1))^
+  theChar.y := h1
+  ch := cast(CharPtr, h2)^ // width & height always positive
+  theChar.w := val(int16, ord(ch))
+  ch := cast(CharPtr, ptroff(h2, 1))^
+  theChar.h := val(int16, ord(ch))
+  obj^ := theChar
+end GetCharObj
+
+// Return the character and data of ch in a font.
+procedure GetChar*(F: Font; ch: char; dx, x, y, w, h: pointer to int16; pat: pointer to AnyPtr)
+  var
+    obj: Objects.Object
+begin
+  F.GetObj(F, val(int16, ord(ch)), @obj)
+  case obj of
+  | Char:
+    dx^ := obj.dx
+    x^ := obj.x
+    y^ := obj.y
+    w^ := obj.w
+    h^ := obj.h
+    pat^ := obj.pat
+  end
+end GetChar
+
+procedure Internalize(F: Font; R: pointer to Files.Rider; type_: int8)
+  var
+    ch: char
+    NofRuns, NofBoxes, i, k, l, m: int16
+    NofBytes, RasterBase: int32
+    A, raster: AnyPtr
+    a: int32
+    run: array 32 (* MaxRuns *) of RunRec
+    box: array 256 of BoxRec
+begin
+  F.type_ := type_
+  Files.Read(R, cast(BytePtr, @ch)) // family
+  Files.Read(R, cast(BytePtr, @ch)) // variant
+  ReadInt(R, @F.height)
+  ReadInt(R, @F.minX)
+  ReadInt(R, @F.maxX)
+  ReadInt(R, @F.minY)
+  ReadInt(R, @F.maxY)
+  ReadInt(R, @NofRuns)
+  NofBoxes := 0
+  k := 0
+  while k # NofRuns do
+    ReadInt(R, @run[k].beg)
+    ReadInt(R, @run[k].end_)
+    NofBoxes := NofBoxes + run[k].end_ - run[k].beg
+    inc(k)
+  end
+
+  l := 0
+  while l # NofBoxes do
+    ReadInt(R, @box[l].dx)
+    ReadInt(R, @box[l].x)
+    ReadInt(R, @box[l].y)
+    ReadInt(R, @box[l].w)
+    ReadInt(R, @box[l].h)
+    inc(l)
+  end
+
+  if type_ = font then
+    NofBytes := IndexSize + 29i2
+    l := 0
+    while l # NofBoxes do
+      NofBytes := NofBytes + 5 + asr(box[l].w + 7, 3) * box[l].h
+      inc(l)
+    end
+
+    Kernel.NewSys(@raster, NofBytes) // SYSTEM.NEW(F.ind, NofBytes)
+    F.ind := cast(Objects.Index, raster)
+    RasterBase := val(int32, ord(cast(AnyPtr, F.ind)))
+    A := ptroff(AnyPtr{0}, RasterBase)
+    a := val(int32, ord(A)) + IndexSize
+    Put1(cast(AnyPtrPtr, @a), 12) // null char
+    Put1(cast(AnyPtrPtr, @a), 0)
+    Put1(cast(AnyPtrPtr, @a), -3)
+    Put1(cast(AnyPtrPtr, @a), 12)
+    Put1(cast(AnyPtrPtr, @a), 12)
+    Put2(cast(AnyPtrPtr, @a), 4095)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 2049)
+    Put2(cast(AnyPtrPtr, @a), 4095)
+    k := 0
+    l := 0
+    m := 0
+    while k < NofRuns do
+      while m < run[k].beg do
+        Put4(@A, RasterBase + IndexSize + 3)
+        inc(m)
+      end
+      while m < run[k].end_ do
+        Put4(@A, a + 3)
+        Put1(cast(AnyPtrPtr, @a), box[l].dx)
+        Put1(cast(AnyPtrPtr, @a), box[l].x)
+        Put1(cast(AnyPtrPtr, @a), box[l].y)
+        Put1(cast(AnyPtrPtr, @a), box[l].w)
+        Put1(cast(AnyPtrPtr, @a), box[l].h)
+        i := asr(box[l].w + 7, 3) * box[l].h
+        while i # 0 do
+          Files.Read(R, cast(BytePtr, @ch))
+          Put1(cast(AnyPtrPtr, @a), val(int16, ord(ch)))
+          dec(i)
+        end
+        inc(l)
+        inc(m)
+      end
+
+      inc(k)
+    end
+
+    while m < 256 do
+      Put4(@A, RasterBase + IndexSize + 3)
+      inc(m)
+    end
+  else
+    // type := metric
+    Kernel.NewSys(@raster, IndexSize + 5 + NofBoxes * 5)
+    F.ind := cast(Objects.Index, raster)
+    RasterBase := val(int32, ord(cast(AnyPtr, F.ind)))
+    A := ptroff(AnyPtr{0}, RasterBase)
+    a := val(int32, ord(A)) + IndexSize
+    Put1(cast(AnyPtrPtr, @a), 12) // null char
+    Put1(cast(AnyPtrPtr, @a), 0)
+    Put1(cast(AnyPtrPtr, @a), -3)
+    Put1(cast(AnyPtrPtr, @a), 12)
+    Put1(cast(AnyPtrPtr, @a), 12)
+    k := 0
+    l := 0
+    m := 0
+    while k < NofRuns do
+      while m < run[k].beg do
+        Put4(@A, RasterBase + IndexSize + 3)
+        inc(m)
+      end
+      while m < run[k].end_ do
+        Put4(@A, a + 3)
+        Put1(cast(AnyPtrPtr, @a), box[l].dx)
+        Put1(cast(AnyPtrPtr, @a), box[l].x)
+        Put1(cast(AnyPtrPtr, @a), box[l].y)
+        Put1(cast(AnyPtrPtr, @a), box[l].w)
+        Put1(cast(AnyPtrPtr, @a), box[l].h)
+        inc(l)
+        inc(m)
+      end
+
+      inc(k)
+    end
+
+    while m < 256 do
+      Put4(@A, RasterBase + IndexSize + 3)
+      inc(m)
+    end
+  end
+end Internalize
+
+procedure Substitute(F: Font)
+begin
+  F.type_ := substitute
+  F.height := Default.height
+  F.minX := Default.minX
+  F.maxX := Default.maxX
+  F.minY := Default.minY
+  F.maxY := Default.maxY
+  F.ind := Default.ind
+  if TraceMissing then
+    Kernel.WriteString("Missing: ")
+    Kernel.WriteString(@F.name)
+    Kernel.WriteLn()
+  end
+end Substitute
+
+procedure Load(L: Objects.Library)
+  var
+    f: Files.File
+    R: Files.Rider
+    id: char
+    i, j: int32
+    name: Objects.Name
+begin
+  case L of
+  | Font:
+    f := Files.Old(@L.name)
+    if f = nil then
+      copy(@name, @L.name, 32)
+      name[7] := 0X
+      if name = "Default" then
+        if TraceAlias then
+          Kernel.WriteString(@L.name)
+          Kernel.WriteString(" -> ")
+        end
+        copy(@name, @Default.name, 32)
+        i := 0
+        while (name[i] # 0X) & ((name[i] < "0") or (name[i] > "9")) do
+          inc(i)
+        end
+        j := 7
+        while L.name[j] # 0X do
+          name[i] := L.name[j]
+          inc(i)
+          inc(j)
+        end
+        name[i] := 0X
+        if TraceAlias then
+          Kernel.WriteString(@name)
+          Kernel.WriteLn()
+        end
+        copy(@L.name, @name, 32)
+        f := Files.Old(@name)
+      else
+        name[6] := 0X
+        if conv & (name = "Syntax") then
+          if TraceAlias then
+            Kernel.WriteString(@L.name)
+            Kernel.WriteString(" -> ")
+          end
+          copy(@name, @Default.name, 32)
+          j := 0
+          while (name[j] # 0X) & ((name[j] < "0") or (name[j] > "9")) do
+            inc(j)
+          end
+          i := 6
+          while (L.name[i] >= "0") & (L.name[i] <= "9") do
+            name[j] := L.name[i]
+            inc(i)
+            inc(j)
+          end
+          if L.name[i] = "m" then
+            name[j] := "b" // Syntax medium -> Oberon bold
+            inc(i)
+            inc(j)
+          end
+          while L.name[i] # 0X do
+            name[j] := L.name[i]
+            inc(i)
+            inc(j)
+          end
+          name[j] := 0X
+          if TraceAlias then
+            Kernel.WriteString(@name)
+            Kernel.WriteLn()
+          end
+          copy(@L.name, @name, 32)
+          f := Files.Old(@name)
+        end
+      end
+    end
+
+    if f # nil then
+      Files.Set(@R, f, 0)
+      Files.Read(@R, cast(BytePtr, @id))
+      if id = FontId then
+        Files.Read(@R, cast(BytePtr, @L.type_))
+        if (L.type_ = metric) or (L.type_ = font) then
+          Internalize(L, @R, L.type_)
+        else
+          Substitute(L)
+        end
+      else
+        Substitute(L)
+      end
+    else
+      copy(@name, @L.name, 32)
+      i := 0
+      while name[i] # 0X do
+        inc(i)
+      end
+      if (i >= 8) & (name[i - 8] = ".") & (name[i - 7] = "M") & (name[i - 6] = "d") then
+        name[i - 7] := "P"
+        name[i - 6] := "r"
+        f := Files.Old(@name)
+        if f # nil then
+          Files.Set(@R, f, 0)
+          Files.Read(@R, cast(BytePtr, @id))
+          if id = FontId then
+            Files.Read(@R, cast(BytePtr, @L.type_))
+            if (L.type_ = metric) or (L.type_ = font) then
+              Internalize(L, @R, metric)
+            else
+              Substitute(L)
+            end
+          else
+            Substitute(L)
+          end
+        else
+          Substitute(L)
+        end
+      else
+        Substitute(L)
+      end
+    end
+  end
+end Load
+
+// Load and cache a font.
+procedure This*(const name: pointer to array of char): Font
+  var
+    L: Objects.Library
+begin
+  L := Objects.ThisLibrary(name)
+  if (L # nil) & (L is Font) then
+    return L(Font)
+  else
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end This
+
+procedure New(): Objects.Library
+  var
+    F: Font
+begin
+  newgc(F)
+  F.Load := Load
+  F.GetObj := GetCharObj
+  return F
+end New
+
+procedure Init()
+  var
+    s: array 8 of char
+begin
+  FontId := Objects.LibBlockId
+  newgc(theChar)
+  Kernel.GetConfig("FontConv", @s, 8)
+  conv := s[0] # "0"
+  Objects.Register("Fnt", New)
+end Init
+
+begin
+  Modules.Register("Fonts", nil)
+  Init()
+end Fonts.

@@ -1,0 +1,1094 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Objects [level=5]
+
+import Kernel, Files, Modules, SYS, Boot
+// portable
+// JG 21.9.93/comments jm 28.2.95
+
+(** Module Objects forms the basis of the object-oriented part of the Oberon system.
+It provides the system with the type Object and defines what messages objects understand.
+Most entities in Oberon are derived from this base type.
+*)
+
+const
+  enum* = 0 // AttrMsg and LinkMsg id
+  get* = 1
+  set_* = 2
+  shallow* = 0 // CopyMsg id
+  deep* = 1
+  load* = 0 // FileMsg id
+  store* = 1
+
+  // AttrMsg class
+  Inval* = 0
+  String* = 2
+  Int* = 3
+  Real* = 4
+  LongReal* = 5
+  Char* = 6
+  Bool* = 7
+
+  MaxNews = 64
+  MaxRuns = 64
+  StepSize = 64 // number of elems to grow an index block
+  Version = 1380272450
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  BytesPtr = pointer to array of byte // helper type for VAR ARRAY OF SYSTEM.BYTE parameters
+  
+  Name* = array 32 of char
+  Object* = pointer to ObjDesc
+  Dummy* = pointer to DummyDesc
+  Library* = pointer to LibDesc
+
+  ObjMsg* = object
+    // Base type of all messages sent to objects.
+    stamp*: int32 // Message time stamp.
+    dlink*: Object // Sender of the message.
+  end
+  PObjMsg* = pointer to ObjMsg
+
+  Handler* = procedure(obj: Object; M: pointer to ObjMsg)
+
+  ObjDesc* = object
+    // Base type of all objects.
+    // Note: SIZE used in Fonts.GetCharObj
+    stamp*: int32 // Time stamp of last message processed by object.
+    dlink*: Object // Next object in the message thread.
+    slink*: Object // Next object in a list of objects.
+    lib*: Library // Library and reference number of object.
+    ref*: int16
+    handle*: Handler // Message handler.
+  end
+
+  // Set, get and enumerate the attributes of an object.
+  AttrMsg* = object (ObjMsg)
+    id*: int16 // get, set or enum.
+    Enum*: procedure(const name: pointer to array of char) // Called by object to enumerate attribute names.
+    name*: Name // Name of the attribute to be set or retrieved.
+    res*: int16 // Return result: < 0 = no response, >= 0 action completed.
+    class*: int16 // Attribute class (Inval, String, Int, Real, LongReal, Char or Bool).
+    i*: int32
+    x*: real
+    y*: longreal
+    c*: char
+    b*: boolean
+    s*: array 64 of char
+  end
+  PAttrMsg* = pointer to AttrMsg
+
+  // Link objects with each other or retrieve the link structure between objects
+  LinkMsg* = object (ObjMsg)
+    id*: int16 // get, set or enum.
+    Enum*: procedure(const name: pointer to array of char) // Called by object to enumerate link names.
+    name*: Name // Link name.
+    res*: int16 // Return result: < 0 = no response, >= 0 action completed.
+    obj*: Object // Value of the link to be set, or link result.
+  end
+  PLinkMsg* = pointer to LinkMsg
+
+  // Request to an object to make a copy of itself
+  CopyMsg* = object (ObjMsg)
+    id*: int16 // Copy style: deep or shallow.
+    obj*: Object // Result of the copy operation.
+  end
+  PCopyMsg* = pointer to CopyMsg
+
+  // Request to an object to bind itself to a library.
+  BindMsg* = object (ObjMsg)
+    lib*: Library // Library where object should be bound.
+  end
+  PBindMsg* = pointer to BindMsg
+
+  // Request to an object to load/store itself.
+  FileMsg* = object (ObjMsg)
+    id*: int16 // load or store
+    len_*: int32 // Length of the object data on loading.
+    R*: Files.Rider // Rider with which to load or store data.
+  end
+  PFileMsg* = pointer to FileMsg
+
+  // Search request for an object with the specified name.
+  FindMsg* = object (ObjMsg)
+    name*: Name
+    obj*: Object // Result object, if found.
+  end
+  PFindMsg* = pointer to FindMsg
+
+  // A placeholder object created for objects that cannot be loaded.
+  DummyDesc* = object (ObjDesc)
+    GName*: Name // Generator procedure of failed object.
+    len_: int32 // length of data block
+    blk: pointer to array of char // stores the data on file
+  end
+
+  // (Hidden) Data structure containing the objects of a library.
+  Index* = pointer to IndexDesc
+  IndexDesc* = object
+  end
+
+  // (Hidden) Map of (ref) numbers and corresponding object names.
+  Dictionary* = pointer to DictionaryDesc
+  DictionaryDesc* = object
+  end
+
+  Block = pointer to array of Object
+  ArrayIndex = pointer to ArrayIndexDesc
+  ArrayIndexDesc = object (IndexDesc)
+    index: Block // index block, containing the objects
+    org: int32 // offset in libfile where index block starts
+    size_: int16 // size of the actual index block
+  end
+
+  Entry = pointer to EntryDesc
+  EntryDesc = record
+    next: Entry
+    key: int16
+    name: Name
+  end
+
+  ListDict = pointer to ListDictDesc
+  ListDictDesc = object (DictionaryDesc)
+    key: int16
+    first: Entry
+  end
+
+  GenName = array 64 of char
+
+  LibDesc* = object
+    // Container for persistent objects.
+    next: Library // offset used by Fonts.GetCharObj, also next offset
+    ind*: Index // Library contents.
+    f: Files.File // file containing data
+    R: Files.Rider // a rider on the lib file
+    name*: Name // name of the library. Private library when "", else public library.
+    dict*: Dictionary // Object names.
+    maxref*: int16 // Highest ref number used in library.
+    GName: pointer to array of GenName
+
+    // Return a free reference number.
+    GenRef*: procedure(L: Library; ref: pointer to int16)
+
+    // Return the object with the indicated reference number.
+    GetObj*: procedure(L: Library; ref: int16; obj: pointer to Object)
+
+    // Insert an object under the indicated reference number.
+    PutObj*: procedure(L: Library; ref: int16; obj: Object)
+
+    // Free object with indicated reference number.
+    FreeObj*: procedure(L: Library; ref: int16)
+
+    // Initialize/load library with L.name.
+    Load*: procedure(L: Library)
+
+    // Store library under L.name.
+    Store*: procedure(L: Library)
+  end
+
+  NewProc* = procedure(): Library // Library generator.
+  EnumProc* = procedure(L: Library) // Enumerator of public libraries
+
+  RunRec = record
+    beg, end_: int16
+  end
+
+  Alias = pointer to AliasDesc
+  AliasDesc = record
+    next: Alias
+    name: Name
+    lib: Library
+  end
+
+var
+  LibBlockId*: char // Identification character as first character of a Library file.
+  FirstLib: Library
+  NoObj: Object
+
+  NewObj*: Object // Newly generated objects are returned here.
+  stamp: int32
+
+  nofreg: int16
+  LibExt: array 8 of array 8 of char
+  LibNew: array 8 of NewProc
+
+  FirstAlias: Alias
+
+procedure Stamp*(M: pointer to ObjMsg)
+begin
+  // Timestamp a message.
+  M.stamp := stamp
+  if stamp # 2147483647 then
+    inc(stamp)
+  else
+    stamp := (-2147483647-1)
+  end
+end Stamp
+
+// general library management
+
+// Delete library L from the list, without changing L.next.
+
+procedure Cleanup(L: AnyPtr)
+  var
+    p0, p: Library
+    a0, a: Alias
+begin
+   (* TODO o2m: the type test of the untyped pointer is not possible in Micron; Oberon: WITH L: Library DO *)
+  p0 := FirstLib
+  p := p0.next
+  while (p # nil) & (p # cast(Library, L)) do
+    p0 := p
+    p := p.next
+  end
+  if p = cast(Library, L) then
+    // found in list
+    p0.next := p.next
+  end
+
+  a0 := FirstAlias
+  a := a0.next
+  while (a # nil) & (a.lib # cast(Library, L)) do
+    a0 := a
+    a := a.next
+  end
+  if a # nil then
+    a0.next := a.next
+  end
+
+end Cleanup
+
+// Check if end of s matches ext.  len returns length of ext.
+
+procedure Match(s, ext: pointer to array of char; len_: pointer to int32): boolean
+  var
+    i, j: int32
+begin
+  i := 0
+  while ext[i] # 0X do
+    inc(i)
+  end
+  len_^ := i
+  j := 0
+  while s[j] # 0X do
+    inc(j)
+  end
+  repeat
+    dec(i)
+    dec(j)
+  until (i < 0) or (j < 0) or (ext[i] # s[j])
+
+  return i < 0
+end Match
+
+// Search, load and cache a public library.
+procedure ThisLibrary*(const name: pointer to array of char): Library
+  var
+    L: Library
+    n, n0: int16
+    len_, t: int32
+    proc_: NewProc
+    A: Alias
+begin
+  A := FirstAlias.next
+  while (A # nil) & (name^ # A.name) do
+    A := A.next
+  end
+  if A # nil then
+    L := A.lib
+  else
+    L := FirstLib.next
+    while (L # nil) & (name^ # L.name) do
+      L := L.next
+    end
+    if L = nil then
+      n := nofreg
+      n0 := 0
+      len_ := -1
+      while n0 # nofreg do
+        if Match(name, @LibExt[n0], @t) & (t >= len_) then
+          n := n0
+          len_ := t
+        end
+
+        inc(n0)
+      end
+
+      if n # nofreg then
+        proc_ := LibNew[n]
+        L := proc_()
+        copy(@L.name, name, 32)
+        L.Load(L)
+        Kernel.RegisterObject(cast(AnyPtr, L), Cleanup, false)
+        if name^ = L.name then
+          L.next := FirstLib.next
+          FirstLib.next := L
+        else
+          newgc(A)
+          copy(@A.name, name, 32)
+          A.lib := L
+          A.next := FirstAlias.next
+          FirstAlias.next := A
+          (*Kernel.WriteString("Alias: ");
+          Kernel.WriteString(name);  Kernel.WriteString(" -> ");  Kernel.WriteString(L.name);
+          Kernel.WriteLn*)
+        end
+      end
+    end
+  end
+
+  return L
+end ThisLibrary
+
+// Free library from public library cache
+procedure FreeLibrary*(const name: pointer to array of char)
+  var
+    L: Library
+begin
+  L := FirstLib.next
+  while L # nil do
+    if name^ = L.name then
+      Cleanup(cast(AnyPtr, L))
+    end
+    L := L.next
+  end
+end FreeLibrary
+
+// Enumerate public libraries. Don't free libraries during enumeration!
+procedure Enumerate*(P: EnumProc)
+  var
+    L: Library
+begin
+  L := FirstLib.next
+  while L # nil do
+    P(L)
+    L := L.next
+  end
+end Enumerate
+
+// Register a new library file extension and its associated generator procedure.
+procedure Register*(const ext: pointer to array of char; new_: NewProc)
+  var
+    n: int16
+    len_: int32
+    L: Library
+begin
+  n := 0
+  while (n # nofreg) & (ext^ # LibExt[n]) do
+    inc(n)
+  end
+  if n # nofreg then
+    LibNew[n] := new_
+  else
+    copy(@LibExt[nofreg], ext, 8)
+    LibNew[nofreg] := new_
+    inc(nofreg)
+  end
+
+  // free library entries that match
+  L := FirstLib.next
+  while L # nil do
+    if Match(@L.name, ext, @len_) then
+      Cleanup(cast(AnyPtr, L))
+    end
+    L := L.next
+  end
+end Register
+
+// standard libraries
+
+procedure ReadName(R: pointer to Files.Rider; name: pointer to array of char)
+  var
+    i: int16
+    ch: char
+begin
+  i := 0
+  Files.Read(R, cast(BytePtr, @ch))
+  while (ch # ".") & (ch # 0X) do
+    name[i] := ch
+    inc(i)
+    Files.Read(R, cast(BytePtr, @ch))
+  end
+  name[i] := "."
+  inc(i)
+  Files.Read(R, cast(BytePtr, @ch))
+  while ch # 0X do
+    name[i] := ch
+    inc(i)
+    Files.Read(R, cast(BytePtr, @ch))
+  end
+  name[i] := 0X
+end ReadName
+
+procedure SplitName(name, MName, PName: pointer to array of char)
+  var
+    i, j: int16
+begin
+  i := 0
+  while name[i] # "." do
+    MName[i] := name[i]
+    inc(i)
+  end
+  MName[i] := 0X
+  inc(i)
+  j := 0
+  while name[i] # 0X do
+    PName[j] := name[i]
+    inc(i)
+    inc(j)
+  end
+  PName[j] := 0X
+end SplitName
+
+procedure HandleDummy(obj: Object; M: pointer to ObjMsg)
+  var
+    dum: Dummy
+begin
+  case obj of
+  | Dummy:
+    case M of
+    | PAttrMsg:
+      if (M.id = get) & (M.name = "Gen") then
+        copy(@M.s, @obj.GName, 64)
+      end
+
+    | PCopyMsg:
+      if M.stamp = obj.stamp then
+        M.obj := obj.dlink
+      else
+        newgc(dum)
+        obj.stamp := M.stamp
+        obj.dlink := dum
+        dum.handle := obj.handle
+        copy(@dum.GName, @obj.GName, 32)
+        dum.len_ := obj.len_
+        dum.blk := obj.blk
+        M.obj := dum
+      end
+
+    | PFileMsg:
+      if M.id = load then
+        obj.len_ := M.len_
+        newgc(obj.blk, obj.len_)
+        Files.ReadBytes(@M.R, cast(BytesPtr, obj.blk), obj.len_, obj.len_)
+      elsif M.id = store then
+        Files.WriteBytes(@M.R, cast(BytesPtr, obj.blk), obj.len_, obj.len_)
+      end
+
+    end
+  end
+end HandleDummy
+
+procedure NewDummy(GName: pointer to array of char)
+  var
+    dum: Dummy
+begin
+  newgc(dum)
+  dum.handle := HandleDummy
+  copy(@dum.GName, GName, 32)
+  NewObj := dum
+end NewDummy
+
+procedure GetObj(L: Library; ref: int16; obj: pointer to Object)
+  var
+    objOrg: int32
+    ind: ArrayIndex
+    MName, PName: array 32 of char
+    n: int16
+    Mod: Modules.Module
+    Cmd: Modules.Command
+    M: FileMsg
+begin
+  ind := L.ind(ArrayIndex)
+  if (ref < 0) or (ref >= ind.size_) then
+    obj^ := nil
+    return
+  end
+  obj^ := ind.index[ref]
+  if obj^ = nil then
+    if L.f # nil then
+      Files.Set(@L.R, L.f, ind.org + ref * 4)
+      Files.ReadLInt(@L.R, @objOrg)
+      if objOrg > ind.org then
+        NewObj := nil
+        Files.Set(@L.R, L.f, objOrg)
+        Files.ReadInt(@L.R, @n)
+        SplitName(@L.GName[n], @MName, @PName)
+        Mod := Modules.ThisMod(@MName)
+        if Modules.res = 0 then
+          Cmd := Modules.ThisCommand(Mod, @PName)
+          if Modules.res = 0 then
+            Cmd()
+          else
+            NewDummy(@L.GName[n])
+          end
+
+        else
+          NewDummy(@L.GName[n])
+        end
+
+        obj^ := NewObj
+        if obj^ # nil then
+          obj^.lib := L
+          obj^.ref := ref
+          ind.index[ref] := obj^
+          // read in data
+          M.id := load
+          Stamp(@M)
+          Files.ReadLInt(@L.R, @M.len_)
+          Files.Set(@M.R, L.f, Files.Pos(@L.R))
+          if M.len_ > 0 then
+            obj^.handle(obj^, @M)
+          end
+        else
+          ind.index[ref] := NoObj
+        end
+
+      else
+        ind.index[ref] := NoObj
+      end
+
+    else
+      ind.index[ref] := NoObj
+    end
+
+  elsif obj^ = NoObj then
+    obj^ := nil
+  end
+end GetObj
+
+procedure PutObj(L: Library; ref: int16; obj: Object)
+  var
+    index: Block
+    ind: ArrayIndex
+    i: int32
+    size_: int16
+begin
+  if (ref < 0) or (obj = nil) then
+    return
+  end
+  ind := L.ind(ArrayIndex)
+  if ref >= ind.size_ then
+    size_ := (asr(ref, 6) + 1) * StepSize
+    newgc(index, size_)
+    if ind.index # nil then
+      SYS.MOVE(cast(AnyPtr, ind.index), cast(AnyPtr, index), val(int32, ind.size_ * 4))
+    end
+    for i := ind.size_ to size_ - 1 do
+      index[i] := NoObj
+    end
+    ind.size_ := size_
+    ind.index := index
+  end
+
+  ind.index[ref] := obj
+  obj.lib := L
+  obj.ref := ref
+  if ref >= L.maxref then
+    L.maxref := ref + 1
+  end
+end PutObj
+
+procedure FreeObj(L: Library; ref: int16)
+begin
+  if (ref >= 0) & (ref < L.ind(ArrayIndex).size_) then
+    L.ind(ArrayIndex).index[ref] := NoObj
+  end
+end FreeObj
+
+procedure GenRef(L: Library; ref: pointer to int16)
+begin
+  ref^ := L.maxref
+  inc(L.maxref)
+end GenRef
+
+// Load a standard object library (old format) from position pos in file f.
+procedure OldLoadLibrary(L: Library; f: Files.File; pos: int32; len_: pointer to int32)
+  var
+    R, S: Files.Rider
+    Mod: Modules.Module
+    Cmd: Modules.Command
+    NofRuns, key, N, i, k, m: int16
+    clen, dlen: int32
+    type_, n: int8
+    ch: char
+    entry: Entry
+    obj: Object
+    M: FileMsg
+    MName, PName: Name
+    GName: array 64 (* MaxNews *) of Name
+    run: array 64 (* MaxRuns *) of RunRec
+    ind: ArrayIndex
+    dict: ListDict
+begin
+  ind := L.ind(ArrayIndex)
+  dict := L.dict(ListDict)
+  Files.Set(@R, f, pos)
+  Files.Read(@R, cast(BytePtr, @type_))
+  Files.ReadLInt(@R, @clen)
+  Files.Set(@S, f, pos + 1 + clen)
+  Files.ReadLInt(@S, @dlen)
+  Files.ReadInt(@S, @key)
+  while key # (-32768i2) do
+    newgc(entry)
+    Files.ReadString(@S, @entry.name, 32)
+    entry.key := key
+    entry.next := dict.first
+    dict.first := entry
+    if key < dict.key then
+      dict.key := key
+    end
+    Files.ReadInt(@S, @key)
+  end
+
+  if type_ >= 0 then
+    // old format
+    Files.Read(@R, cast(BytePtr, @ch))
+    Files.Read(@R, cast(BytePtr, @ch))
+    Files.ReadInt(@R, @i)
+    Files.ReadInt(@R, @i)
+    Files.ReadInt(@R, @i)
+    Files.ReadInt(@R, @i)
+    Files.ReadInt(@R, @i)
+  end
+
+  Files.ReadInt(@R, @NofRuns)
+  k := 0
+  while k # NofRuns do
+    Files.ReadInt(@R, @run[k].beg)
+    Files.ReadInt(@R, @run[k].end_)
+    inc(k)
+  end
+
+  N := 0
+  k := 0
+  m := 0
+  while k < NofRuns do
+    m := run[k].beg
+    while m < run[k].end_ do
+      Files.Read(@R, cast(BytePtr, @n))
+      if n = N then
+        ReadName(@R, @GName[N])
+        inc(N)
+      end
+      SplitName(@GName[n], @MName, @PName)
+      Mod := Modules.ThisMod(@MName)
+      if Modules.res = 0 then
+        Cmd := Modules.ThisCommand(Mod, @PName)
+        if Modules.res = 0 then
+          Cmd()
+        else
+          NewDummy(@GName[n])
+        end
+
+      else
+        NewDummy(@GName[n])
+      end
+
+      PutObj(L, m, NewObj)
+      NewObj.lib := L
+      NewObj.ref := m
+      inc(m)
+    end
+
+    inc(k)
+  end
+
+  L.maxref := m
+  M.id := load
+  Stamp(@M)
+  Files.Set(@M.R, f, Files.Pos(@R))
+  k := 0
+  m := 0
+  while k < NofRuns do
+    m := run[k].beg
+    while m < run[k].end_ do
+      Files.ReadLInt(@M.R, @M.len_)
+      pos := Files.Pos(@M.R) + M.len_
+      if M.len_ # 0 then
+        obj := ind.index[m]
+        obj.handle(obj, @M)
+      end
+
+      if Files.Pos(@M.R) < pos then
+        // ejz skip rest of obj data
+        Files.Set(@M.R, f, pos)
+      elsif Files.Pos(@M.R) > pos then
+        // ejz object read too much
+        halt(99)
+      end
+
+      inc(m)
+    end
+
+    inc(k)
+  end
+
+  len_^ := 1 + clen + dlen
+end OldLoadLibrary
+
+// Load a standard object library from position pos in file f.
+procedure LoadLibrary*(L: Library; f: Files.File; pos: int32; len_: pointer to int32)
+  var
+    ind: ArrayIndex
+    dict: ListDict
+    i, version, dorg, gorg: int32
+    key, n, N: int16
+    entry: Entry
+    R: Files.Rider
+begin
+  ind := L.ind(ArrayIndex)
+  Files.Set(@R, f, pos)
+  Files.ReadLInt(@R, @version)
+  if version = Version then
+    Files.ReadLInt(@R, @gorg)
+    Files.ReadLInt(@R, @dorg)
+    Files.ReadInt(@R, @L.maxref)
+    ind.size_ := L.maxref
+    ind.org := Files.Pos(@R)
+    if L.maxref > 0 then
+      newgc(ind.index, L.maxref)
+    end
+    for i := 0 to L.maxref - 1 do
+      ind.index[i] := nil
+    end
+    // read generator table
+    Files.Set(@R, f, gorg)
+    Files.ReadInt(@R, @N)
+    if N > 0 then
+      newgc(L.GName, N)
+      for n := 0 to N - 1 do
+        Files.ReadString(@R, @L.GName[n], 64)
+      end
+    else
+      L.GName := nil
+    end
+
+    // read dict
+    dict := L.dict(ListDict)
+    Files.Set(@R, f, dorg)
+    Files.ReadInt(@R, @key)
+    while (key # (-32768i2)) & ~R.eof do
+      newgc(entry)
+      Files.ReadString(@R, @entry.name, 32)
+      entry.key := key
+      entry.next := dict.first
+      dict.first := entry
+      if key < dict.key then
+        dict.key := key
+      end
+      Files.ReadInt(@R, @key)
+    end
+
+    L.f := f
+    Files.Set(@L.R, f, ind.org)
+    len_^ := Files.Pos(@R) - pos
+  else
+    ind.org := 0
+    ind.size_ := 0
+    ind.index := nil
+    L.f := nil
+    Files.Set(@L.R, nil, 0)
+    OldLoadLibrary(L, f, pos, len_)
+  end
+end LoadLibrary
+
+// Store a standard object library at position pos in file f.
+procedure StoreLibrary*(L: Library; f: Files.File; pos: int32; len_: pointer to int32)
+  var
+    obj: Object
+    ind: ArrayIndex
+    i, olen, org, indorg: int32
+    m, n, N: int16
+    entry: Entry
+    ch: char
+    GName: array 64 (* MaxNews *) of GenName
+    R, indR: Files.Rider
+    M: FileMsg
+    A: AttrMsg
+begin
+  ind := L.ind(ArrayIndex)
+  Files.Set(@R, f, pos)
+  Files.Write(@R, val(byte, ord(LibBlockId)))
+  Files.WriteLInt(@R, Version)
+  Files.WriteLInt(@R, -1) // place holder genTable pos
+  Files.WriteLInt(@R, -1) // place holder dict pos
+  Files.WriteInt(@R, L.maxref)
+  indorg := Files.Pos(@R)
+  Files.Set(@indR, f, indorg)
+  if L.maxref > 0 then
+    Files.WriteBytes(@R, cast(BytesPtr, ind.index), L.maxref * 4, L.maxref * 4)
+  end
+
+  // store obj data
+  A.id := get
+  copy(@A.name, "Gen", 32)
+  N := 0
+  M.id := store
+  Stamp(@M)
+  for i := 0 to L.maxref - 1 do
+    obj := ind.index[i]
+    if obj = nil then
+      // object is not load yet
+      Files.Set(@L.R, L.f, ind.org + 4 * i)
+      Files.ReadLInt(@L.R, @org)
+      if org >= 0 then
+        // there is an object in the file
+        Files.Set(@L.R, L.f, org)
+        Files.ReadInt(@L.R, @m)
+        Files.ReadLInt(@L.R, @olen)
+        copy(@GName[N], @L.GName[m], 64)
+        n := 0
+        while GName[n] # GName[N] do
+          inc(n)
+        end
+        if n = N then
+          inc(N)
+        end
+
+        Files.WriteLInt(@indR, Files.Pos(@R)) // write index
+        Files.WriteInt(@R, n)
+        Files.WriteLInt(@R, olen)
+        while olen > 0 do
+          Files.Read(@L.R, cast(BytePtr, @ch))
+          Files.Write(@R, val(byte, ord(ch)))
+          dec(olen)
+        end
+      else
+        // there was never an object with this ref
+        Files.WriteLInt(@indR, -1)
+      end
+
+    elsif obj # NoObj then
+      // there is an object to store
+      A.res := -1
+      obj.handle(obj, @A)
+      copy(@GName[N], @A.s, 64)
+      n := 0
+      while GName[n] # GName[N] do
+        inc(n)
+      end
+      if n = N then
+        inc(N)
+      end
+
+      Files.WriteLInt(@indR, Files.Pos(@R)) // write index
+      Files.WriteInt(@R, n)
+      Files.Set(@M.R, f, Files.Pos(@R))
+      Files.WriteLInt(@M.R, 0)
+      obj.handle(obj, @M)
+      olen := Files.Pos(@M.R) - Files.Pos(@R) - 4
+      Files.WriteLInt(@R, olen)
+      Files.Set(@R, f, Files.Pos(@M.R))
+    else
+      // no object
+      Files.WriteLInt(@indR, -1)
+    end
+  end
+
+  // write generator table
+  i := Files.Pos(@R)
+  Files.Set(@R, f, pos + 5)
+  Files.WriteLInt(@R, i)
+  Files.Set(@R, f, i)
+  Files.WriteInt(@R, N)
+  if N > 0 then
+    newgc(L.GName, N)
+    for n := 0 to N - 1 do
+      Files.WriteString(@R, @GName[n], 64)
+      copy(@L.GName[n], @GName[n], 64)
+    end
+  end
+
+  // store dict
+  i := Files.Pos(@R)
+  Files.Set(@R, f, pos + 9)
+  Files.WriteLInt(@R, i)
+  Files.Set(@R, f, i)
+  entry := L.dict(ListDict).first
+  while entry # nil do
+    Files.WriteInt(@R, entry.key)
+    i := 0
+    Files.WriteString(@R, @entry.name, 32)
+    entry := entry.next
+  end
+
+  Files.WriteInt(@R, (-32768i2))
+  len_^ := Files.Pos(@R) - pos
+  L.f := f
+  ind.org := indorg
+  Files.Set(@L.R, L.f, ind.org)
+end StoreLibrary
+
+procedure LoadFileLib(L: Library)
+  var
+    f: Files.File
+    R: Files.Rider
+    len_: int32
+    id: char
+begin
+  f := Files.Old(@L.name)
+  if f # nil then
+    Files.Set(@R, f, 0)
+    Files.Read(@R, cast(BytePtr, @id))
+    if id = LibBlockId then
+      LoadLibrary(L, f, 1, @len_)
+    else
+      L.f := nil
+      L.ind(ArrayIndex).size_ := 0
+      L.ind(ArrayIndex).index := nil
+    end
+  end
+end LoadFileLib
+
+procedure StoreFileLib(L: Library)
+  var
+    f: Files.File
+    len_: int32
+begin
+  f := Files.New(@L.name)
+  if f # nil then
+    StoreLibrary(L, f, 0, @len_)
+    Files.Register(f)
+  end
+end StoreFileLib
+
+// Initialize a standard object library.
+procedure OpenLibrary*(L: Library)
+  var
+    ind: ArrayIndex
+    dict: ListDict
+begin
+  L.Load := LoadFileLib
+  L.Store := StoreFileLib
+  L.GenRef := GenRef
+  L.GetObj := GetObj
+  L.PutObj := PutObj
+  L.FreeObj := FreeObj
+  newgc(ind)
+  ind.org := 0
+  ind.size_ := 0
+  ind.index := nil
+  L.ind := ind
+  newgc(dict)
+  dict.first := nil
+  dict.key := 0
+  L.dict := dict
+  L.maxref := 0
+end OpenLibrary
+
+procedure NewLibrary(): Library
+  var
+    L: Library
+begin
+  newgc(L)
+  OpenLibrary(L)
+  return L
+end NewLibrary
+
+// Given an object name, return the object reference number from the dictionary.
+procedure GetRef*(D: pointer to Dictionary; const name: pointer to array of char; ref: pointer to int16)
+  var
+    cur: Entry
+begin
+  if D^ is ListDict then
+    cur := D^(ListDict).first
+    while (cur # nil) & ((cur.key < 0) or (cur.name # name^)) do
+      cur := cur.next
+    end
+    if cur = nil then
+      ref^ := (-32768i2)
+    else
+      ref^ := cur.key
+    end
+  else
+    ref^ := (-32768i2)
+  end
+end GetRef
+
+// Allocate a key (any integer < 0) to a name.
+procedure GetKey*(D: pointer to Dictionary; const name: pointer to array of char; key: pointer to int16)
+  var
+    cur: Entry
+begin
+  if D^ is ListDict then
+    cur := D^(ListDict).first
+    while (cur # nil) & ((cur.key >= 0) or (cur.name # name^)) do
+      cur := cur.next
+    end
+    if cur = nil then
+      dec(D^(ListDict).key)
+      newgc(cur)
+      cur.key := D^(ListDict).key
+      copy(@cur.name, name, 32)
+      cur.next := D^(ListDict).first
+      D^(ListDict).first := cur
+    end
+
+    key^ := cur.key
+
+  else
+    key^ := (-32768i2)
+  end
+end GetKey
+
+// Get name associated with a key/reference number.
+procedure GetName*(D: pointer to Dictionary; key: int16; name: pointer to array of char; name_len: int32)
+  var
+    cur: Entry
+begin
+  if D^ is ListDict then
+    cur := D^(ListDict).first
+    while (cur # nil) & (cur.key # key) do
+      cur := cur.next
+    end
+    if cur = nil then
+      name[0] := 0X
+    else
+      copy(name, @cur.name, name_len)
+    end
+  else
+    name[0] := 0X
+  end
+end GetName
+
+// Associate a name with a reference number.
+procedure PutName*(D: pointer to Dictionary; key: int16; const name: pointer to array of char)
+  // Note: D could be value parameter
+  var
+    cur: Entry
+begin
+  if D^ is ListDict then
+    if key >= 0 then
+      cur := D^(ListDict).first
+      while (cur # nil) & (cur.key # key) do
+        cur := cur.next
+      end
+      if cur = nil then
+        newgc(cur)
+        cur.key := key
+        cur.next := D^(ListDict).first
+        D^(ListDict).first := cur
+      end
+
+      copy(@cur.name, name, 32)
+
+    end
+  end
+end PutName
+
+begin
+  Modules.Register("Objects", nil)
+  LibBlockId := 0DBX
+  newgc(FirstLib)
+  FirstLib.next := nil
+  newgc(FirstAlias)
+  FirstAlias.next := nil
+  stamp := (-2147483647-1)
+  newgc(NoObj)
+  nofreg := 0
+  Register("Lib", NewLibrary)
+end Objects.

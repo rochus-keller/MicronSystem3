@@ -1,0 +1,2163 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Texts [level=5]
+
+import Files, Objects, Display, Fonts, Reals, Modules
+// portable
+// JG 23.8.94
+
+(** The Texts module implements the text abstract data type. Texts are sequences of
+characters and objects, with different colors, different fonts, and vertical offsets.
+*)
+
+// Scanner symbol classes.
+
+const
+  Inval* = 0 // Invalid symbol.
+  Name* = 1 // Name s (of length len).
+  String* = 2 // Quoted string s (length len).
+  Int* = 3 // Integer i (decimal or hexadecimal).
+  Real* = 4 // Real number x.
+  LongReal* = 5 // Long real number y.
+  Char* = 6 // Special character c.
+  Object* = 7 // Object obj.
+
+  TAB = 9X
+  CR = 0DX
+  LF = 0AX
+  OldTextBlockId = 1X
+  OldTextSpex = 0F0X
+
+  (* TextBlock = TextBlockId type hlen run {run} 0 tlen {AsciiCode} [font block].
+  run = font [name] col voff len. *)
+
+  BufSize = 64
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  BytesPtr = pointer to array of byte // helper type for VAR ARRAY OF SYSTEM.BYTE parameters
+
+  Piece = pointer to PieceDesc
+
+  PieceDesc = record
+    f: Files.File
+    off, len_: int32
+
+    obj: Objects.Object
+    lib: Objects.Library
+    ref: int16 // ref no in obs lib
+    col, voff: int8
+
+    prev, next: Piece
+  end
+
+  Text* = pointer to TextDesc
+
+  TextDesc* = object (Objects.ObjDesc)
+    len_*: int32 // Text consists of characters 0 to T.len - 1.
+    obs: Objects.Library // Library containing objects located in text.
+    trailer: Piece
+    org: int32 // cache
+    pce: Piece
+  end
+
+  UpdateMsg* = object (Display.FrameMsg)
+    // Message broadcast to indicate that part of a text changed.
+    text*: Text // The text that changed.
+    beg*: int32 // Change location.
+    end_*, len_*: int32
+  end
+  PUpdateMsg* = pointer to UpdateMsg
+
+  Finder* = record
+    // Finder of (non-character) objects located in text.
+    eot*: boolean // End-of-text reached during search.
+    pos*: int32 // Offset of Finder in text.
+    T: Text
+    ref: Piece
+  end
+
+  Reader* = object
+    // Character-wise reader of a text stream.
+    ref: Piece
+    T: Text
+    org, off: int32
+
+    R: Files.Rider
+    stamp: int32
+    buf: array 64 (* BufSize *) of char
+    bufpos, buflen: int32
+    lib*: Objects.Library // Library of last character/object read.
+    col*: int8 // Color index of last character read.
+    voff*: int8 // vertical offset of last character read.
+    eot*: boolean // Reader has reached end of the text stream.
+  end
+  PReader* = pointer to Reader
+
+  Scanner* = object (Reader)
+    // Scanner for symbol streams.
+    nextCh*: char // Character immediately following the last symbol scanned.
+    line*: int16 // # carriage returns scanned so far.
+    class*: int16 // Scan result: Int, Real, String etc.
+    i*: int32
+    x*: real
+    y*: longreal
+    c*: char
+    len_*: int8 // Length of name or string scanned.
+    s*: array 64 of char
+    obj*: Objects.Object
+  end
+  PScanner* = pointer to Scanner
+
+  Buffer* = pointer to BufDesc // Temporary container of text stretches.
+
+  BufDesc* = record
+    len_*: int32 // # characters in buffer.
+    header, last: Piece
+  end
+
+  Writer* = record
+    // Used to write a stream of textual data in a buffer.
+    R: Files.Rider
+    buf*: Buffer // Associated buffer.
+    lib*: Objects.Library // Current font/library of characters written.
+    col*: int8 // Current color of text being written.
+    voff*: int8 // Current vertical offset of text being written.
+  end
+
+var
+  TextBlockId*: char // First character of a text block.
+  DocBlockId, NoSpex, NoSpex2, TextSpex: char
+  Wfile: Files.File
+  R: Files.Rider
+  DelBuf: Buffer
+  H: Objects.Handler
+  nameChars: array 256 of boolean
+  obs: Objects.Library
+
+// Load text block from ASCII file f to text T.
+procedure LoadAscii*(T: Text; f: Files.File)
+  var
+    Q, q: Piece
+    len_: int32
+begin
+  len_ := Files.Length(f)
+  newgc(Q)
+  Q.f := Wfile
+  Q.off := 0
+  Q.len_ := 1
+  Q.ref := (-32768i2)
+  Q.lib := nil
+  Q.col := 127
+  Q.voff := 0
+  newgc(q)
+  q.f := f
+  q.off := 0
+  q.len_ := len_
+  q.ref := (-32768i2)
+  q.lib := Fonts.Default
+  q.col := 15
+  q.voff := 0
+  Q.next := q
+  q.prev := Q
+  q.next := Q
+  Q.prev := q
+  T.handle := H
+  T.obs := nil
+  T.trailer := Q
+  T.len_ := len_
+  T.org := -1 // init cache
+  T.pce := T.trailer
+end LoadAscii
+
+procedure ReadDocHeader(R: pointer to Files.Rider; ch: pointer to char)
+  var
+    len_: int32
+    x, y, w, h: int16
+    name: array 32 of char
+begin
+  Files.Read(R, cast(BytePtr, ch))
+  Files.ReadString(R, @name, 32)
+  Files.ReadInt(R, @x)
+  Files.ReadInt(R, @y)
+  Files.ReadInt(R, @w)
+  Files.ReadInt(R, @h)
+  Files.Read(R, cast(BytePtr, ch))
+  if ch^ = 0F7X then
+    // skip meta info
+    Files.Read(R, cast(BytePtr, ch))
+    if ch^ = 8X then
+      Files.ReadLInt(R, @len_)
+      Files.Set(R, Files.Base(R), Files.Pos(R) + len_)
+      Files.Read(R, cast(BytePtr, ch))
+    end
+  end
+end ReadDocHeader
+
+// Load text block from file f at position pos to text T (assumes that the text id has been read already). len returns length.
+procedure Load*(T: Text; f: Files.File; pos: int32; len_: pointer to int32)
+
+  var
+    R, S: Files.Rider
+    Q, q, p: Piece
+    hlen, tlen, flen, off: int32
+    N, lib: int8
+    type_, ref, tag: char
+    LName: array 32 of char
+    Dict: array 32 of Objects.Library
+    i: int16
+begin
+  newgc(Q)
+  Q.f := Wfile
+  Q.off := 0
+  Q.len_ := 1
+  Q.ref := (-32768i2)
+  Q.lib := nil
+  Q.col := 127
+  Q.voff := 0
+  p := Q
+  Files.Set(@R, f, pos)
+  Files.Read(@R, cast(BytePtr, @type_))
+  Files.ReadLInt(@R, @hlen)
+  Files.Set(@S, f, pos - 1 + hlen - 4)
+  Files.ReadLInt(@S, @tlen)
+  if (type_ = TextSpex) or (type_ = OldTextSpex) then
+    T.obs := nil
+    flen := 0
+  else
+    newgc(T.obs)
+    Objects.OpenLibrary(T.obs)
+    Files.Set(@S, f, pos - 1 + hlen + tlen)
+    Files.Read(@S, cast(BytePtr, @tag))
+    if tag = Objects.LibBlockId then
+      Objects.LoadLibrary(T.obs, f, pos - 1 + hlen + tlen + 1, @flen)
+    end
+
+    inc(flen)
+  end
+
+  Dict[0] := T.obs
+  N := 1
+  off := pos - 1 + hlen
+  while Files.Pos(@R) < pos - 1 + hlen - 5 do
+    Files.Read(@R, cast(BytePtr, @lib))
+    if lib = N then
+      Files.ReadString(@R, @LName, 32)
+      Dict[N] := Objects.ThisLibrary(@LName)
+      inc(N)
+    end
+
+    newgc(q)
+    q.lib := Dict[lib]
+    q.obj := nil
+    if ~(q.lib is Fonts.Font) then
+      Files.Set(@S, f, off) // q.lib.GetObj(q.lib, ORD(ref), q.obj)
+      Files.Read(@S, cast(BytePtr, @ref))
+      q.ref := val(int16, ord(ref))
+    else
+      q.ref := (-32768i2)
+    end
+
+    Files.Read(@R, cast(BytePtr, @q.col))
+    Files.Read(@R, cast(BytePtr, @q.voff))
+    Files.ReadLInt(@R, @q.len_)
+    if q.len_ < 0 then
+      LoadAscii(T, f)
+      return
+    end
+
+    q.f := f
+    q.off := off
+    off := off + q.len_
+    p.next := q
+    q.prev := p
+    p := q
+  end
+
+  p.next := Q
+  Q.prev := p
+  T.handle := H
+  T.trailer := Q
+  T.len_ := tlen
+  T.org := -1 // init cache
+  T.pce := T.trailer
+  if type_ = NoSpex2 then
+    // generate multiple private libs with <= 256 objs
+    for i := 0 to 31 do
+      Dict[i] := nil
+    end
+
+    Files.Set(@R, f, pos - 1 + hlen + tlen + flen)
+    p := T.trailer.next
+    while p # T.trailer do
+      if p.lib = T.obs then
+        Files.ReadInt(@R, @i)
+        inc(flen, 2)
+        if Dict[asr(i, 8)] = nil then
+          newgc(Dict[asr(i, 8)])
+          Objects.OpenLibrary(Dict[asr(i, 8)])
+        end
+
+        // T.obs.GetObj(T.obs, i, p.obj);
+        p.obj := nil
+        p.ref := i
+        p.lib := Dict[asr(i, 8)]
+        // Dict[i DIV 256].PutObj(Dict[i DIV 256], i MOD 256, p.obj)
+      end
+
+      p := p.next
+    end
+  end
+
+  len_^ := hlen - 1 + tlen + flen
+end Load
+
+procedure SyncPiece(T: Text; p: Piece)
+
+  var
+    R: Files.Rider
+    ch: char
+begin
+  // NOTE RK: if we get crashes because of p.lib = NIL set it to Fonts.Default here; just for system bootstrapping
+  if (p.lib # nil) & (p.ref >= 0) & (p.obj = nil) & ~(p.lib is Fonts.Font) then
+    T.obs.GetObj(T.obs, p.ref, @p.obj)
+    Files.Set(@R, p.f, p.off)
+    Files.Read(@R, cast(BytePtr, @ch))
+    p.lib.PutObj(p.lib, val(int16, ord(ch)), p.obj)
+  end
+end SyncPiece
+
+// Store text T on disk file f at position pos. Writes the first id character too. len is the number of bytes written.
+procedure Store*(T: Text; f: Files.File; pos: int32; len_: pointer to int32)
+
+  type
+    ObjsBlock = pointer to ObjsBlockDesc
+    ObjsBlockDesc = record
+      objs: array 256 of Objects.Object
+      next: ObjsBlock
+    end
+
+  var
+    p, q: Piece
+    R, W: Files.Rider
+    hlen, flen, rlen, m: int32
+    id, i: int16
+    N, n: int8
+    type_, ch: char
+    obj: Objects.Object
+    M: Objects.BindMsg
+    Dict: array 32 of Objects.Name
+    allObjs, curObjs, objs: ObjsBlock
+begin
+  Files.Set(@W, f, pos)
+  Files.Write(@W, val(byte, ord(TextBlockId)))
+  Files.Write(@W, val(byte, ord(0X))) // type
+  // place holder
+  Files.WriteLInt(@W, 0) // hlen
+  // place holder
+  copy(@Dict[0], "", 32)
+  N := 1
+  p := T.trailer.next
+  while p # T.trailer do
+    rlen := p.len_
+    q := p.next
+    if p.lib is Fonts.Font then
+      while (q # T.trailer) & (q.lib = p.lib) & (q.col = p.col) & (q.voff = p.voff) do
+        rlen := rlen + q.len_
+        q := q.next
+      end
+    end
+
+    copy(@Dict[N], @p.lib.name, 32)
+    n := 0
+    while Dict[n] # p.lib.name do
+      inc(n)
+    end
+    Files.Write(@W, val(byte, n))
+    if n = N then
+      Files.WriteString(@W, @p.lib.name, 32)
+      inc(N)
+    end
+    Files.Write(@W, val(byte, p.col))
+    Files.Write(@W, val(byte, p.voff))
+    Files.WriteLInt(@W, rlen)
+    p := q
+  end
+
+  Files.Write(@W, val(byte, ord(0X)))
+  Files.WriteLInt(@W, T.len_)
+  newgc(allObjs)
+  allObjs.next := nil
+  curObjs := allObjs
+  hlen := Files.Pos(@W) - pos
+  id := 0
+  p := T.trailer.next
+  while p # T.trailer do
+    Files.Set(@R, p.f, p.off)
+    m := p.len_
+    while m # 0 do
+      Files.Read(@R, cast(BytePtr, @ch))
+      if p.lib.name[0] = 0X then
+        SyncPiece(T, p)
+        p.lib.GetObj(p.lib, val(int16, ord(ch)), @obj)
+        p.obj := obj
+        curObjs.objs[band(id, 255)] := obj
+        i := 0
+        objs := allObjs
+        while objs.objs[band(i, 255)] # obj do
+          inc(i)
+          if band(i, 255) = 0 then
+            objs := objs.next
+          end
+        end
+
+        if i = id then
+          inc(id)
+          if band(id, 255) = 0 then
+            newgc(curObjs.next)
+            p.ref := id
+            curObjs := curObjs.next
+            curObjs.next := nil
+          end
+        end
+
+        ch := chr(i)
+      end
+
+      Files.Write(@W, val(byte, ord(ch)))
+      dec(m)
+    end
+
+    p := p.next
+  end
+
+  if id > 0 then
+    if id > 255 then
+      type_ := NoSpex2
+    else
+      type_ := NoSpex
+    end
+
+    newgc(T.obs)
+    Objects.OpenLibrary(T.obs)
+    i := 0
+    objs := allObjs
+    repeat
+      T.obs.PutObj(T.obs, i, objs.objs[band(i, 255)])
+      inc(i)
+      if band(i, 255) = 0 then
+        objs := objs.next
+      end
+    until i = id
+
+    M.lib := T.obs
+    i := 0
+    objs := allObjs
+    repeat
+      objs.objs[band(i, 255)].handle(objs.objs[band(i, 255)], @M)
+      inc(i)
+      if band(i, 255) = 0 then
+        objs := objs.next
+      end
+    until i = id
+
+    Objects.StoreLibrary(T.obs, f, pos + hlen + T.len_, @flen)
+    if type_ = NoSpex2 then
+      // append a reference block to the text file
+      Files.Set(@W, f, pos + hlen + T.len_ + flen)
+      p := T.trailer.next
+      while p # T.trailer do
+        if p.lib.name[0] = 0X then
+          i := 0
+          objs := allObjs
+          while objs.objs[band(i, 255)] # p.obj do
+            inc(i)
+            if band(i, 255) = 0 then
+              objs := objs.next
+            end
+          end
+
+          Files.WriteInt(@W, i)
+          inc(flen, 2)
+        end
+
+        p := p.next
+      end
+    end
+
+  else
+    type_ := TextSpex // no integrated objects
+    flen := 0
+  end
+
+  Files.Set(@W, f, pos + 1)
+  Files.Write(@W, val(byte, ord(type_))) // fixup
+  Files.WriteLInt(@W, hlen) // fixup
+  len_^ := hlen + T.len_ + flen
+end Store
+
+procedure GenNew(T: Text)
+  var
+    Q: Piece
+begin
+  newgc(Q)
+  Q.f := Wfile
+  Q.off := 0
+  Q.len_ := 1
+  Q.ref := (-32768i2)
+  Q.lib := nil
+  Q.col := 127
+  Q.voff := 0
+  Q.next := Q
+  Q.prev := Q
+  T.handle := H
+  T.obs := nil
+  T.trailer := Q
+  T.len_ := 0
+  T.org := -1 // init cache
+  T.pce := T.trailer
+end GenNew
+
+// Open text T from file specified by name. A new text is opened when name = "".
+procedure Open*(T: Text; const name: pointer to array of char)
+  var
+    f: Files.File
+    R: Files.Rider
+    len_: int32
+    ch: char
+begin
+  obs := nil
+  f := Files.Old(name)
+  if f # nil then
+    Files.Set(@R, f, 0)
+    Files.Read(@R, cast(BytePtr, @ch))
+    if ch = DocBlockId then
+      ReadDocHeader(@R, @ch)
+    end
+    if (ch = TextBlockId) or (ch = OldTextBlockId) then
+      Load(T, f, Files.Pos(@R), @len_)
+    else
+      LoadAscii(T, f)
+    end
+
+  else
+    GenNew(T)
+  end
+end Open
+
+// Text generator procedure. Resulting text is assigned to Objects.NewObj.
+procedure New*()
+  var
+    T: Text
+begin
+  newgc(T)
+  T.handle := H
+  GenNew(T)
+  Objects.NewObj := T
+end New
+
+procedure FindPiece(T: Text; pos: int32; org: pointer to int32; p: pointer to Piece)
+  var
+    n: int32
+begin
+  if pos < T.org then
+    T.org := -1
+    T.pce := T.trailer
+  end
+  org^ := T.org // from cache
+  p^ := T.pce
+  n := 0
+  while pos >= org^ + p^.len_ do
+    org^ := org^ + p^.len_
+    p^ := p^.next
+    inc(n)
+  end
+  if n > 50 then
+    T.org := org^
+    T.pce := p^
+  end
+end FindPiece
+
+procedure SplitPiece(p: Piece; off: int32; pr: pointer to Piece)
+  var
+    q: Piece
+begin
+  if off > 0 then
+    newgc(q)
+    q.ref := (-32768i2)
+    q.lib := p.lib
+    q.col := p.col
+    q.voff := p.voff
+    q.len_ := p.len_ - off
+    q.f := p.f
+    q.off := p.off + off
+    p.len_ := off
+    q.next := p.next
+    p.next := q
+    q.prev := p
+    q.next.prev := q
+    pr^ := q
+  else
+    pr^ := p
+  end
+end SplitPiece
+
+// Insert buffer B in text T position pos. B is emptied.
+procedure Insert*(T: Text; pos: int32; B: Buffer)
+  var
+    pl, pr, p, qb, qe: Piece
+    org: int32
+    M: UpdateMsg
+begin
+  FindPiece(T, pos, @org, @p)
+  SplitPiece(p, pos - org, @pr)
+  if T.org >= org then
+    // adjust cache
+    T.org := org - p.prev.len_
+    T.pce := p.prev
+  end
+
+  pl := pr.prev
+  qb := B.header.next
+  if (qb # nil) & (qb.f = pl.f) & (qb.off = pl.off + pl.len_) & (pl.lib is Fonts.Font) & (pl.lib = qb.lib) & (pl.col = qb.col) & (pl.voff = qb.voff) then
+
+    pl.len_ := pl.len_ + qb.len_
+    qb := qb.next
+  end
+
+  if qb # nil then
+    qe := B.last
+    qb.prev := pl
+    pl.next := qb
+    qe.next := pr
+    pr.prev := qe
+  end
+
+  T.len_ := T.len_ + B.len_
+  M.text := T
+  M.F := nil
+  M.beg := pos
+  M.end_ := pos
+  M.len_ := B.len_
+  B.last := B.header
+  B.last.next := nil
+  B.len_ := 0
+  Display.Broadcast(@M)
+  T.stamp := M.stamp
+end Insert
+
+// Append buffer to the end of text T. B is emptied.
+procedure Append*(T: Text; B: Buffer)
+begin
+  Insert(T, T.len_, B)
+end Append
+
+// Delete text stretch [beg, end[.
+procedure Delete*(T: Text; beg, end_: int32)
+  var
+    pb, pe, pbr, per: Piece
+    orgb, orge: int32
+    M: UpdateMsg
+begin
+  if beg < end_ then
+    FindPiece(T, beg, @orgb, @pb)
+    SplitPiece(pb, beg - orgb, @pbr)
+    FindPiece(T, end_, @orge, @pe)
+    SplitPiece(pe, end_ - orge, @per)
+    if T.org >= orgb then
+      // adjust cache
+      T.org := orgb - pb.prev.len_
+      T.pce := pb.prev
+    end
+
+    DelBuf.header.next := pbr
+    DelBuf.last := per.prev
+    DelBuf.last.next := nil
+    DelBuf.len_ := end_ - beg
+    per.prev := pbr.prev
+    pbr.prev.next := per
+    T.len_ := T.len_ - end_ + beg
+    M.text := T
+    M.F := nil
+    M.beg := beg
+    M.end_ := end_
+    M.len_ := 0
+    Display.Broadcast(@M)
+    T.stamp := M.stamp
+  end
+end Delete
+
+// Replace [beg, end[ of T with contents of buffer B. B is emptied.
+procedure Replace*(T: Text; beg, end_: int32; B: Buffer)
+  var
+    M: UpdateMsg
+    pb, pe, pbr, per, pl, qb, qe: Piece
+    orgb, orge: int32
+begin
+  if beg < end_ then
+    FindPiece(T, beg, @orgb, @pb)
+    SplitPiece(pb, beg - orgb, @pbr)
+    FindPiece(T, end_, @orge, @pe)
+    SplitPiece(pe, end_ - orge, @per)
+    if T.org >= orgb then
+      // adjust cache
+      T.org := orgb - pb.prev.len_
+      T.pce := pb.prev
+    end
+
+    DelBuf.header.next := pbr
+    DelBuf.last := per.prev
+    DelBuf.last.next := nil
+    DelBuf.len_ := end_ - beg
+    per.prev := pbr.prev
+    pbr.prev.next := per
+    pl := pbr.prev
+    qb := B.header.next
+    if (qb # nil) & (qb.f = pl.f) & (qb.off = pl.off + pl.len_) & (pl.lib is Fonts.Font) & (pl.lib = qb.lib) & (pl.col = qb.col) & (pl.voff = qb.voff) then
+
+      pl.len_ := pl.len_ + qb.len_
+      qb := qb.next
+    end
+
+    if qb # nil then
+      qe := B.last
+      qb.prev := pl
+      pl.next := qb
+      qe.next := per
+      per.prev := qe
+    end
+
+    T.len_ := T.len_ - end_ + beg + B.len_
+    M.text := T
+    M.F := nil
+    M.beg := beg
+    M.end_ := end_
+    M.len_ := B.len_
+    B.last := B.header
+    B.last.next := nil
+    B.len_ := 0
+    Display.Broadcast(@M)
+    T.stamp := M.stamp
+  end
+end Replace
+
+// Change character attributes within stretch [beg, end[ of text T. sel selects the attributes to be changed:
+//  0, 1, 2 IN sel = fnt, col, voff selected.
+procedure ChangeLooks*(T: Text; beg, end_: int32; sel: set; lib: Objects.Library; col, voff: int8)
+  var
+    pb, pe, p: Piece
+    org: int32
+    M: UpdateMsg
+    A: Objects.AttrMsg
+begin
+  if beg < end_ then
+    FindPiece(T, beg, @org, @p)
+    SplitPiece(p, beg - org, @pb)
+    FindPiece(T, end_, @org, @p)
+    SplitPiece(p, end_ - org, @pe)
+    p := pb
+    repeat
+      // IF (0 IN sel) & (p.lib IS Fonts.Font) THEN p.lib := lib END;
+      if (0 in sel) & (p.lib is Fonts.Font) then
+        p.lib := lib
+      elsif ~(p.lib is Fonts.Font) then
+        SyncPiece(T, p)
+        if (p.obj # nil) & (p.obj.handle # nil) then
+          if 1 in sel then
+            A.id := Objects.get
+            copy(@A.name, "Color", 32)
+            A.class := Objects.Inval
+            A.res := -1
+            p.obj.handle(p.obj, @A)
+            if A.res = 0 then
+              A.id := Objects.set_
+              A.class := Objects.Int
+              A.i := val(int32, band(val(int16, col), 255))
+              p.obj.handle(p.obj, @A)
+            end
+          end
+
+          if (0 in sel) & (lib # nil) & (lib is Fonts.Font) then
+            A.id := Objects.get
+            copy(@A.name, "Font", 32)
+            A.class := Objects.Inval
+            A.res := -1
+            p.obj.handle(p.obj, @A)
+            if A.res = 0 then
+              A.id := Objects.set_
+              A.class := Objects.String
+              copy(@A.s, @lib(Fonts.Font).name, 64)
+              p.obj.handle(p.obj, @A)
+            end
+          end
+        end
+      end
+
+      if 1 in sel then
+        p.col := col
+      end
+      if 2 in sel then
+        p.voff := voff
+      end
+      p := p.next
+    until p = pe
+
+    M.text := T
+    M.F := nil
+    M.beg := beg
+    M.end_ := end_
+    M.len_ := end_ - beg
+    Display.Broadcast(@M)
+    T.stamp := M.stamp
+  end
+end ChangeLooks
+
+// Open a new text buffer B.
+procedure OpenBuf*(B: Buffer)
+begin
+  newgc(B.header) // null piece
+  B.header.ref := (-32768i2)
+  B.last := B.header
+  B.len_ := 0
+end OpenBuf
+
+// Save stretch [beg, end[ of T in buffer B.
+procedure Save*(T: Text; beg, end_: int32; B: Buffer)
+  var
+    p, q, qb, qe: Piece
+    org: int32
+begin
+  if beg < end_ then
+    FindPiece(T, beg, @org, @p)
+    SyncPiece(T, p)
+    newgc(qb)
+    qb^ := p^
+    qb.ref := (-32768i2)
+    qb.len_ := qb.len_ - (beg - org)
+    qb.off := qb.off + (beg - org)
+    qe := qb
+    while end_ > org + p.len_ do
+      org := org + p.len_
+      p := p.next
+      SyncPiece(T, p)
+      newgc(q)
+      q^ := p^
+      q.ref := (-32768i2)
+      qe.next := q
+      q.prev := qe
+      qe := q
+    end
+
+    qe.next := nil
+    qe.len_ := qe.len_ - (org + p.len_ - end_)
+    B.last.next := qb
+    qb.prev := B.last
+    B.last := qe
+    B.len_ := B.len_ + (end_ - beg)
+  end
+end Save
+
+// Append copy of source buffer SB to destination buffer DB.
+procedure Copy*(SB, DB: Buffer)
+  var
+    Q, q, p: Piece
+begin
+  p := SB.header
+  Q := DB.last
+  while p # SB.last do
+    p := p.next
+    newgc(q)
+    q.ref := (-32768i2)
+    q^ := p^
+    Q.next := q
+    q.prev := Q
+    Q := q
+  end
+
+  DB.last := Q
+  DB.len_ := DB.len_ + SB.len_
+end Copy
+
+// Recall previously deleted text.
+procedure Recall*(B: pointer to Buffer)
+begin
+  // deleted text
+  Copy(DelBuf, B^)
+end Recall
+
+// Default handler for text objects. This handler understands Objects.AttrMsg(for Gen attribute), Objects.CopyMsg, Objects.BindMsg, and Objects.FileMsg only.
+procedure Handle*(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    T: Text
+    B: Buffer
+    len_: int32
+    id: int16
+    ch: char
+begin
+  case obj of
+  | Text:
+    case M of
+    | Objects.PAttrMsg:
+      if M.name = "Gen" then
+        M.class := Objects.String
+        copy(@M.s, "Texts.New", 64)
+        M.res := 0
+      end
+
+    | Objects.PCopyMsg:
+      newgc(B)
+      OpenBuf(B)
+      Save(obj, 0, obj.len_, B)
+      newgc(T)
+      T.handle := obj.handle
+      GenNew(T)
+      Insert(T, 0, B)
+      M.obj := T
+
+    | Objects.PBindMsg:
+      if (obj.lib = nil) or (obj.lib.name[0] = 0X) & (obj.lib # M.lib) then
+        M.lib.GenRef(M.lib, @id)
+        M.lib.PutObj(M.lib, id, obj)
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.load then
+        Files.Read(@M.R, cast(BytePtr, @ch))
+        if ch = DocBlockId then
+          ReadDocHeader(@R, @ch)
+        end
+        if (ch = TextBlockId) or (ch = OldTextBlockId) then
+          Load(obj, Files.Base(@M.R), Files.Pos(@M.R), @len_)
+          Files.Set(@M.R, Files.Base(@M.R), Files.Pos(@M.R) + len_)
+        end
+
+      else
+        // M.id = Objects.store
+        Store(obj, Files.Base(@M.R), Files.Pos(@M.R), @len_)
+        Files.Set(@M.R, Files.Base(@M.R), Files.Pos(@M.R) + len_)
+      end
+
+    end
+  end
+end Handle
+
+// Open Finder at position pos in T. The finder is automatically advanced to the next object in text.
+procedure OpenFinder*(F: pointer to Finder; T: Text; pos: int32)
+  var
+    p: Piece
+    org: int32
+begin
+  FindPiece(T, pos, @org, @p)
+  F.T := T
+  while (p.f # Wfile) & (p.lib is Fonts.Font) do
+    org := org + p.len_
+    p := p.next
+  end
+
+  F.pos := org
+  F.ref := p
+  F.eot := false
+end OpenFinder
+
+// Advance Finder to next object in text and return current object.
+procedure FindObj*(F: pointer to Finder; obj: pointer to Objects.Object)
+  var
+    p: Piece
+    org: int32
+begin
+  obj^ := F.ref.obj
+  if obj^ = nil then
+    // load object
+    SyncPiece(F.T, F.ref)
+    obj^ := F.ref.obj
+  end
+
+  if F.ref.f = Wfile then
+    F.eot := true
+  end
+  org := F.pos
+  p := F.ref
+  repeat
+    org := org + p.len_
+    p := p.next
+  until (p.f = Wfile) or ~(p.lib is Fonts.Font)
+
+  F.pos := org
+  F.ref := p
+end FindObj
+
+// Open text reader R and set it up at position pos in text T.
+procedure OpenReader*(R: pointer to Reader; T: Text; pos: int32)
+  var
+    p: Piece
+    org: int32
+begin
+  FindPiece(T, pos, @org, @p)
+  R.T := T
+  R.lib := nil
+  R.stamp := T.stamp
+  R.bufpos := 0
+  R.buflen := 0
+  R.ref := p
+  R.org := org
+  R.off := pos - org
+  R.lib := p.lib
+  R.col := p.col
+  R.voff := p.voff
+  if p.ref >= 0 then
+    SyncPiece(T, p)
+  end
+  Files.Set(@R.R, p.f, p.off + R.off)
+  R.eot := p.f = Wfile
+end OpenReader
+
+(** Read next character into ch. R.eot is set when the last character is read. The fields lib, voff and col of R give
+information about the last character read. *)
+procedure Read*(R: pointer to Reader; ch: pointer to char)
+  var
+    ref: Piece
+begin
+  if (R.stamp # R.T.stamp) or (R.bufpos >= R.buflen) then
+    if R.stamp = R.T.stamp then
+      ref := R.ref
+      R.bufpos := 0
+      R.buflen := ref.len_ - R.off
+      if R.buflen <= 0 then
+        R.org := R.org + ref.len_
+        R.off := 0
+        ref := ref.next
+        R.ref := ref
+        R.lib := ref.lib
+        R.col := ref.col
+        R.voff := ref.voff
+        if ref.ref >= 0 then
+          SyncPiece(R.T, ref)
+        end
+        Files.Set(@R.R, ref.f, ref.off)
+        R.buflen := ref.len_
+        if ref.f = Wfile then
+          R.eot := true
+        end
+      end
+
+      if R.buflen > BufSize then
+        R.buflen := BufSize
+      end
+      Files.ReadBytes(@R.R, cast(BytesPtr, @R.buf), 64 (* BufSize *), R.buflen)
+    else
+      OpenReader(R, R.T, R.org + R.off)
+      Read(R, ch)
+      return
+    end
+  end
+
+  ch^ := R.buf[R.bufpos]
+  inc(R.bufpos)
+  inc(R.off)
+end Read
+
+// Return reader's position within the text.
+procedure Pos*(R: pointer to Reader): int32
+begin
+  return R.org + R.off
+end Pos
+
+// Open text scanner S and set it up at position pos in text T.
+procedure OpenScanner*(S: pointer to Scanner; T: Text; pos: int32)
+begin
+  OpenReader(S, T, pos)
+  S.line := 0
+  S.class := Inval
+  Read(S, @S.nextCh)
+end OpenScanner
+
+// Scanners --------------- NW ---------------
+
+(*IEEE floating-point formats  (BM 1992.1.1): (-1)^s * 1.m * 2^(e-e0), where
+
+s                 e                 e0              m
+REAL             1-bit     8-bit biased      127    1+23-bit explicit
+LONGREAL   1-bit   11-bit biased     1023   1+52-bit explicit*)
+
+// Read the next symbol. Whitespace is ignored. CR increments the line counter.
+procedure Scan*(S: pointer to Scanner)
+  const
+    maxD = 32 // fixed size: maxD <= LEN(S.s)!
+  var
+    ch, E: char
+    neg, negE, hex, sign: boolean
+    i, j, h, e, k, k1, k2, k3: int32
+    y: longreal
+    d: array 32 (* maxD *) of char
+begin
+  ch := S.nextCh
+  i := 0
+  loop
+    if (S.lib = nil) or ~(S.lib is Fonts.Font) then
+      exit
+    elsif ch = CR then
+      inc(S.line)
+    elsif (ch # " ") & (ch # TAB) & (ch # LF) then
+      exit
+    end
+
+    Read(S, @ch)
+  end
+
+  if S.lib = nil then
+    S.class := Inval
+    S.eot := true
+    Read(S, @ch)
+  elsif ~(S.lib is Fonts.Font) then
+    S.class := Object
+    S.lib.GetObj(S.lib, val(int16, ord(ch)), @S.obj)
+    Read(S, @ch)
+  elsif (41H <= val(int32, band(ord(ch), 0DFH))) & (val(int32, band(ord(ch), 0DFH)) <= 5AH) or (ch = ".") or (ch = "/") then
+    // OR (ch = ":")
+    // name
+    repeat
+      S.s[i] := ch
+      inc(i)
+      Read(S, @ch)
+    until ~nameChars[ord(ch)] or ~(S.lib is Fonts.Font) or (i = val(int32, val(int16, 64) - 1))
+
+    S.s[i] := 0X
+    if (i = 1) & ((val(int32, band(ord(S.s[0]), 0DFH)) < 41H) or (val(int32, band(ord(S.s[0]), 0DFH)) > 5AH)) then
+      S.c := S.s[0]
+      S.class := Char
+    else
+      S.len_ := val(int8, val(int16, i))
+      S.class := Name
+    end
+
+  elsif ch = 22X then
+    // literal string
+    Read(S, @ch)
+    while (ch # 22X) & (ch >= " ") & (S.lib is Fonts.Font) & (i # val(int32, val(int16, 64) - 1)) do
+      S.s[i] := ch
+      inc(i)
+      Read(S, @ch)
+    end
+
+    while (ch # 22X) & (ch >= " ") & (S.lib is Fonts.Font) do
+      Read(S, @ch)
+    end
+    S.s[i] := 0X
+    S.len_ := val(int8, val(int16, i))
+    Read(S, @ch)
+    S.class := String
+  else
+    if ch = "-" then
+      sign := true
+      neg := true
+      Read(S, @ch)
+    elsif ch = "+" then
+      sign := true
+      neg := false
+      Read(S, @ch)
+    else
+      sign := false
+      neg := false
+    end
+
+    if ("0" <= ch) & (ch <= "9") & (S.lib is Fonts.Font) then
+      // number
+      hex := false
+      j := 0
+      loop
+        d[i] := ch
+        inc(i)
+        Read(S, @ch)
+        if (ch < "0") or ~(S.lib is Fonts.Font) or (i >= maxD) then
+          exit
+        end
+        if "9" < ch then
+          if ("A" <= ch) & (ch <= "F") then
+            hex := true
+            ch := chr(val(int16, ord(ch)) - 7)
+          elsif ("a" <= ch) & (ch <= "f") then
+            hex := true
+            ch := chr(val(int16, ord(ch)) - 39)
+          else
+            exit
+          end
+        end
+      end
+
+      if (ch = "H") & (S.lib is Fonts.Font) then
+        // hex number
+        Read(S, @ch)
+        S.class := Int
+        if i - j > 8 then
+          j := i - 8
+        end
+        k := val(int32, val(int16, ord(d[j])) - 48)
+        inc(j)
+        if (i - j = 7) & (k >= 8) then
+          dec(k, 16)
+        end
+        while j < i do
+          k := k * 16 + val(int32, val(int16, ord(d[j])) - 48)
+          inc(j)
+        end
+        if neg then
+          S.i := -k
+        else
+          S.i := k
+        end
+      elsif (ch = ".") & (S.lib is Fonts.Font) then
+        // read real
+        Read(S, @ch)
+        h := i
+        while ("0" <= ch) & (ch <= "9") & (S.lib is Fonts.Font) & (i < maxD) do
+          d[i] := ch
+          inc(i)
+          Read(S, @ch)
+        end
+
+        // -------- begin floating-point handling BM 1993.3.10 -----------------------------------
+        while band(i, 7) # 0 do
+          d[i] := "0"
+          inc(i)
+        end
+        j := 0 // store digits 0..7, 8..15, 16..23, 24..31 in k, k1, k2, k3
+        k := 0
+        k1 := 0
+        k2 := 0
+        k3 := 0
+        while j < 8 do
+          k := k * 10 + val(int32, ord(d[j])) - val(int32, ord("0"))
+          inc(j)
+        end
+        if 8 < i then
+          while j < 16 do
+            k1 := k1 * 10 + val(int32, ord(d[j])) - val(int32, ord("0"))
+            inc(j)
+          end
+        end
+
+        if 16 < i then
+          while j < 24 do
+            k2 := k2 * 10 + val(int32, ord(d[j])) - val(int32, ord("0"))
+            inc(j)
+          end
+        end
+
+        if 24 < i then
+          while j < 32 do
+            k3 := k3 * 10 + val(int32, ord(d[j])) - val(int32, ord("0"))
+            inc(j)
+          end
+        end
+
+        e := 0
+        E := ch
+        if ((E = "D") or (E = "E")) & (S.lib is Fonts.Font) then
+          Read(S, @ch)
+          if (ch = "-") & (S.lib is Fonts.Font) then
+            negE := true
+            Read(S, @ch)
+          else
+            negE := false
+            if (ch = "+") & (S.lib is Fonts.Font) then
+              Read(S, @ch)
+            end
+          end
+
+          while ("0" <= ch) & (ch <= "9") & (S.lib is Fonts.Font) do
+            e := e * 10 + val(int32, ord(ch)) - val(int32, ord("0"))
+            Read(S, @ch)
+          end
+
+          if negE then
+            e := -e
+          end
+        end
+
+        y := val(longreal, k3) * Reals.Ten(-32) + val(longreal, k2) * Reals.Ten(-24)
+        y := y + val(longreal, k1) * Reals.Ten(-16)
+        if abs(e + h) < 308 then
+          y := (y + val(longreal, k) * Reals.Ten(-8)) / Reals.Ten(-e - h)
+        else
+          y := (y + val(longreal, k) * Reals.Ten(-8)) * Reals.Ten(h)
+          if (e <= 308i2 - 32i2) or (e <= 308) & (y < 1.7976931348623157E308 / Reals.Ten(e)) then
+            y := y * Reals.Ten(e)
+          else
+            y := 1.7976931348623157E308
+          end
+        end
+
+        if E = "D" then
+          if y = 1.7976931348623157E308 then
+            S.class := Inval // NaN
+          else
+            S.class := LongReal
+            if neg then
+              S.y := -y
+            else
+              S.y := y
+            end
+            if Reals.ExpoL(S.y) = 0 then
+              S.y := val(longreal, 0)
+            end
+          end
+
+        elsif val(longreal, 3.40282347E38) < y then
+          S.class := Inval // NaN
+        else
+          S.class := Real
+          if neg then
+            S.x := val(real, -y)
+          else
+            S.x := val(real, y)
+          end
+          if Reals.Expo(S.x) = 0 then
+            S.x := val(real, 0)
+          end
+        end
+
+        // -------- end floating-point handling BM 1993.3.10 -----------------------------------
+        if hex then
+          S.class := Inval
+        end
+      else
+        // decimal integer
+        S.class := Int
+        k := 0
+        while (j # i) & ((k < 2147483647i4 div 10i4) or (k = 2147483647i4 div 10i4) & 
+              (val(int32, val(int16, ord(d[j])) - 48) <= 2147483647i4 mod 10i4)) do
+          // JG
+          k := k * 10 + val(int32, val(int16, ord(d[j])) - 48)
+          inc(j)
+        end
+
+        if j # i then
+          S.class := Inval
+        else
+          if neg then
+            S.i := -k
+          else
+            S.i := k
+          end
+          if hex then
+            S.class := Inval
+          else
+            S.class := Int
+          end
+        end
+      end
+
+    else
+      S.class := Char
+      if sign then
+        if neg then
+          S.c := "-"
+        else
+          S.c := "+"
+        end
+      else
+        S.c := ch
+        Read(S, @ch)
+      end
+    end
+  end
+
+  S.nextCh := ch
+end Scan
+
+// Open a new writer W.
+procedure OpenWriter*(W: pointer to Writer)
+begin
+  newgc(W.buf)
+  OpenBuf(W.buf)
+  W.lib := Fonts.Default
+  W.col := 15
+  W.voff := 0
+  Files.Set(@W.R, Files.New(""), 0)
+end OpenWriter
+
+// Set writer W to font fnt.
+procedure SetFont*(W: pointer to Writer; fnt: Objects.Library)
+begin
+  W.lib := fnt
+end SetFont
+
+// Set writer W to color col.
+procedure SetColor*(W: pointer to Writer; col: int8)
+begin
+  W.col := col
+end SetColor
+
+// Set writer W to vertical offset voff. Vertical offset controls the writing of super- and sub-scripts.
+procedure SetOffset*(W: pointer to Writer; voff: int8)
+begin
+  W.voff := voff
+end SetOffset
+
+// Write character ch to writer W's buffer.
+procedure Write*(W: pointer to Writer; ch: char)
+  var
+    p, q: Piece
+begin
+  p := W.buf.last
+  if ~(W.lib is Fonts.Font) or (W.lib # p.lib) or (W.col # p.col) or (W.voff # p.voff) or (Files.Base(@W.R) # p.f) then
+    newgc(q)
+    q.ref := (-32768i2)
+    if ~(W.lib is Fonts.Font) then
+      W.lib.GetObj(W.lib, val(int16, ord(ch)), @q.obj)
+    end
+    q.f := Files.Base(@W.R)
+    q.off := Files.Pos(@W.R)
+    q.len_ := 0
+    q.lib := W.lib
+    q.col := W.col
+    q.voff := W.voff
+    q.next := nil
+    p.next := q
+    q.prev := p
+    p := q
+    W.buf.last := p
+  end
+
+  Files.Write(@W.R, val(byte, ord(ch)))
+  inc(p.len_)
+  inc(W.buf.len_)
+end Write
+
+// Write an end-of-line character to W's buffer.
+procedure WriteLn*(W: pointer to Writer)
+begin
+  Write(W, CR)
+end WriteLn
+
+// Write string s to W's buffer.
+procedure WriteString*(W: pointer to Writer; const s: pointer to array of char)
+  var
+    i: int32
+begin
+  i := 0
+  while s[i] # 0X do
+    Write(W, s[i])
+    inc(i)
+  end
+end WriteString
+
+// Write integer x to W's buffer. Spaces are padded to the left until the number field is at least n characters long.
+procedure WriteInt*(W: pointer to Writer; x, n: int32)
+  var
+    i, x0: int32
+    a: array 10 of char
+begin
+  i := 0
+  if x < 0 then
+    if x = (-2147483647-1) then
+      WriteString(W, " -2147483648")
+      return
+    else
+      dec(n)
+      x0 := -x
+    end
+
+  else
+    x0 := x
+  end
+
+  repeat
+    a[i] := chr(obmod(x0, 10) + 48)
+    x0 := obdiv(x0, 10)
+    inc(i)
+  until x0 = 0
+
+  while n > i do
+    Write(W, " ")
+    dec(n)
+  end
+  if x < 0 then
+    Write(W, "-")
+  end
+  repeat
+    dec(i)
+    Write(W, a[i])
+  until i = 0
+end WriteInt
+
+// Write a hexadecimal representation of x to W's buffer.
+procedure WriteHex*(W: pointer to Writer; x: int32)
+  var
+    i, y: int32
+    a: array 10 of char
+begin
+  i := 0
+  Write(W, " ")
+  repeat
+    y := band(x, 15)
+    if y < 10 then
+      a[i] := chr(y + 48)
+    else
+      a[i] := chr(y + 55)
+    end
+    x := asr(x, 4)
+    inc(i)
+  until i = 8
+
+  repeat
+    dec(i)
+    Write(W, a[i])
+  until i = 0
+end WriteHex
+
+// Write the hexadecimal representation of x to W's buffer.
+procedure WriteRealHex*(W: pointer to Writer; x: real)
+begin
+  // BM 1991.12.25
+  WriteHex(W, Reals.Int(x))
+end WriteRealHex
+
+// Write the hexadecimal representation of x to W's buffer.
+procedure WriteLongRealHex*(W: pointer to Writer; x: longreal)
+  var
+    h: int32 // BM 1991.12.25
+    l: int32
+begin
+  Reals.IntL(x, @h, @l)
+  WriteHex(W, h)
+  WriteHex(W, l)
+end WriteLongRealHex
+
+// Write real x to W's buffer using n character positions.
+procedure WriteReal*(W: pointer to Writer; x: real; n: int32)
+  // BM 1993.4.22. Do not simplify rounding!
+  var
+    e, h, i: int32
+    y: longreal
+    z: real
+    d: array 8 of char
+begin
+  e := Reals.Expo(x)
+  if e = 255 then
+    while n > 8 do
+      Write(W, " ")
+      dec(n)
+    end
+    h := Reals.NaNCode(x)
+    if h # 0 then
+      WriteString(W, "     NaN")
+    elsif x < val(real, 0) then
+      WriteString(W, "    -INF")
+    else
+      WriteString(W, "      INF")
+    end
+
+  else
+    if n <= 8 then
+      n := 1
+    else
+      dec(n, 7)
+    end
+    repeat
+      Write(W, " ") // 0 <= n <= 7 fraction digits
+      dec(n)
+    until n <= 7
+    if (e # 0) & (x < val(real, 0)) then
+      Write(W, "-")
+      x := -x
+    else
+      Write(W, " ")
+    end
+    if e = 0 then
+      h := 0 // no denormals
+    else
+      e := obdiv((e - 127) * 301, 1000) // ln(2)/ln(10) = 0.301029996
+      if e < 38 then
+        z := val(real, Reals.Ten(e + 1))
+        if x >= z then
+          y := val(longreal, x) / val(longreal, z)
+          inc(e)
+        else
+          y := val(longreal, x) * Reals.Ten(-e)
+        end
+      else
+        y := val(longreal, x) * Reals.Ten(-38)
+      end
+      if y >= val(longreal, 10) then
+        y := y * Reals.Ten(-1) + 0.5 / Reals.Ten(n)
+        inc(e)
+      else
+        y := y + 0.5 / Reals.Ten(n)
+        if y >= val(longreal, 10) then
+          y := y * Reals.Ten(-1)
+          inc(e)
+        end
+      end
+
+      y := y * Reals.Ten(7)
+      h := val(int32, floor(y))
+    end
+
+    i := 7
+    while i >= 0 do
+      d[i] := chr(obmod(h, 10) + val(int32, ord("0")))
+      h := obdiv(h, 10)
+      dec(i)
+    end
+    Write(W, d[0])
+    Write(W, ".")
+    i := 1
+    while i <= n do
+      Write(W, d[i])
+      inc(i)
+    end
+    if e < 0 then
+      WriteString(W, "E-")
+      e := -e
+    else
+      WriteString(W, "E+")
+    end
+    Write(W, chr(obdiv(e, 10) + val(int32, ord("0"))))
+    Write(W, chr(obmod(e, 10) + val(int32, ord("0"))))
+  end
+end WriteReal
+
+(** Write real x in a fixed point notation. n is the overall minimal length for the output field,
+f the number of fraction digits following the decimal point, E the fixed exponent (printed only
+when E # 0). *)
+procedure WriteRealFix*(W: pointer to Writer; x: real; n, f, E: int32)
+  // BM 1993.4.22. Do not simplify rounding ! / JG formatting adjusted
+  var
+    e, h, i: int32
+    r, y: longreal
+    z: real
+    s: char
+    d: array 8 of char
+begin
+  e := Reals.Expo(x)
+  if (e = 255) or (abs(E) > 38) then
+    while n > 8 do
+      Write(W, " ")
+      dec(n)
+    end
+    h := Reals.NaNCode(x)
+    if h # 0 then
+      WriteString(W, "     NaN")
+    elsif x < val(real, 0) then
+      WriteString(W, "    -INF")
+    else
+      WriteString(W, "      INF")
+    end
+
+  else
+    if E = 0 then
+      dec(n, 2)
+    else
+      dec(n, 6)
+    end
+    if f < 0 then
+      f := 0
+    end
+    if n < f + 2 then
+      n := f + 2
+    end
+    dec(n, f)
+    if (e # 0) & (x < val(real, 0)) then
+      s := "-"
+      x := -x
+    else
+      s := " "
+    end
+    if e = 0 then
+      h := 0 // no denormals
+      dec(e, E - 1)
+    else
+      e := obdiv((e - 127) * 301, 1000) // ln(2)/ln(10) = 0.301029996
+      if e < 38 then
+        z := val(real, Reals.Ten(e + 1))
+        if x >= z then
+          y := val(longreal, x) / val(longreal, z)
+          inc(e)
+        else
+          y := val(longreal, x) * Reals.Ten(-e)
+        end
+      else
+        y := val(longreal, x) * Reals.Ten(-38)
+      end
+      dec(e, E - 1)
+      i := -(e + f)
+      if i <= 0 then
+        r := val(longreal, 5) * Reals.Ten(i)
+      else
+        r := val(longreal, 0)
+      end
+      if y >= val(longreal, 10) then
+        y := y * Reals.Ten(-1) + r
+        inc(e)
+      else
+        y := y + r
+        if y >= val(longreal, 10) then
+          y := y * Reals.Ten(-1)
+          inc(e)
+        end
+      end
+
+      y := y * Reals.Ten(7)
+      h := val(int32, floor(y))
+    end
+
+    i := 7
+    while i >= 0 do
+      d[i] := chr(obmod(h, 10) + val(int32, ord("0")))
+      h := obdiv(h, 10)
+      dec(i)
+    end
+    if n <= e then
+      n := e + 1
+    end
+    if e > 0 then
+      while n > e do
+        Write(W, " ")
+        dec(n)
+      end
+      Write(W, s)
+      e := 0
+      while n > 0 do
+        dec(n)
+        if e < 8 then
+          Write(W, d[e])
+          inc(e)
+        else
+          Write(W, "0")
+        end
+      end
+
+      Write(W, ".")
+    else
+      while n > 1 do
+        Write(W, " ")
+        dec(n)
+      end
+      Write(W, s)
+      Write(W, "0")
+      Write(W, ".")
+      while (0 < f) & (e < 0) do
+        Write(W, "0")
+        dec(f)
+        inc(e)
+      end
+    end
+
+    while f > 0 do
+      dec(f)
+      if e < 8 then
+        Write(W, d[e])
+        inc(e)
+      else
+        Write(W, "0")
+      end
+    end
+
+    if E # 0 then
+      if E < 0 then
+        WriteString(W, "E-")
+        E := -E
+      else
+        WriteString(W, "E+")
+      end
+
+      Write(W, chr(obdiv(E, 10) + val(int32, ord("0"))))
+      Write(W, chr(obmod(E, 10) + val(int32, ord("0"))))
+    end
+  end
+end WriteRealFix
+
+// Write LONGREAL x to W's buffer using n character positions.
+procedure WriteLongReal*(W: pointer to Writer; x: longreal; n: int32)
+  // BM 1993.4.22. Do not simplify rounding!
+  var
+    e, h, l, i: int32
+    z: longreal
+    d: array 16 of char
+begin
+  e := Reals.ExpoL(x)
+  if e = 2047 then
+    while n > 9 do
+      Write(W, " ")
+      dec(n)
+    end
+    Reals.NaNCodeL(x, @h, @l)
+    if (h # 0) or (l # 0) then
+      WriteString(W, "      NaN")
+    elsif x < val(longreal, 0) then
+      WriteString(W, "     -INF")
+    else
+      WriteString(W, "      INF")
+    end
+
+  else
+    if n <= 9 then
+      n := 1
+    else
+      dec(n, 8)
+    end
+    repeat
+      Write(W, " ") // 0 <= n <= 15 fraction digits
+      dec(n)
+    until n <= 15
+    if (e # 0) & (x < val(longreal, 0)) then
+      Write(W, "-")
+      x := -x
+    else
+      Write(W, " ")
+    end
+    if e = 0 then
+      h := 0 // no denormals
+      l := 0
+    else
+      e := obdiv((e - 1023) * 301029, 1000000) // ln(2)/ln(10) = 0.301029996
+      z := Reals.Ten(e + 1)
+      if x >= z then
+        x := x / z
+        inc(e)
+      else
+        x := x * Reals.Ten(-e)
+      end
+      if x >= val(longreal, 10) then
+        x := x * Reals.Ten(-1) + 0.5 / Reals.Ten(n)
+        inc(e)
+      else
+        x := x + 0.5 / Reals.Ten(n)
+        if x >= val(longreal, 10) then
+          x := x * Reals.Ten(-1)
+          inc(e)
+        end
+      end
+
+      x := x * Reals.Ten(7)
+      h := val(int32, floor(x))
+      x := (x - val(longreal, h)) * Reals.Ten(8)
+      l := val(int32, floor(x))
+    end
+
+    i := 15
+    while i > 7 do
+      d[i] := chr(obmod(l, 10) + val(int32, ord("0")))
+      l := obdiv(l, 10)
+      dec(i)
+    end
+    while i >= 0 do
+      d[i] := chr(obmod(h, 10) + val(int32, ord("0")))
+      h := obdiv(h, 10)
+      dec(i)
+    end
+    Write(W, d[0])
+    Write(W, ".")
+    i := 1
+    while i <= n do
+      Write(W, d[i])
+      inc(i)
+    end
+    if e < 0 then
+      WriteString(W, "D-")
+      e := -e
+    else
+      WriteString(W, "D+")
+    end
+    Write(W, chr(obdiv(e, 100) + val(int32, ord("0"))))
+    e := obmod(e, 100)
+    Write(W, chr(obdiv(e, 10) + val(int32, ord("0"))))
+    Write(W, chr(obmod(e, 10) + val(int32, ord("0"))))
+  end
+end WriteLongReal
+
+// Write LONGREAL x in a fixed point notation. n is the overall minimal length for the output field, 
+// f the number of fraction digits following the decimal point, D the fixed exponent (printed only when D # 0)
+procedure WriteLongRealFix*(W: pointer to Writer; x: longreal; n, f, D: int32)
+  // BM 1993.4.22. Do not simplify rounding! / JG formatting adjusted
+  var
+    e, h, l, i: int32
+    r, z: longreal
+    d: array 16 of char
+    s: char
+begin
+  e := Reals.ExpoL(x)
+  if (e = 2047) or (abs(D) > 308) then
+    while n > 9 do
+      Write(W, " ")
+      dec(n)
+    end
+    Reals.NaNCodeL(x, @h, @l)
+    if (h # 0) or (l # 0) then
+      WriteString(W, "      NaN")
+    elsif x < val(longreal, 0) then
+      WriteString(W, "     -INF")
+    else
+      WriteString(W, "      INF")
+    end
+
+  else
+    if D = 0 then
+      dec(n, 2)
+    else
+      dec(n, 7)
+    end
+    if n < 2 then
+      n := 2
+    end
+    if f < 0 then
+      f := 0
+    end
+    if n < f + 2 then
+      n := f + 2
+    end
+    dec(n, f)
+    if (e # 0) & (x < val(longreal, 0)) then
+      s := "-"
+      x := -x
+    else
+      s := " "
+    end
+    if e = 0 then
+      h := 0 // no denormals
+      l := 0
+      dec(e, D - 1)
+    else
+      e := obdiv((e - 1023) * 301029, 1000000) // ln(2)/ln(10) = 0.301029996
+      z := Reals.Ten(e + 1)
+      if x >= z then
+        x := x / z
+        inc(e)
+      else
+        x := x * Reals.Ten(-e)
+      end
+      dec(e, D - 1)
+      i := -(e + f)
+      if i <= 0 then
+        r := val(longreal, 5) * Reals.Ten(i)
+      else
+        r := val(longreal, 0)
+      end
+      if x >= val(longreal, 10) then
+        x := x * Reals.Ten(-1) + r
+        inc(e)
+      else
+        x := x + r
+        if x >= val(longreal, 10) then
+          x := x * Reals.Ten(-1)
+          inc(e)
+        end
+      end
+
+      x := x * Reals.Ten(7)
+      h := val(int32, floor(x))
+      x := (x - val(longreal, h)) * Reals.Ten(8)
+      l := val(int32, floor(x))
+    end
+
+    i := 15
+    while i > 7 do
+      d[i] := chr(obmod(l, 10) + val(int32, ord("0")))
+      l := obdiv(l, 10)
+      dec(i)
+    end
+    while i >= 0 do
+      d[i] := chr(obmod(h, 10) + val(int32, ord("0")))
+      h := obdiv(h, 10)
+      dec(i)
+    end
+    if n <= e then
+      n := e + 1
+    end
+    if e > 0 then
+      while n > e do
+        Write(W, " ")
+        dec(n)
+      end
+      Write(W, s)
+      e := 0
+      while n > 0 do
+        dec(n)
+        if e < 16 then
+          Write(W, d[e])
+          inc(e)
+        else
+          Write(W, "0")
+        end
+      end
+
+      Write(W, ".")
+    else
+      while n > 1 do
+        Write(W, " ")
+        dec(n)
+      end
+      Write(W, s)
+      Write(W, "0")
+      Write(W, ".")
+      while (0 < f) & (e < 0) do
+        Write(W, "0")
+        dec(f)
+        inc(e)
+      end
+    end
+
+    while f > 0 do
+      dec(f)
+      if e < 16 then
+        Write(W, d[e])
+        inc(e)
+      else
+        Write(W, "0")
+      end
+    end
+
+    if D # 0 then
+      if D < 0 then
+        WriteString(W, "D-")
+        D := -D
+      else
+        WriteString(W, "D+")
+      end
+
+      Write(W, chr(obdiv(D, 100) + val(int32, ord("0"))))
+      D := obmod(D, 100)
+      Write(W, chr(obdiv(D, 10) + val(int32, ord("0"))))
+      Write(W, chr(obmod(D, 10) + val(int32, ord("0"))))
+    end
+  end
+end WriteLongRealFix
+
+// Write the time and date to W's buffer.
+procedure WriteDate*(W: pointer to Writer; t, d: int32)
+
+  procedure WritePair(ch: char; x: int32; W: pointer to Writer)
+  begin
+    Write(W, ch)
+    Write(W, chr(obdiv(x, 10) + 48))
+    Write(W, chr(obmod(x, 10) + 48))
+  end WritePair
+begin
+  WritePair(" ", band(d, 31), W)
+  WritePair(".", band(asr(d, 5), 15), W)
+  Write(W, ".")
+  WriteInt(W, 1900 + asr(d, 9), 1)
+  WritePair(" ", band(asr(t, 12), 31), W)
+  WritePair(":", band(asr(t, 6), 63), W)
+  WritePair(":", band(t, 63), W)
+end WriteDate
+
+// Write a SET value to writer W.
+
+procedure WriteSet*(W: pointer to Writer; s: set)
+
+  var
+    i, last: int32
+    dots: boolean
+begin
+  Write(W, "{")
+  last := (-2147483647-1)
+  for i := 0 to 31 do
+    if i in s then
+      if last = i - 1 then
+        if dots then
+          WriteString(W, " .. ")
+          dots := false
+        end
+
+        if (i = val(int32, 31)) or ~(i + 1 in s) then
+          WriteInt(W, i, 0)
+        end
+
+      else
+        if last >= val(int32, 0) then
+          WriteString(W, ", ")
+        end
+
+        WriteInt(W, i, 0)
+        dots := true
+      end
+
+      last := i
+    end
+  end
+
+  Write(W, "}")
+end WriteSet
+
+// Write obj to writer W.
+procedure WriteObj*(W: pointer to Writer; obj: Objects.Object)
+  var
+    lib: Objects.Library
+begin
+  if (obj.lib = nil) or (obj.ref < 0) or (obj.lib.name = "") then
+    // free or private
+    if obs = nil then
+      newgc(obs)
+      Objects.OpenLibrary(obs)
+    end
+
+    obs.GenRef(obs, @obj.ref)
+    if obj.ref >= 256 then
+      newgc(obs)
+      Objects.OpenLibrary(obs)
+      obs.GenRef(obs, @obj.ref)
+    end
+
+    obs.PutObj(obs, obj.ref, obj)
+  end
+
+  assert(obj.ref < 256)
+  lib := W.lib
+  SetFont(W, obj.lib)
+  Write(W, chr(obj.ref))
+  SetFont(W, lib)
+end WriteObj
+
+procedure InitScan()
+  var
+    i: int32
+begin
+  for i := 0 to 255 do
+    nameChars[i] := false
+  end
+  for i := 128i2 to 150i2 do
+    nameChars[i] := true // german characters
+  end
+  for i := val(int16, ord("0")) to val(int16, ord("9")) do
+    nameChars[i] := true
+  end
+  for i := val(int16, ord("A")) to val(int16, ord("Z")) do
+    nameChars[i] := true
+  end
+  for i := val(int16, ord("a")) to val(int16, ord("z")) do
+    nameChars[i] := true
+  end
+  nameChars[ord("@")] := true // mail, compiler
+  nameChars[ord(".")] := true // mail, filenames, compiler
+  nameChars[ord("/")] := true // filenames
+  nameChars[ord(":")] := true // filenames (Mac)
+  nameChars[ord("_")] := true
+end InitScan
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "New" end return New end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Texts", cmd_)
+  TextBlockId := 0F0X
+  DocBlockId := 0F7X
+  NoSpex := 0X
+  TextSpex := 1X
+  NoSpex2 := 2X
+  H := Handle
+  Wfile := Files.New("")
+  Files.Set(@R, Wfile, 0)
+  Files.Write(@R, val(byte, ord(0X)))
+  newgc(DelBuf)
+  OpenBuf(DelBuf)
+  InitScan()
+  obs := nil
+end Texts.

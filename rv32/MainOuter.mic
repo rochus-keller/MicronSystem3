@@ -1,0 +1,17 @@
+module Main [level=5] // the boot file of the Micron Oberon System 3
+
+import 
+  // inner core
+  Heaps, Kernel, Modules, Disks, SDDisks, OFS, OFSDiskVolumes, OFSAosFiles,
+  OFSCacheVolumes, OFSBoot, Boot, Files, __mic,
+  // outer core
+  Objects, CLUTs, Display, Fonts, Input,
+  VMInput, Texts, Viewers, Oberon, MenuViewers, TextFrames, System 
+  
+begin
+  Modules.Register("Kernel", Kernel.cmd_)
+
+  Kernel.Hello("Micron Oberon System 3")
+  System.Init() // opens the initial viewers and enters Oberon.Loop
+end Main.
+

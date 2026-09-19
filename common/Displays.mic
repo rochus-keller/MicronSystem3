@@ -1,0 +1,423 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Displays [level=5]
+
+import SYS, Modules
+// pjm
+
+// formats for Transfer.  value = bytes per pixel.
+
+const
+  index8* = 1
+  color565* = 2
+  color888* = 3
+  color8888* = 4
+
+  // operations for Transfer.
+  get* = 0
+  set_* = 1
+
+  // color components.
+  red* = 16711680
+  green* = 65280i4
+  blue* = 255i2
+
+  trans* = val(int32, 2147483648) // transparency for Mask.
+  invert* = 1073741824 // inverting.
+  (*
+  alpha = 0C0000000H; (** alpha blending. *)
+  *)
+
+  BufSize = 65536
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  SetPtr = pointer to set // helper type for a variable reinterpreted by SYSTEM.VAL
+
+  Display* = object
+
+    width*: int32 // dimensions of visible display.
+    height*, offscreen*: int32 // number of non-visible lines at the bottom of the display.
+    format*: int32 // format for Transfer.
+    unit*: int32 // approximate square pixel size = unit/36000 mm.
+    fblow, fbhigh, fbstride: int32
+  end
+  PDisplay* = pointer to Display
+procedure ^ (self: PDisplay) Transfer*(buf: pointer to array of char; buf_len: int32; ofs, stride, x, y, w, h, op: int32)
+procedure ^ (self: PDisplay) ColorToIndex*(col: int32): int32
+
+// Transfer a block of pixels in "raw" display format to (op = set) or from (op = get) the display.  Pixels in the rectangular 
+// area are transferred from left to right and top to bottom.  The pixels are transferred to or from "buf", starting at "ofs".  
+// The line byte increment is "stride", which may be positive, negative or zero.
+
+// convert to bytes
+
+// index check
+
+// index check
+
+// skip
+
+// Fill a rectangle in color "col".
+
+// Equivalent to Fill(col, x, y, 1, 1).
+
+// {EXCLUSIVE}
+// opaque or invert
+
+// invert
+
+// Transfer a block of pixels from a 1-bit mask to the display.  Pixels in the rectangular area are transferred from left to right 
+// and top to bottom.  The pixels are transferred from "buf", starting at bit offset "bitofs".  The line byte increment is "stride", 
+// which may be positive, negative or zero. "fg" and "bg" specify the colors for value 1 and 0 pixels respectively.
+
+// invert special
+// invert special
+// p always aligned to 32-bit boundary
+
+// invert
+
+// invert
+
+// moved outside s
+
+// Copy source block sx, sy, w, h to destination dx, dy.  Overlap is allowed.
+
+// Map a color value to an 8-bit CLUT index.  Only used if format = index8.
+
+// default implementation is not very useful and should be overridden.
+
+// Map an 8-bit CLUT index to a color value.  Only used if format = index8.
+
+// default implementation is not very useful and should be overridden.
+
+// Initialize a linear frame buffer for Transfer.
+
+// same sign, for index check in Transfer
+
+(*
+(** Draw a line. *)
+PROCEDURE Line*(col, x1, y1, x2, y2: LONGINT); (* error term, major, minor? *)
+BEGIN
+HALT(99)
+END Line;
+
+(* Like Mask, but replicate the mask in the specified rectangular area. *)
+PROCEDURE ReplMask*(VAR buf: ARRAY OF CHAR; bitofs, stride, fg, bg, px, py, pw, ph, x, y, w, h: LONGINT);
+BEGIN
+HALT(99)
+END ReplMask;
+*)
+
+var
+  main*: PDisplay
+  buf: pointer to array of char
+
+procedure Fill0(d: PDisplay; col, x, y, w, h: int32)
+  var
+    j: int32
+    p: AnyPtr
+    w0, h0, s: int32
+    t, c: set
+    invert: boolean
+begin
+  // {EXCLUSIVE}
+  if (w > 0) & (h > 0) & (col >= 0) then
+    // opaque or invert
+    invert := sigc(shl(val(int32, col), 1)) < 0
+    if buf = nil then
+      newgc(buf, BufSize)
+    end
+    case d.format of
+      1 (* index8 *):
+      s := 4
+      col := d.ColorToIndex(col)
+      c := bset(usig(sigc(shl(val(int32, col), 24)) + sigc(shl(val(int32, col), 16)) + sigc(shl(val(int32, col), 8)) + col))
+    | 2 (* color565 *):
+      s := 4
+      col := val(int32, ord(bset(usig(asr(col, 8))) * {11..15} + bset(usig(asr(col, 5))) * {5..10} + bset(usig(asr(col, 3))) * {0..4}))
+
+      c := bset(usig(sigc(shl(val(int32, col), 16)) + band(col, 65535)))
+    | 3 (* color888 *):
+      s := 3
+      c := bset(usig(band(col, 16777215)))
+    | 4 (* color8888 *):
+      s := 4
+      c := bset(usig(band(col, 16777215)))
+    end
+
+    w0 := w * d.format // -3 for 32-bit loops below
+    h0 := obdiv(val(int32, BufSize) - 3, w0)
+    assert(h0 > 0)
+    if h < h0 then
+      h0 := h
+    end
+    if ~invert then
+      p := cast(AnyPtr, @buf[0])
+      for j := 0 to obdiv(w0 * h0 - 1, s) do
+        cast(SetPtr, p)^ := c
+        inc(p, s)
+      end
+    else
+      if c = {} then
+        c := {0..31}
+      end
+    end
+
+    loop
+      if invert then
+        d.Transfer(buf, val(int32, BufSize), 0, w0, x, y, w, h0, get)
+        p := cast(AnyPtr, @buf[0])
+        for j := 0 to obdiv(w0 * h0 - 1, s) do
+          t := cast(SetPtr, p)^
+          cast(SetPtr, p)^ := t / c
+          inc(p, s)
+        end
+      end
+
+      d.Transfer(buf, val(int32, BufSize), 0, w0, x, y, w, h0, set_)
+      dec(h, h0)
+      if h <= 0 then
+        exit
+      end
+      inc(y, h0)
+      if h < h0 then
+        h0 := h
+      end
+    end
+  end
+end Fill0
+
+procedure Copy0(d: PDisplay; sx, sy, w, h, dx, dy: int32)
+  var
+    w0, h0, s: int32
+begin
+  // {EXCLUSIVE}
+  if (w > 0) & (h > 0) then
+    if buf = nil then
+      newgc(buf, BufSize)
+    end
+    w0 := w * d.format
+    h0 := obdiv(val(int32, BufSize), w0)
+    assert(h0 > 0)
+    if (sy >= dy) or (h <= h0) then
+      s := 1
+    else
+      s := -1
+      inc(sy, h - h0)
+      inc(dy, h - h0)
+    end
+
+    loop
+      if h < h0 then
+        if s = -1 then
+          inc(sy, h0 - h)
+          inc(dy, h0 - h)
+        end
+        h0 := h
+      end
+
+      d.Transfer(buf, val(int32, BufSize), 0, w0, sx, sy, w, h0, get)
+      d.Transfer(buf, val(int32, BufSize), 0, w0, dx, dy, w, h0, set_)
+      dec(h, h0)
+      if h <= 0 then
+        exit
+      end
+      inc(sy, s * h0)
+      inc(dy, s * h0)
+    end
+  end
+end Copy0
+
+procedure (self: PDisplay) Transfer*(buf: pointer to array of char; buf_len: int32; ofs, stride, x, y, w, h, op: int32)
+  var
+    bufadr, buflow, bufhigh: AnyPtr
+    dispadr: int32
+begin
+  if w > 0 then
+    assert(self.fblow # 0)
+    w := w * self.format
+    bufadr := cast(AnyPtr, @buf[ofs])
+    dispadr := self.fblow + (y * self.width + x) * self.format
+    case op of
+      1 (* set_ *):
+      while h > 0 do
+        assert((dispadr >= self.fblow) & (dispadr + w <= self.fbhigh))
+        SYS.MOVE(bufadr, ptroff(AnyPtr{0}, dispadr), w)
+        inc(bufadr, stride)
+        inc(dispadr, self.fbstride)
+        dec(h)
+      end
+
+    | 0 (* get *):
+      buflow := cast(AnyPtr, @buf[0])
+      bufhigh := buflow
+      inc(bufhigh, buf_len)
+      while h > 0 do
+        assert((ord(bufadr) >= ord(buflow)) & (ord(ptroff(bufadr, w)) <= ord(bufhigh)))
+        SYS.MOVE(ptroff(AnyPtr{0}, dispadr), bufadr, w)
+        inc(bufadr, stride)
+        inc(dispadr, self.fbstride)
+        dec(h)
+      end
+
+    else
+    end
+  end
+end Transfer
+
+procedure (self: PDisplay) Fill*(col, x, y, w, h: int32)
+begin
+  Fill0(self, col, x, y, w, h)
+end Fill
+
+procedure (self: PDisplay) Dot*(col, x, y: int32)
+  type
+    Buf = array 4 of char
+    PBuf = pointer to Buf
+  var
+    t, c: set
+begin
+  if col >= 0 then
+    case self.format of
+      1 (* index8 *):
+      c := bset(usig(self.ColorToIndex(col)))
+    | 2 (* color565 *):
+      c := bset(usig(asr(col, 8))) * {11..15} + bset(usig(asr(col, 5))) * {5..10} + bset(usig(asr(col, 3))) * {0..4}
+
+    | 3 (* color888 *), 4 (* color8888 *):
+      c := bset(usig(band(col, 16777215)))
+    end
+
+    if sigc(shl(val(int32, col), 1)) < 0 then
+      if c = {} then
+        c := {0..31}
+      end
+      self.Transfer(cast(PBuf, @t), 4, 0, self.format, x, y, 1, 1, get)
+      c := t / c
+    end
+
+    self.Transfer(cast(PBuf, @c), 4, 0, self.format, x, y, 1, 1, set_)
+  end
+end Dot
+
+procedure (self: PDisplay) Mask*(buf: pointer to array of char; bitofs, stride, fg, bg, x, y, w, h: int32)
+  type
+    Buf = array 4 of char
+    PBuf = pointer to Buf
+  var
+    p: AnyPtr
+    i: int32
+    s, fgc, bgc, t: set
+begin
+  if (w > 0) & (h > 0) then
+    case self.format of
+      1 (* index8 *):
+      if fg >= 0 then
+        fgc := bset(usig(self.ColorToIndex(fg)))
+      end
+      if bg >= 0 then
+        bgc := bset(usig(self.ColorToIndex(bg)))
+      end
+    | 2 (* color565 *):
+      fgc := bset(usig(asr(fg, 8))) * {11..15} + bset(usig(asr(fg, 5))) * {5..10} + bset(usig(asr(fg, 3))) * {0..4}
+
+      bgc := bset(usig(asr(bg, 8))) * {11..15} + bset(usig(asr(bg, 5))) * {5..10} + bset(usig(asr(bg, 3))) * {0..4}
+
+    | 3 (* color888 *), 4 (* color8888 *):
+      fgc := bset(usig(band(fg, 16777215)))
+      bgc := bset(usig(band(bg, 16777215)))
+    end
+
+    if (sigc(shl(val(int32, fg), 1)) < 0) & (fgc = {}) then
+      fgc := {0..31}
+    end
+    if (sigc(shl(val(int32, bg), 1)) < 0) & (bgc = {}) then
+      bgc := {0..31}
+    end
+    p := cast(AnyPtr, @buf[0])
+    inc(p, asr(bitofs, 5) * 4)
+    bitofs := band(bitofs, 31)
+    stride := stride * 8
+    loop
+      s := cast(SetPtr, p)^
+      i := bitofs
+      loop
+        if band(i, 31) in s then
+          if fg >= 0 then
+            if sigc(shl(val(int32, fg), 1)) < 0 then
+              self.Transfer(cast(PBuf, @t), 4, 0, self.format, x + i - bitofs, y, 1, 1, get)
+              t := t / fgc
+            else
+              t := fgc
+            end
+
+            self.Transfer(cast(PBuf, @t), 4, 0, self.format, x + i - bitofs, y, 1, 1, set_)
+          end
+
+        else
+          if bg >= 0 then
+            if sigc(shl(val(int32, bg), 1)) < 0 then
+              self.Transfer(cast(PBuf, @t), 4, 0, self.format, x + i - bitofs, y, 1, 1, get)
+              t := t / bgc
+            else
+              t := bgc
+            end
+
+            self.Transfer(cast(PBuf, @t), 4, 0, self.format, x + i - bitofs, y, 1, 1, set_)
+          end
+        end
+
+        inc(i)
+        if i - bitofs = w then
+          exit
+        end
+        if band(i, 31) = 0 then
+          s := cast(SetPtr, ptroff(p, asr(i, 3)))^
+        end
+      end
+
+      dec(h)
+      if h = 0 then
+        exit
+      end
+      inc(y)
+      inc(bitofs, stride)
+      if (bitofs >= 32) or (bitofs < 0) then
+        inc(p, asr(bitofs, 5) * 4)
+        bitofs := band(bitofs, 31)
+      end
+    end
+  end
+end Mask
+
+procedure (self: PDisplay) Copy*(sx, sy, w, h, dx, dy: int32)
+begin
+  Copy0(self, sx, sy, w, h, dx, dy)
+end Copy
+
+procedure (self: PDisplay) ColorToIndex*(col: int32): int32
+begin
+  return val(int32, ord(bset(usig(asr(col, 16))) * {5..7} + bset(usig(asr(col, 11))) * {2..4} + bset(usig(asr(col, 6))) * {0..1}))
+end ColorToIndex
+
+procedure (self: PDisplay) IndexToColor*(index: int32): int32
+begin
+  return sigc(shl(val(int32, ord(bset(usig(index)) * {5..7})), 16)) + sigc(shl(val(int32, ord(bset(usig(index)) * {2..4})), 11)) + 
+            sigc(shl(val(int32, ord(bset(usig(index)) * {0..1})), 6))
+end IndexToColor
+
+procedure (self: PDisplay) InitFrameBuffer*(adr, size_: int32)
+begin
+  assert(self.width * (self.height + self.offscreen) * self.format <= size_)
+  self.fblow := adr
+  self.fbhigh := self.fblow + size_
+  self.fbstride := self.width * self.format
+  assert(asr(self.fblow, 31) = asr(self.fbhigh, 31))
+end InitFrameBuffer
+
+begin
+  Modules.Register("Displays", nil)
+  buf := nil
+end Displays.

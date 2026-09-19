@@ -1,0 +1,81 @@
+module DisplayLinear [level=5] // linear frame buffer driver for the RV32 emulator
+
+// New module using the linear, top-down frame buffer
+// address, dimensions and pixel format are read from the device registers of the machine
+
+import Kernel, Modules, Displays
+
+const Header = "DisplayLinear: "
+
+var display: Displays.PDisplay
+
+procedure InitPalette()
+  // a 3-3-2 palette, as expected by Displays.ColorToIndex
+  var i, r, g, b: int32
+begin
+  for i := 0 to 255 do
+    r := band(i, 0E0H) div 20H * 24H
+    g := band(i, 01CH) div 4 * 24H
+    b := band(i, 3) * 55H
+    Kernel.SetPalette(i, r * 010000H + g * 0100H + b)
+  end
+end InitPalette
+
+procedure Install*()
+begin
+  if display # nil then
+    Displays.main := display
+  end
+end Install
+
+procedure Init()
+  var w, h, f, stride, adr, mem: int32
+begin
+  if ~Kernel.FBPresent() then
+    Kernel.WriteString(Header)
+    Kernel.WriteString("no frame buffer, the machine was started without --fb")
+    Kernel.WriteLn()
+    display := nil
+    return
+  end
+  adr := Kernel.FBAdr()
+  w := Kernel.FBWidth()
+  h := Kernel.FBHeight()
+  f := Kernel.FBFormat()
+  stride := Kernel.FBStride()
+  mem := stride * h
+
+  newgc(display)
+  display.width := stride div f // the frame buffer may have padded lines
+  display.height := h
+  display.offscreen := 0
+  display.format := f
+  display.unit := 10000
+  display.InitFrameBuffer(adr, mem)
+  if f = Displays.index8 then
+    InitPalette()
+  end
+
+  Kernel.WriteString(Header)
+  Kernel.WriteInt(w, 0)
+  Kernel.WriteChar("x")
+  Kernel.WriteInt(h, 0)
+  Kernel.WriteChar("x")
+  Kernel.WriteInt(f * 8, 0)
+  Kernel.WriteString(" at ")
+  Kernel.WriteHex(adr, 8)
+  Kernel.WriteLn()
+end Init
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Install" end return Install end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("DisplayLinear", cmd_)
+  Init()
+end DisplayLinear.
