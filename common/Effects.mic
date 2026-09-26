@@ -1,0 +1,1173 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Effects [level=5]
+
+import Display, Display3, Input, Oberon, Modules
+// portable
+// jm 18.1.95
+
+(**Implements special effects and encapsulates a few platform dependent features.
+*)
+(*
+THIS IS THE NATIVE VERSION
+
+jm 22.2.93 - removed max screen
+6.5.94 - Improved palette
+20.9.94 - better usage of the background bitmap
+15.11.94 - removed selectpat to Display3
+-removed middle, right, left
+- removed ticks per sec
+- removed font
+16.11.94 - Added callback for SizeRect
+pjm 13.01.96 - inverting arrow cursor
+pjm 28.03.96 - flying cursor (thanks PM)
+*)
+
+const
+  markW = 5
+  GravQ = 4
+  MinGrav = 2
+  left = 2
+  middle = 1
+  right = 0
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  
+  Callback* = procedure(MX: int16; MY: int16; X: int16; Y: int16; W: int16; H: int16; keysum: set)
+
+  Area = record
+    X, Y, W, H: int16
+    buf: pointer to array of char
+    buflen: int32
+    pix: int32
+    offscreen: boolean
+  end
+
+  // ---
+
+  Tracker = pointer to TrackerDesc
+  Drawer = procedure(T: Tracker; X: int16; Y: int16)
+  TrackerDesc = record
+    R: Display3.Mask
+    exit_: boolean
+    keysum, keys: set
+    MX, MY, X, Y, W, H: int16
+    Fade, Draw: Drawer
+    X0, Y0: int16
+  end
+
+var
+  FlatHand*: Oberon.Marker // Marker used to indicate a dragging/moving operation.
+  PointHand*: Oberon.Marker // Marker used to indicate a pointing/resizing operation.
+  Arrow*: Oberon.Marker // Substitute for the normal Oberon marker that does not operate using XOR mode.
+  MoveHand*: Oberon.Marker // Marker used to indicate a moving operation.
+  CopyHand*: Oberon.Marker // Marker used to indicate a copying operation.
+  Cross*: Oberon.Marker // Marker used by Rembrandt.
+  gravity*: int16 // Size of gravity spot used for "snapping" the cursor.
+
+  moveRect, cross, bar, highlight: Tracker
+
+  flatHand, pointHand, movePat, copyPat, crossPat, crossPat2: AnyPtr
+
+  block, A: Area
+  snapX, snapY, snapW, snapH, X0: int16 // global tracker variables; complete bullshit, must be deleted !
+  Y0, bX, bY: int16
+
+  arrowshape: AnyPtr
+
+procedure Min(x, y: int16): int16
+begin
+  if x < y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+procedure Max(x, y: int16): int16
+begin
+  if x > y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Max
+
+// Set the snapping grid origin and width and height used for all future effects.
+procedure SetSnap*(sX, sY, sW, sH: int16)
+begin
+  snapX := sX
+  snapY := sY
+  snapW := sW
+  snapH := sH
+end SetSnap
+
+// Snap X, Y to the snapping grid.
+procedure Snap*(X, Y: pointer to int16)
+  var
+    sX, sY: int16
+begin
+  sX := snapW - obmod(snapX, snapW)
+  sY := snapH - obmod(snapY, snapH)
+  X^ := obdiv(X^ + sX + asr(snapW, 1), snapW) * snapW - sX
+  Y^ := obdiv(Y^ + sY + asr(snapH, 1), snapH) * snapH - sY
+end Snap
+
+procedure FadeMouse()
+  var
+    cx, cy, cw, ch: int16
+begin
+  Display.GetClip(@cx, @cy, @cw, @ch)
+  Display.ResetClip()
+  Oberon.FadeCursor(@Oberon.Mouse)
+  Display.SetClip(cx, cy, cw, ch)
+end FadeMouse
+
+procedure GetBlock(X, Y, W, H: int16; A: pointer to Area; cursor: boolean)
+  var
+    dX: int16
+    size_: int32
+begin
+  // clip to full display
+  if X < 0 then
+    inc(W, X)
+    X := 0
+  end
+  if Y < 0 then
+    inc(H, Y)
+    Y := 0
+  end
+  if X + W - 1 >= Display.Width then
+    W := Display.Width - X
+  end
+  if Y + H - 1 >= Display.Height then
+    H := Display.Height - Y
+  end
+  // save area
+  A.X := X
+  A.Y := Y
+  A.W := W
+  A.H := H
+  if H <= -Display.UBottom then
+    A.offscreen := true
+    if cursor then
+      dX := Display.Width - A.W
+    else
+      dX := 0
+    end
+    Display.CopyBlock(X, Y, W, H, dX, -H, Display.replace)
+  else
+    A.offscreen := false
+    A.pix := asr(Display.TransferFormat(0), 3)
+    if A.pix # 0 then
+      size_ := val(int32, W) * H * A.pix
+      if (A.buf = nil) or (size_ > A.buflen) then
+        A.buflen := size_
+        newgc(A.buf, A.buflen)
+      end
+      Display.TransferBlock(A.buf, A.buflen, 0, W * A.pix, X, Y, W, H, Display.get)
+    else
+    end
+    // skip
+  end
+end GetBlock
+
+procedure RestoreBlock(A: pointer to Area; cursor: boolean)
+  var
+    cx, cy, cw, ch, dX: int16
+begin
+  Display.GetClip(@cx, @cy, @cw, @ch)
+  Display.ResetClip()
+  if A.offscreen then
+    if cursor then
+      dX := Display.Width - A.W
+    else
+      dX := 0
+    end
+    Display.CopyBlock(dX, -A.H, A.W, A.H, A.X, A.Y, Display.replace)
+  else
+    if A.pix # 0 then
+      Display.TransferBlock(A.buf, A.buflen, 0, A.W * A.pix, A.X, A.Y, A.W, A.H, Display.set_)
+    else
+    end
+    // skip
+  end
+
+  Display.SetClip(cx, cy, cw, ch)
+end RestoreBlock
+
+(** Temporarily save a part of the display in an offscreen buffer. Note that the height of the buffer might be limited from
+platform to platform. *)
+procedure OpenMenu*(X, Y, W, H: int16)
+  var
+    cx, cy, cw, ch: int16
+begin
+  Display.GetClip(@cx, @cy, @cw, @ch)
+  Display.ResetClip()
+  GetBlock(X, Y, W, H, @A, false)
+  Display.SetClip(cx, cy, cw, ch)
+end OpenMenu
+
+// Restore the screen area saved  by OpenMenu.
+procedure CloseMenu*()
+begin
+  RestoreBlock(@A, false)
+end CloseMenu
+
+(** Tempory save a part of the display in an offscreen buffer. This area must be small, and is thought for saving the
+areas under non-inverting cursors. *)
+procedure OpenCursor*(X, Y, W, H: int16)
+  var
+    cx, cy, cw, ch: int16
+begin
+  Display.GetClip(@cx, @cy, @cw, @ch)
+  Display.ResetClip()
+  GetBlock(X, Y, W, H, @block, true)
+  Display.SetClip(cx, cy, cw, ch)
+end OpenCursor
+
+// Restore the screen area saved by OpenCursor.
+procedure CloseCursor*()
+begin
+  RestoreBlock(@block, true)
+end CloseCursor
+
+// Returns TRUE if mx, my is within gravity pixels from X, Y.
+procedure Invicinity*(mx, my, X, Y: int32): boolean
+begin
+  return (mx - X) * (mx - X) + (my - Y) * (my - Y) < gravity * gravity
+end Invicinity
+
+// Returns TRUE if mx, my is inside the rectange X, Y, W, H.
+procedure Inside*(mx, my, X, Y, W, H: int16): boolean
+begin
+  return (mx >= X) & (mx < X + W) & (my >= Y) & (my < Y + H)
+end Inside
+
+// Returns TRUE if mx, my is near (within gravity) one of the four corners of  X, Y, W, H. The gravity is tempory adjusted should W, H be too small.
+procedure InCorner*(mx, my, X, Y, W, H: int16): boolean
+  var
+    hg, vg: int16
+begin
+  if (W <= gravity * 3) or (H <= gravity * 3) then
+    hg := Min(gravity, Max(asr(W, 2), MinGrav))
+    vg := Min(gravity, Max(asr(H, 2), MinGrav))
+    return Inside(mx, my, X, Y, hg, vg) or Inside(mx, my, X + W - hg, Y, hg, vg) or Inside(mx, my, X, Y + H - vg, hg, vg) or Inside(mx, my, X + W - hg, Y + H - vg, hg, vg)
+
+  else
+    return Inside(mx, my, X, Y, gravity, gravity) or Inside(mx, my, X + W - gravity, Y, gravity, gravity) or Inside(mx, my, X, Y + H - gravity, gravity, gravity) or Inside(mx, my, X + W - gravity, Y + H - gravity, gravity, gravity)
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end InCorner
+
+// Returns TRUE if mx, my is inside the border of X, Y, W, H (gravity is used). The gravity is tempory adjusted should W, H be too small.
+procedure InBorder*(mx, my, X, Y, W, H: int16): boolean
+  var
+    hg, vg: int16
+begin
+  if (W <= gravity * 3) or (H <= gravity * 3) then
+    hg := Min(gravity, Max(asr(W, 2), MinGrav))
+    vg := Min(gravity, Max(asr(H, 2), MinGrav))
+    return Inside(mx, my, X, Y, hg, H) or Inside(mx, my, X, Y, W, vg) or Inside(mx, my, X + W - hg, Y, hg, H) or Inside(mx, my, X, Y + H - vg, W, vg)
+
+  else
+    return Inside(mx, my, X, Y, gravity, H) or Inside(mx, my, X, Y, W, gravity) or Inside(mx, my, X + W - gravity, Y, gravity, H) or Inside(mx, my, X, Y + H - gravity, W, gravity)
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end InBorder
+
+// Returns TRUE if mx, my is within gravity pixels of the line from X, Y to X1, Y1.
+procedure InLineVicinity*(mx, my, X, Y, X1, Y1: int16): boolean
+  var
+    w, h, pw, ph, det, len_: int32
+
+  procedure Between(x, a, b: int16): boolean
+    var
+      min_, max_: int16
+  begin
+    min_ := Min(a, b)
+    max_ := Max(a, b)
+    return (min_ - gravity <= x) & (x <= max_ + gravity)
+  end Between
+begin
+  if abs(X - X1) > gravity then
+    if abs(Y - Y1) > gravity then
+      if Invicinity(mx, my, X, Y) or Invicinity(mx, my, X1, Y1) then
+        return true
+      end
+      pw := mx - X
+      ph := my - Y
+      w := X1 - X
+      h := Y1 - Y
+      det := pw * h - ph * w
+      len_ := w * w + h * h
+      return Between(mx, X, X1) & Between(my, Y, Y1) & (val(real, det) / val(real, len_) * val(real, det) < val(real, gravity * gravity))
+    else
+      return Between(mx, X, X1) & (abs(my - Y) < gravity)
+    end
+
+  else
+    return Between(my, Y, Y1) & (abs(mx - X) < gravity)
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end InLineVicinity
+
+// Returns TRUE if the two rectangles intersect each other.
+procedure Intersect*(X, Y, W, H, X1, Y1, W1, H1: int16): boolean
+begin
+  return (X + W > X1) & (X1 + W1 > X) & (Y + H > Y1) & (Y1 + H1 > Y)
+end Intersect
+
+procedure TrackerValues(tracker: Tracker; keys, keysum: pointer to set; MX, MY, X, Y, W, H: pointer to int16)
+begin
+  MX^ := tracker.MX
+  MY^ := tracker.MY
+  X^ := tracker.X
+  Y^ := tracker.Y
+  W^ := tracker.W
+  H^ := tracker.H
+  keys^ := tracker.keys
+  keysum^ := tracker.keysum
+end TrackerValues
+
+// Polls the mouse, continually drawing the specified marker, until the mouse snaps to the nearest grid position.
+procedure TrackMouse*(keys: pointer to set; X, Y: pointer to int16; marker: Oberon.Marker)
+  var
+    k: set
+    x, y, cx, cy, cw, ch: int16
+begin
+  Display.GetClip(@cx, @cy, @cw, @ch)
+  Display.ResetClip()
+  Snap(X, Y)
+  repeat
+    Input.Mouse(@k, @x, @y)
+    Oberon.DrawCursor(@Oberon.Mouse, @marker, x, y)
+    Snap(@x, @y)
+  until (k # keys^) or (X^ # x) or (Y^ # y)
+
+  keys^ := k
+  X^ := x
+  Y^ := y
+  Display.SetClip(cx, cy, cw, ch)
+end TrackMouse
+
+procedure Track(tracker: Tracker; marker: Oberon.Marker)
+  var
+    MX, MY: int16
+    keys: set
+begin
+  MX := tracker.MX
+  MY := tracker.MY
+  keys := tracker.keys
+  Snap(@MX, @MY)
+  while ~tracker.exit_ do
+    if tracker.Draw # nil then
+      FadeMouse()
+      tracker.Draw(tracker, MX, MY)
+    end
+
+    if ~tracker.exit_ then
+      TrackMouse(@keys, @MX, @MY, marker)
+    end
+    if tracker.Fade # nil then
+      FadeMouse()
+      tracker.Fade(tracker, tracker.MX, tracker.MY)
+    end
+
+    tracker.MX := MX
+    tracker.MY := MY
+    tracker.keys := keys
+    tracker.keysum := tracker.keysum + keys
+  end
+end Track
+
+procedure TrackDrag(tracker: Tracker)
+  var
+    MX, MY, x, y, cx, cy, cw, ch: int16
+    k, keys: set
+begin
+  MX := tracker.MX
+  MY := tracker.MY
+  keys := tracker.keys
+  Snap(@MX, @MY)
+  while ~tracker.exit_ do
+    if tracker.Draw # nil then
+      FadeMouse()
+      tracker.Draw(tracker, MX, MY)
+    end
+
+    if ~tracker.exit_ then
+      Display.GetClip(@cx, @cy, @cw, @ch)
+      Display.ResetClip()
+      Snap(@MX, @MY)
+      repeat
+        Input.Mouse(@k, @x, @y)
+        if tracker.keysum = {middle,right} then
+          Oberon.DrawCursor(@Oberon.Mouse, @CopyHand, x, y)
+        elsif tracker.keysum = {middle,left} then
+          Oberon.DrawCursor(@Oberon.Mouse, @MoveHand, x, y)
+        elsif tracker.keysum = {middle} then
+          Oberon.DrawCursor(@Oberon.Mouse, @FlatHand, x, y)
+        else
+          Oberon.DrawCursor(@Oberon.Mouse, @Arrow, x, y)
+        end
+
+        Snap(@x, @y)
+      until (k # keys) or (MX # x) or (MY # y)
+
+      keys := k
+      MX := x
+      MY := y
+      Display.SetClip(cx, cy, cw, ch)
+    end
+
+    if tracker.Fade # nil then
+      FadeMouse()
+      tracker.Fade(tracker, tracker.MX, tracker.MY)
+    end
+
+    tracker.MX := MX
+    tracker.MY := MY
+    tracker.keys := keys
+    tracker.keysum := tracker.keysum + keys
+  end
+end TrackDrag
+
+procedure OpenTracker(tracker: Tracker; R: Display3.Mask; draw, fade: Drawer; keys: set; MX, MY, X, Y, W, H: int16)
+begin
+  if tracker.Draw = nil then
+    tracker.Draw := draw
+  end
+  if tracker.Fade = nil then
+    tracker.Fade := fade
+  end
+  tracker.R := R
+  tracker.keysum := keys
+  tracker.keys := keys
+  tracker.X := X
+  tracker.Y := Y
+  tracker.W := W
+  tracker.H := H
+  tracker.MX := MX
+  tracker.MY := MY
+  tracker.exit_ := false
+end OpenTracker
+
+// ------MoveRect----------------------------------------------------
+procedure drawMoveRect(T: Tracker; X, Y: int16)
+begin
+  T.exit_ := T.keys = {}
+  T.X := X - T.X0
+  T.Y := Y - T.Y0
+  Display3.Rect(T.R, Display3.invertC, Display.solid, T.X, T.Y, T.W, T.H, 1, Display.invert)
+end drawMoveRect
+
+procedure OpenMoveRect(tracker: Tracker; R: Display3.Mask; keys: set; MX, MY, X, Y, W, H: int16)
+begin
+  Snap(@MX, @MY)
+  OpenTracker(tracker, R, drawMoveRect, drawMoveRect, keys, MX, MY, X, Y, W, H)
+  tracker.X0 := MX - tracker.X
+  tracker.Y0 := MY - tracker.Y
+end OpenMoveRect
+
+// ------ Cross ----------------------------------------------------
+
+procedure drawCross(T: Tracker; X, Y: int16)
+begin
+  // jm fix
+  T.MX := Max(T.X, X)
+  T.MX := Min(T.MX, T.X + T.W - 1)
+  T.MY := Max(T.Y, Y)
+  T.MY := Min(T.MY, T.Y + T.H - 1)
+  T.exit_ := T.keys = {}
+  OpenMenu(T.MX - markW, T.MY - markW, 2i1 * markW + 1i1, 2i1 * markW + 1i1)
+  Display.CopyPattern(Display.FG, Display.cross, T.MX - markW, T.MY - markW, Display.paint)
+end drawCross
+
+procedure fadeCross(T: Tracker; X, Y: int16)
+begin
+  CloseMenu()
+end fadeCross
+
+procedure OpenTrackCross(tracker: Tracker; R: Display3.Mask; keys: set; MX, MY, X, Y, W, H: int16)
+begin
+  OpenTracker(tracker, R, drawCross, fadeCross, keys, MX, MY, X, Y, W, H)
+end OpenTrackCross
+
+// ------ Highlight ----------------------------------------------------
+
+procedure drawHighlight(T: Tracker; X, Y: int16)
+  var
+    X0: int16
+
+  procedure Draw(X0: int16; T: pointer to Tracker)
+  begin
+    if X0 = 1 then
+      Display3.Rect(T^.R, Display3.invertC, Display.solid, T^.X, T^.Y, T^.W, T^.H, 1, Display.invert)
+    elsif X0 = 0 then
+      Display3.ReplConst(T^.R, Display3.invertC, T^.X, T^.Y, T^.W, T^.H, Display.invert)
+    end
+  end Draw
+begin
+  T.exit_ := T.keys = {}
+  if InBorder(X, Y, T.X, T.Y, T.W, T.H) then
+    X0 := 1
+  elsif Inside(X, Y, T.X, T.Y, T.W, T.H) then
+    X0 := 0
+  else
+    X0 := 2
+  end
+  if T.exit_ then
+    Draw(T.X0, @T)
+    T.X0 := 2
+  elsif T.X0 # X0 then
+    Draw(T.X0, @T)
+    T.X0 := X0
+    Draw(T.X0, @T)
+  end
+
+  T.Y0 := band(T.Y0 + 1, 1)
+end drawHighlight
+
+procedure OpenHighlight(tracker: Tracker; R: pointer to Display3.Mask; keys: set; MX, MY, X, Y, W, H: int16)
+begin
+  tracker.X0 := 2
+  tracker.Y0 := 0
+  OpenTracker(tracker, R^, drawHighlight, drawHighlight, keys, MX, MY, X, Y, W, H)
+end OpenHighlight
+
+// -----bar  ------------------------------------------------
+
+// Given a bar position, calculate the relative bar position.
+procedure BarValue*(X, Y, W, H, B, BW: int16; min_, max_: int32): int32
+  var
+    d, r, h: int32
+begin
+  d := max_ - min_
+  if H > W then
+    r := obdiv((B - Y - 1) * d, H - 2 - BW)
+  else
+    r := obdiv((B - X - 1) * d, W - 2 - BW)
+  end
+  r := min_ + r
+  if min_ > max_ then
+    h := max_
+    max_ := min_
+    min_ := h
+  end
+  if r > max_ then
+    r := max_
+  elsif r < min_ then
+    r := min_
+  end
+  return r
+end BarValue
+
+// Given the min, max, and val values, calculate the absolute bar position.
+procedure BarPos*(X, Y, W, H, BW: int16; min_, max_, val_: int32): int16
+  var
+    b, d: int32
+begin
+  d := max_ - min_
+  if min_ < max_ then
+    if val_ < min_ then
+      val_ := min_
+    elsif val_ > max_ then
+      val_ := max_
+    end
+  else
+    if val_ < max_ then
+      val_ := max_
+    elsif val_ > min_ then
+      val_ := min_
+    end
+  end
+  val_ := val_ - min_
+  if H > W then
+    b := Y + obdiv(val_ * (H - 2 - BW), d)
+  else
+    b := X + obdiv(val_ * (W - 2 - BW), d)
+  end
+  return val(int16, b)
+end BarPos
+
+procedure DrawSlider(T: Tracker)
+begin
+  if T.H > T.W then
+    if Y0 < 0 then
+      Y0 := T.Y0
+    end
+    Display3.FilledRect3D(T.R, Display3.topC, Display3.bottomC, Display3.groupC, T.X + 1, T.Y0, T.W - 2, T.X0, 1, Display.replace)
+    if T.W > 6 then
+      Display3.ReplConst(T.R, Display3.bottomC, T.X + 3, T.Y0 + asr(T.X0, 1), T.W - 6, 1, Display.replace)
+      Display3.ReplConst(T.R, Display3.topC, T.X + 3, T.Y0 + asr(T.X0, 1) - 1, T.W - 6, 1, Display.replace)
+    end
+
+  else
+    if X0 < 0 then
+      X0 := T.X0
+    end
+    Display3.FilledRect3D(T.R, Display3.topC, Display3.bottomC, Display3.groupC, T.X0, T.Y + 1, T.Y0, T.H - 2, 1, Display.replace)
+    if T.H > 6 then
+      Display3.ReplConst(T.R, Display3.bottomC, T.X0 + asr(T.Y0, 1) - 1, T.Y + 3, 1, T.H - 6, Display.replace)
+      Display3.ReplConst(T.R, Display3.topC, T.X0 + asr(T.Y0, 1), T.Y + 3, 1, T.H - 6, Display.replace)
+    end
+  end
+end DrawSlider
+
+procedure drawBar(T: Tracker; X, Y: int16)
+  var
+    col: int16
+begin
+  T.exit_ := T.keys = {}
+  if ~T.exit_ then
+    col := 12
+    if T.H > T.W then
+      T.Y0 := Max(T.Y + 1, Min(Y + bY, T.Y + T.H - T.X0 - 1))
+      if Y0 # T.Y0 then
+        DrawSlider(T)
+        if Y0 > T.Y0 then
+          Display3.ReplConst(T.R, col, T.X + 1, T.Y0 + T.X0, T.W - 2, Y0 - T.Y0, Display.replace)
+        else
+          Display3.ReplConst(T.R, col, T.X + 1, Y0, T.W - 2, T.Y0 - Y0, Display.replace)
+        end
+        Y0 := T.Y0
+      end
+
+    else
+      T.X0 := Max(T.X + 1, Min(X + bX, T.X + T.W - T.Y0 - 1))
+      if T.X0 # X0 then
+        DrawSlider(T)
+        if X0 > T.X0 then
+          Display3.ReplConst(T.R, col, T.X0 + T.Y0, T.Y + 1, X0 - T.X0, T.H - 2, Display.replace)
+        else
+          Display3.ReplConst(T.R, col, X0, T.Y + 1, T.X0 - X0, T.H - 2, Display.replace)
+        end
+
+        X0 := T.X0
+      end
+    end
+  end
+end drawBar
+
+procedure OpenBar(tracker: Tracker; R: Display3.Mask; keys: set; MX, MY, X, Y, W, H, B, BW: int16)
+  var
+    col, T: int16
+begin
+  OpenTracker(tracker, R, drawBar, drawBar, keys, MX, MY, X, Y, W, H)
+  if tracker.W > tracker.H then
+    tracker.X0 := B + 1 // + X
+    tracker.Y0 := Min(BW, tracker.W - 2)
+  else
+    tracker.Y0 := B + 1 // + Y
+    tracker.X0 := Min(BW, tracker.H - 2)
+  end
+  FadeMouse()
+  if MX + MY # 0 then
+    // jm
+    if tracker.H > tracker.W then
+      bX := tracker.X - MX
+      if (MY < tracker.Y0) or (MY > tracker.Y0 + tracker.X0) then
+        // not in bar
+        tracker.Y0 := Max(tracker.Y + 1, Min(MY - asr(tracker.X0, 1), tracker.Y + tracker.H - tracker.X0 - 2))
+        bY := -asr(tracker.X0, 1)
+      else
+        bY := tracker.Y0 - MY
+      end
+    else
+      bY := tracker.Y - MY
+      if (MX < tracker.X0) or (MX > tracker.X0 + tracker.Y0) then
+        // not in bar
+        tracker.X0 := Max(tracker.X + 1, Min(MX - asr(tracker.Y0, 1), tracker.X + tracker.W - tracker.Y0 - 2))
+        bX := -asr(tracker.Y0, 1)
+      else
+        bX := tracker.X0 - MX
+      end
+    end
+  end
+
+  Display3.Rect3D(R, Display3.bottomC, Display3.topC, tracker.X, tracker.Y, tracker.W, tracker.H, 1, Display.replace)
+  col := 12
+  if tracker.H > tracker.W then
+    T := tracker.Y0 + tracker.X0
+    Display3.ReplConst(R, col, tracker.X + 1, tracker.Y + 1, tracker.W - 2, tracker.Y0 - tracker.Y - 1, Display.replace)
+    Display3.ReplConst(R, col, tracker.X + 1, T, tracker.W - 2, tracker.Y + tracker.H - T - 1, Display.replace)
+  else
+    T := tracker.Y0 + tracker.X0
+    Display3.ReplConst(R, col, tracker.X + 1, tracker.Y + 1, tracker.X0 - tracker.X - 1, tracker.H - 2, Display.replace)
+    Display3.ReplConst(R, col, T, tracker.Y + 1, tracker.X + tracker.W - T - 1, tracker.H - 2, Display.replace)
+  end
+
+  DrawSlider(tracker)
+  X0 := tracker.X0
+  Y0 := tracker.Y0
+end OpenBar
+
+// Displays a scroll bar. B is the absolute control knob position and BW the bar width/height. Use BarPos to calculate B.
+procedure Bar*(R: Display3.Mask; X, Y, W, H, B, BW: int16)
+begin
+  OpenBar(bar, R, {}, 0, 0, X, Y, W, H, B, BW)
+end Bar
+
+// Drag rectangle X, Y, W, H outline until the mouse button is released. MX, MY is the position where the mouse was released, and keys contains all the mouse buttons that were pressed.
+procedure MoveRect*(R: Display3.Mask; keysum: pointer to set; MX, MY, X, Y, W, H: pointer to int16)
+  var
+    keys: set
+begin
+  Input.Mouse(@keys, MX, MY)
+  OpenMoveRect(moveRect, R, keys, MX^, MY^, X^, Y^, W^, H^)
+  TrackDrag(moveRect)
+  TrackerValues(moveRect, @keys, keysum, MX, MY, X, Y, W, H)
+end MoveRect
+
+// Resize the rectangle X, Y, W, H using rubber-banding. The nearest resize corner is determined according to the mouse position MX, MY. During resizing the callback procedure is continually called.Keysum returns the set of mouse buttons pressed and MX, MY the position where the mouse buttons were released.
+procedure SizeRect*(R: Display3.Mask; keysum: pointer to set; MX, MY, X, Y, W, H: pointer to int16; callback: Callback)
+  var
+    keys: set
+    x0, y0, x1, y1: int16
+
+  procedure sizeRect(x0, y0: int16; x1, y1: pointer to int16; R: pointer to Display3.Mask; callback: pointer to Callback; keys: pointer to set; keysum: pointer to set)
+    var
+      x, y: int16
+  begin
+    Snap(x1, y1)
+    repeat
+      Oberon.FadeCursor(@Oberon.Mouse)
+      Display3.Rect(R^, Display3.invertC, Display.solid, Min(x0, x1^), Min(y0, y1^), abs(x0 - x1^), abs(y0 - y1^), 1, Display.invert)
+      x := x1^
+      y := y1^
+      TrackMouse(keys, x1, y1, PointHand)
+      keysum^ := keysum^ + keys^
+      Snap(x1, y1)
+      Oberon.FadeCursor(@Oberon.Mouse)
+      Display3.Rect(R^, Display3.invertC, Display.solid, Min(x0, x), Min(y0, y), abs(x0 - x), abs(y0 - y), 1, Display.invert)
+      if callback^ # nil then
+        callback^(x, y, Min(x0, x1^), Min(y0, y1^), abs(x0 - x1^), abs(y0 - y1^), keysum^)
+      end
+    until keys^ = {}
+  end sizeRect
+begin
+  Input.Mouse(@keys, MX, MY)
+  Snap(MX, MY)
+  Snap(X, Y)
+  keysum^ := keys
+  x0 := X^
+  y0 := Y^
+  x1 := X^ + W^
+  y1 := Y^ + H^
+  if MY^ < asr(y0 + y1, 1) then
+    if MX^ < asr(x0 + x1, 1) then
+      sizeRect(x1, y1, @x0, @y0, @R, @callback, @keys, keysum)
+    else
+      sizeRect(x0, y1, @x1, @y0, @R, @callback, @keys, keysum)
+    end
+  else
+    if MX^ < asr(x0 + x1, 1) then
+      sizeRect(x1, y0, @x0, @y1, @R, @callback, @keys, keysum)
+    else
+      sizeRect(x0, y0, @x1, @y1, @R, @callback, @keys, keysum)
+    end
+  end
+
+  X^ := Min(x0, x1)
+  Y^ := Min(y0, y1)
+  W^ := abs(x0 - x1)
+  H^ := abs(y0 - y1)
+end SizeRect
+
+// Track a cross mark inside the rectangle X, Y, W, H. Keysum returns all the mouse buttons pressed and MX, MY the position where the mouse buttons were released.
+procedure TrackCross*(R: Display3.Mask; keysum: pointer to set; MX, MY, X, Y, W, H: pointer to int16)
+  var
+    keys: set
+begin
+  Input.Mouse(@keys, MX, MY)
+  OpenTrackCross(cross, R, keys, MX^, MY^, X^, Y^, W^, H^)
+  Track(cross, Arrow)
+  TrackerValues(cross, @keys, keysum, MX, MY, X, Y, W, H)
+  MX^ := Max(MX^, X^)
+  MY^ := Max(MY^, Y^)
+  MX^ := Min(MX^, X^ + W^ - 1)
+  MY^ := Min(MY^, Y^ + H^ - 1)
+end TrackCross
+
+// Track the position knob of a scrollbar. By bars are meant scroll bars with a knob. The bar orients itself according to the width/height ratio of the bounding rectangle. The interpolation functions allow you to convert between internal measurements and screen coordinates.
+procedure TrackBar*(R: Display3.Mask; keysum: pointer to set; MX, MY, X, Y, W, H, B, BW: pointer to int16)
+  var
+    keys: set
+begin
+  Input.Mouse(@keys, MX, MY)
+  OpenBar(bar, R, keys, MX^, MY^, X^, Y^, W^, H^, B^, BW^)
+  Track(bar, FlatHand)
+  TrackerValues(bar, @keys, keysum, MX, MY, X, Y, W, H)
+  if H^ > W^ then
+    B^ := bar.Y0 // - bar.Y
+  else
+    B^ := bar.X0 // - bar.X
+  end
+end TrackBar
+
+// Track mouse in area X, Y, W, H, highlighting the border or inside of the rectangle, depending on the mouse location. Keysum returnes all the mouse buttons pressed and MX, MY the position where the mouse buttons were released.
+procedure TrackHighlight*(R: Display3.Mask; keysum: pointer to set; MX, MY: pointer to int16; X, Y, W, H: int16)
+  var
+    keys: set
+begin
+  Input.Mouse(@keys, MX, MY)
+  OpenHighlight(highlight, @R, keys, MX^, MY^, X, Y, W, H)
+  Track(highlight, Arrow)
+  TrackerValues(highlight, @keys, keysum, MX, MY, @X, @Y, @W, @H)
+end TrackHighlight
+
+// --- Misc ---
+
+procedure DrawFlatHand(x, y: int16)
+  var
+    s, cx, cy, cw, ch: int16
+begin
+  Display.GetClip(@cx, @cy, @cw, @ch)
+  Display.ResetClip()
+  s := obdiv(x, Display.Width) * Display.Width
+  x := x - s
+  if x < 8 then
+    x := 8
+  elsif (x > Display.Width - 8) & (x < Display.Width) then
+    x := Display.Width - 8
+  end
+  x := x + s
+  if y < 7 then
+    y := 7
+  elsif y > Display.Height - 9 then
+    y := Display.Height - 9
+  end
+
+  // --- NP ---
+  GetBlock(x - 8, y - 7, 16, 16, @block, true)
+  Display.CopyPattern(Display.FG, flatHand, x - 8, y - 7, Display.paint)
+
+  (* --- If you need an inverting flathand use this: rather than ^
+  Display.CopyPattern(Display.FG, flatHand, x-8, y-7, Display.invert);
+  --- *)
+
+  Display.SetClip(cx, cy, cw, ch)
+end DrawFlatHand
+
+procedure DrawPointHand(x, y: int16)
+  var
+    s, cx, cy, cw, ch: int16
+begin
+  Display.GetClip(@cx, @cy, @cw, @ch)
+  Display.ResetClip()
+  s := obdiv(x, Display.Width) * Display.Width
+  x := x - s
+  if x < 1 then
+    x := 1
+  elsif (x > Display.Width - 15) & (x < Display.Width) then
+    x := Display.Width - 15
+  end
+  x := x + s
+  if y < 15 then
+    y := 15
+  elsif y >= Display.Height then
+    y := Display.Height - 1
+  end
+
+  // --- NP ---
+  GetBlock(x, y - 15, 16, 16, @block, true)
+  Display.CopyPattern(Display.FG, pointHand, x, y - 15, Display.paint)
+
+  (* --- If you need an inverting pointhand use this: rather than ^
+  Display.CopyPattern(Display.FG, flatHand, x-8, y-7, Display.invert);
+  --- *)
+
+  Display.SetClip(cx, cy, cw, ch)
+end DrawPointHand
+
+(* --- NP --- If you want inverting hands
+PROCEDURE *FadeFlatHand(x, y: INTEGER);
+BEGIN DrawFlatHand(x, y);
+END FadeFlatHand;
+
+PROCEDURE *FadePointHand(x, y: INTEGER);
+BEGIN DrawPointHand(x, y);
+END FadePointHand;
+*)
+
+procedure DrawCopyHand(x, y: int16)
+  var
+    s: int16
+begin
+  s := obdiv(x, Display.Width) * Display.Width
+  x := x - s
+  if x < 8 then
+    x := 8
+  elsif (x > Display.Width - 8) & (x < Display.Width) then
+    x := Display.Width - 8
+  end
+  x := x + s
+  if y < 7 then
+    y := 7
+  elsif y > Display.Height - 9 then
+    y := Display.Height - 9
+  end
+  x := x - 8
+  y := y - 7
+  OpenCursor(x, y, 16, 16)
+  Display.CopyPattern(Display.FG, flatHand, x, y, Display.paint)
+  Display.CopyPattern(9, copyPat, x, y, Display.paint)
+end DrawCopyHand
+
+procedure DrawMoveHand(x, y: int16)
+  var
+    s: int16
+begin
+  s := obdiv(x, Display.Width) * Display.Width
+  x := x - s
+  if x < 8 then
+    x := 8
+  elsif (x > Display.Width - 8) & (x < Display.Width) then
+    x := Display.Width - 8
+  end
+  x := x + s
+  if y < 7 then
+    y := 7
+  elsif y > Display.Height - 9 then
+    y := Display.Height - 9
+  end
+  x := x - 8
+  y := y - 7
+  OpenCursor(x, y, 16, 16)
+  Display.CopyPattern(Display.FG, flatHand, x, y, Display.paint)
+  Display.CopyPattern(9, movePat, x, y, Display.paint)
+end DrawMoveHand
+
+procedure DrawCross(x, y: int16)
+  const
+    d = 11
+begin
+  OpenCursor(x - d, y - d, 23, 23)
+  Display.CopyPattern(Display.FG, crossPat, x - d, y - d, Display.paint)
+  Display.CopyPattern(Display.BG, crossPat2, x - d, y - d, Display.paint)
+end DrawCross
+
+procedure Fade(x, y: int16)
+begin
+  RestoreBlock(@block, true)
+end Fade
+
+procedure DrawArrow(x, y: int16)
+  var
+    s, cx, cy, cw, ch: int16
+begin
+  Display.GetClip(@cx, @cy, @cw, @ch)
+  Display.ResetClip()
+  if x < 1 then
+    x := 1
+  end
+  (*
+  IF (x < Display.ColLeft) THEN
+  s := x DIV Display.Width * Display.Width; x := x - s;
+  IF (x > Display.Width - 15) & (x < Display.Width) THEN x := Display.Width - 15 END; x := x + s;
+  IF y >= Display.Height THEN y := Display.Height - 1 END;
+  Display.CopyPattern(Display.FG, Display.arrow, x, y - 15, Display.invert)
+  ELSE
+  *)
+  GetBlock(x - 1, y - 15, 16, 16, @block, true)
+  Display.SetClip(0, 0, Display.Width, Display.Height)
+  Display.CopyPattern(Display.FG, Display.arrow, x, y - 15, Display.paint)
+  Display.CopyPattern(Display.BG, arrowshape, x - 1, y - 15, Display.paint)
+  Display.SetClip(cx, cy, cw, ch)
+end DrawArrow
+
+procedure FadeArrow(x, y: int16)
+begin
+  RestoreBlock(@block, true)
+end FadeArrow
+
+// ---
+
+procedure InitCursors()
+  var
+    flatHandS, pointHandS, movePatS, copyPatS, image: array 16 of set
+    crossPatS: array 23 of set
+begin
+  flatHandS[0] := {10..11}
+  flatHandS[1] := {7..9}
+  flatHandS[2] := {4..6}
+  flatHandS[3] := {2..3}
+  flatHandS[4] := {1}
+  flatHandS[5] := {0,5,15}
+  flatHandS[6] := {0,3..4,15}
+  flatHandS[7] := {1..3,15}
+  flatHandS[8] := {1,6,15}
+  flatHandS[9] := {0,5,14}
+  flatHandS[10] := {0,3..4,8,14}
+  flatHandS[11] := {1..3,7,11,14}
+  flatHandS[12] := {2,6,10,13}
+  flatHandS[13] := {2,5,9,12}
+  flatHandS[14] := {3..5,8,10..11}
+  flatHandS[15] := {6..7}
+  pointHandS[0] := {9..10}
+  pointHandS[1] := {7..9}
+  pointHandS[2] := {5..6,10,16}
+  pointHandS[3] := {4,16}
+  pointHandS[4] := {3,11,16}
+  pointHandS[5] := {2..6,10,15..16}
+  pointHandS[6] := {1..2,5..8,10,15}
+  pointHandS[7] := {1,4,7..10,15}
+  pointHandS[8] := {2..3,6..7,11,14}
+  pointHandS[9] := {3,5,8,14}
+  pointHandS[10] := {3..4,7,9..13}
+  pointHandS[11] := {5..6,10}
+  pointHandS[12] := {4..5,8..9}
+  pointHandS[13] := {2..3,7}
+  pointHandS[14] := {2,5..6}
+  pointHandS[15] := {3..4}
+  flatHand := Display.NewPattern(16, 16, @flatHandS)
+  pointHand := Display.NewPattern(16, 16, @pointHandS)
+
+  crossPatS[0] := {}
+  crossPatS[1] := {11}
+  crossPatS[2] := {11}
+  crossPatS[3] := {11}
+  crossPatS[4] := {11}
+  crossPatS[5] := {11}
+  crossPatS[6] := {11}
+  crossPatS[7] := {11}
+  crossPatS[8] := {11}
+  crossPatS[9] := {11}
+  crossPatS[10] := {}
+  crossPatS[11] := {1..9,13..21}
+  crossPatS[12] := {}
+  crossPatS[13] := {11}
+  crossPatS[14] := {11}
+  crossPatS[15] := {11}
+  crossPatS[16] := {11}
+  crossPatS[17] := {11}
+  crossPatS[18] := {11}
+  crossPatS[19] := {11}
+  crossPatS[20] := {11}
+  crossPatS[21] := {}
+  crossPat := Display.NewPattern(22, 22, @crossPatS)
+
+  crossPatS[0] := {10..12}
+  crossPatS[1] := {10,12}
+  crossPatS[2] := {10,12}
+  crossPatS[3] := {10,12}
+  crossPatS[4] := {10,12}
+  crossPatS[5] := {10,12}
+  crossPatS[6] := {10,12}
+  crossPatS[7] := {10,12}
+  crossPatS[8] := {10,12}
+  crossPatS[9] := {10,12}
+  crossPatS[10] := {0..9,11,13..22}
+  crossPatS[11] := {0,10,12,22}
+  crossPatS[12] := {0..9,11,13..22}
+  crossPatS[13] := {10,12}
+  crossPatS[14] := {10,12}
+  crossPatS[15] := {10,12}
+  crossPatS[16] := {10,12}
+  crossPatS[17] := {10,12}
+  crossPatS[18] := {10,12}
+  crossPatS[19] := {10,12}
+  crossPatS[20] := {10,12}
+  crossPatS[21] := {10,12}
+  crossPatS[22] := {10..12}
+  crossPat2 := Display.NewPattern(22, 23, @crossPatS)
+  Cross.Draw := DrawCross
+  Cross.Fade := Fade
+
+  movePatS[0] := {10..15}
+  movePatS[1] := {10,15}
+  movePatS[2] := {10,15}
+  movePatS[3] := {7..10,15}
+  movePatS[4] := {7..10,15}
+  movePatS[5] := {7..15}
+  movePatS[6] := {7..12}
+  movePatS[7] := {7..12}
+  movePatS[8] := {7..12}
+  movePatS[9] := {}
+  movePatS[10] := {}
+  movePatS[11] := {}
+  movePatS[12] := {}
+  movePatS[13] := {}
+  movePatS[14] := {}
+  movePatS[15] := {}
+  movePat := Display.NewPattern(16, 16, @movePatS)
+  MoveHand.Draw := DrawMoveHand
+  MoveHand.Fade := Fade
+
+  copyPatS[0] := {14..15}
+  copyPatS[1] := {13..15}
+  copyPatS[2] := {9,12..14}
+  copyPatS[3] := {9..13}
+  copyPatS[4] := {9..12}
+  copyPatS[5] := {9..12}
+  copyPatS[6] := {9..13}
+  copyPatS[7] := {}
+  copyPatS[8] := {}
+  copyPatS[9] := {}
+  copyPatS[10] := {}
+  copyPatS[11] := {}
+  copyPatS[12] := {}
+  copyPatS[13] := {}
+  copyPatS[14] := {}
+  copyPatS[15] := {}
+  copyPat := Display.NewPattern(16, 16, @copyPatS)
+  CopyHand.Draw := DrawCopyHand
+  CopyHand.Fade := Fade
+
+  image[0] := {13}
+  image[1] := {12}
+  image[2] := {11,15}
+  image[3] := {10,14}
+  image[4] := {9,13}
+  image[5] := {8,12}
+  image[6] := {0,1,7,11}
+  image[7] := {0,2,6,10}
+  image[8] := {0,3,5,9}
+  image[9] := {0,4,8}
+  image[10] := {0,7}
+  image[11] := {0,6}
+  image[12] := {0,7}
+  image[13] := {0,8}
+  image[14] := {0,9}
+  image[15] := {0..9}
+  arrowshape := Display.NewPattern(16, 16, @image) // thanks PM
+
+  FlatHand.Draw := DrawFlatHand
+  FlatHand.Fade := Fade
+  PointHand.Draw := DrawPointHand
+  PointHand.Fade := Fade
+  Arrow.Draw := DrawArrow
+  Arrow.Fade := FadeArrow
+end InitCursors
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "CloseMenu" end return CloseMenu end
+  if i = 1 then if name # nil then name^ := "CloseCursor" end return CloseCursor end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Effects", cmd_)
+  gravity := 6
+  snapX := 0
+  snapY := 0
+  snapH := 1
+  snapW := 1
+  A.buf := nil
+  A.buflen := 0
+  block.buf := nil
+  block.buflen := 0
+  InitCursors()
+  newgc(moveRect)
+  newgc(cross)
+  newgc(bar)
+  newgc(highlight)
+end Effects.

@@ -1,0 +1,3433 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Rembrandt [level=5]
+
+import Rembrandt0, Files, Display, D3 := Display3, Texts, Printer3, Printer, Effects, Objects, Gadgets, Fonts, Oberon, Pictures, Out, Input, Attributes, Modules
+
+// portable
+// Ist das Hauptmodul für den Rembrandt-Editor
+// tk, picture-depth corrections 25.5.1995
+// jm, fixed Copy 4.12.95
+// ps, resize dep. of attr. Border 21.5.96
+// ps, changed to Printer.Frame 4.8.96
+// ps, changed behaviour of {MM, MR} 8.10.96
+// ps, bugfix in GetSelection 24.4.97
+
+// Konstanten für Mouseklicks
+
+const
+  MM = 1i1
+  MR = 0i1
+  ML = 2i1
+  Cancel = {MM,MR,ML}
+
+  // ID's für Selection
+  No* = 0 // Keine Selektion
+  Block* = 1 // Rectangle selektiert
+  Image* = 2 // Ganzes Picture selektiert
+  Object* = 3 // Ein Gebiet mit einer best. Farbe selektiert
+  Freehand* = 4 // Polygon selektiert
+
+  idMove* = 0 // Belegung der MM falls Selektion vorhanden
+  idRotate* = 1
+  idScale* = 2
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+
+  Element = pointer to ElemDesc
+  ElemDesc = record
+    next: Element
+    x, y, w: int16
+  end
+
+  Lockrec = record
+    scaledpict: Pictures.Picture // Skaliertes Picture falls Gadget locked
+    lw: int16 // Originalframegrösse ; aktuelle Abstand zu Ecke ; aktuelle Framegrösse
+    lh, lpx, lpy, actlw, actlh: int16
+  end
+
+  Frame* = pointer to FrameDesc
+  FrameDesc* = object (Gadgets.FrameDesc)
+    pict*: Pictures.Picture
+    px: int16 // Position des Bildes innerhalb des Frames; Nullpkt. linke, obere Ecke
+    py: int16
+    locked: boolean // Pictures ändern möglich oder nicht
+    lockdata: Lockrec // Daten für Zustand locked
+    border: boolean // Rand sichtbar oder nicht
+    selection*, sx*: int16 // Selektionsbereich
+    sy*, sw*, sh*: int16
+    selstruct: Element // Beliebige Fläche selektiert
+    seloutline: Element // Darstellung des selektierten
+    selcolor: int16 // Selektionsfarbe
+    selcol: int16 // Farbe der Fläche
+    seltime: int32
+    selpict: Pictures.Picture
+    car*: boolean
+    cx*, cy*: int16
+    string: record
+      len_, x, y: int16
+    end
+    zoom: int16 // Zoomweite: 1=normal
+    grid: boolean // Rasterlinien
+    time: int32
+    col*: int16 // für Version 1.6
+  end
+
+  TrackMMProc* = procedure(F: Frame; M: pointer to Oberon.InputMsg; x: int16; y: int16)
+
+  DrawSelectionMsg = object (Display.FrameMsg)
+  end
+  PDrawSelectionMsg = pointer to DrawSelectionMsg
+  DrawCaretMsg = object (Display.FrameMsg)
+  end
+  PDrawCaretMsg = pointer to DrawCaretMsg
+  DrawGridMsg = object (Display.FrameMsg)
+    u, v, w, h: int16
+  end
+  PDrawGridMsg = pointer to DrawGridMsg
+  ZoomMsg = object (Display.DisplayMsg)
+    zoom: int16
+  end
+  PZoomMsg = pointer to ZoomMsg
+  FocusMsg = object (Display.FrameMsg)
+    u, v: int16
+  end
+  PFocusMsg = pointer to FocusMsg
+  SelectMsg = object (Display.SelectMsg)
+    pict: Pictures.Picture
+    u, v, w, h: int16
+  end
+  PSelectMsg = pointer to SelectMsg
+
+  Region = pointer to RegionDesc
+  RegionDesc = record
+    next: Region
+    px, py: int16
+    P, pict: Pictures.Picture
+  end
+
+var
+  trackMM*: TrackMMProc // Handler für Operationen
+  trackSelMM*: record
+    // Handler f?r Selektionsoperationen
+    id*: int8
+    track*: TrackMMProc
+  end
+
+  undo: Region // , redo
+  // Picture für letzte Änderung rückgängig machbar
+  cursor*: Oberon.Marker
+  seltype: int16
+  selcolor*: int16 // Farbe für Selektion
+  clipboard: record
+    id, col: int16
+    P: Pictures.Picture
+    selstruct: Element
+    sw, sh: int16
+    Paste: procedure(D: Pictures.Picture; dx: int16; dy: int16)
+  end
+
+  seldir: array 4 of record
+    dx, dy, ind: int8
+  end
+
+procedure ^ NewP*(F: Frame; pict: Pictures.Picture)
+
+procedure Min(a, b: int16): int16
+begin
+  if a < b then
+    return a
+  else
+    return b
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+procedure Max(a, b: int16): int16
+begin
+  if a > b then
+    return a
+  else
+    return b
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Max
+
+procedure SizeFrame(F: Frame; d: int16)
+  // ps - 21.5.96
+  var
+    M: Display.ModifyMsg
+begin
+  inc(F.px, d)
+  inc(F.py, d)
+  inc(F.lockdata.lpx, d)
+  inc(F.lockdata.lpy, d)
+  M.id := Display.extend
+  M.mode := Display.display
+  M.F := F
+  M.X := F.X - d
+  M.Y := F.Y - d
+  M.W := F.W + 2 * d
+  M.H := F.H + 2 * d
+  M.dX := -d
+  M.dY := -d
+  M.dW := 2 * d
+  M.dH := 2 * d
+  Display.Broadcast(@M)
+end SizeFrame
+
+// Handler für Attribute
+procedure FrameAttributes*(F: Frame; M: pointer to Objects.AttrMsg)
+  var
+    L: Lockrec
+    old: boolean
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "Rembrandt.New", 64)
+      M.res := 0
+    elsif M.name = "Color" then
+      M.class := Objects.Int
+      M.i := F.col
+      M.res := 0
+    elsif M.name = "Locked" then
+      M.class := Objects.Bool
+      M.b := F.locked
+      M.res := 0
+    elsif M.name = "Border" then
+      M.class := Objects.Bool
+      M.b := F.border
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.res := 0
+      M.i := asr(F.H, 1) - 5
+    elsif M.name = "Cmd" then
+      Gadgets.framehandle(F, M)
+      if M.res < 0 then
+        M.class := Objects.String
+        copy(@M.s, "", 64)
+        M.res := 0
+      end
+    elsif M.name = "Zoom" then
+      M.class := Objects.Int
+      M.i := F.zoom
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Color" then
+      if M.class = Objects.Int then
+        F.col := val(int16, M.i)
+        M.res := 0
+      end
+
+    elsif M.name = "Locked" then
+      if M.class = Objects.Bool then
+        F.locked := M.b
+        if F.locked then
+          L := F.lockdata
+          L.scaledpict := nil
+          L.lw := F.W
+          L.lh := F.H
+          L.lpx := F.px
+          L.lpy := F.py
+          L.actlw := F.W
+          L.actlh := F.H
+          F.lockdata := L
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "Border" then
+      if M.class = Objects.Bool then
+        old := F.border
+        F.border := M.b
+        M.res := 0
+        if F.border # old then
+          if F.border then
+            SizeFrame(F, 1)
+          else
+            SizeFrame(F, -1)
+          end
+        end
+
+        Gadgets.Update(F)
+      end
+
+    elsif (M.name = "Zoom") & (M.class = Objects.Int) & (M.i > 0) then
+      F.zoom := val(int16, M.i)
+      Gadgets.Update(F)
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Color")
+    M.Enum("Cmd")
+    M.Enum("Locked")
+    M.Enum("Border")
+    M.Enum("Zoom")
+    Gadgets.framehandle(F, M)
+  end
+end FrameAttributes
+
+procedure FrameLinks(F: Frame; M: pointer to Objects.LinkMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Model" then
+      M.obj := F.pict
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Model" then
+      if (M.obj # nil) & (M.obj is Pictures.Picture) then
+        F.pict := M.obj(Pictures.Picture)
+        Gadgets.Update(F)
+        M.res := 0
+      else
+        Gadgets.framehandle(F, M)
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    Gadgets.framehandle(F, M)
+  end
+end FrameLinks
+
+// Wandelt die absoluten Bildschirmkoordinaten in Picturekoordinaten um
+procedure ScreentoPict*(F: Frame; x, y, absx, absy: int16; px, py: pointer to int16)
+begin
+  px^ := obdiv(absx - x - F.px * F.zoom, F.zoom)
+  py^ := obdiv(absy - y - F.H + F.pict.height * F.zoom + F.py * F.zoom, F.zoom)
+end ScreentoPict
+
+// Wandelt relative Picturekoordinaten in absulute Bildschirmkoordinaten um
+procedure PicttoScreen*(F: Frame; x, y, relx, rely: int16; absx, absy: pointer to int16)
+  var
+    h: int16
+begin
+  if F.locked & (F.lockdata.scaledpict # nil) then
+    h := F.lockdata.scaledpict.height
+  else
+    h := F.pict.height
+  end
+  absx^ := (relx + F.px) * F.zoom + x
+  absy^ := (rely - h - F.py) * F.zoom + y + F.H
+end PicttoScreen
+
+// Entfernt eine vorhandene Selektion im Frame F
+procedure RemoveSelection*(F: Frame)
+  var
+    M: DrawSelectionMsg
+begin
+  if F.selection # No then
+    M.res := -1
+    M.F := F
+    Display.Broadcast(@M)
+    F.selection := No
+    F.selstruct := nil
+  end
+end RemoveSelection
+
+procedure SetSelection(F: Frame; id: int16)
+  var
+    M: DrawSelectionMsg
+begin
+  F.selection := id
+  M.res := -1
+  M.F := F
+  Display.Broadcast(@M)
+  F.time := Oberon.Time()
+end SetSelection
+
+procedure GetSelection(F: pointer to Frame; P: pointer to Pictures.Picture; time: pointer to int32; x, y, w, h: pointer to int16)
+  var
+    M: SelectMsg
+    M2: Display.SelectMsg
+    time2: int32
+begin
+  M.id := Display.get
+  M.time := -1
+  M.pict := nil
+  M.F := nil
+  M.obj := nil
+  Display.Broadcast(@M)
+  time^ := M.time
+  time2 := -1
+  M2.id := Display.get
+  M2.time := -1
+  M2.F := nil
+  M2.obj := nil
+  Display.Broadcast(@M2)
+  if M2.obj # nil then
+    if M2.obj is Frame then
+      M2.obj := M2.obj(Frame).pict
+    end
+    if M2.obj is Pictures.Picture then
+      time2 := M2.time
+    end
+  end
+
+  if (time^ # -1) & (time^ > time2) then
+    if M.pict # nil then
+      F^ := M.sel(Frame)
+      P^ := M.pict
+      x^ := M.u
+      y^ := M.v
+      w^ := M.w
+      h^ := M.h
+    end
+
+  elsif time2 # -1 then
+    if M2.obj is Pictures.Picture then
+      if M.sel is Frame then
+        F^ := M.sel(Frame)
+      else
+        F^ := nil
+      end
+      P^ := M2.obj(Pictures.Picture)
+      time^ := time2
+      x^ := 0
+      y^ := 0
+      w^ := P^.width
+      h^ := P^.height
+    end
+  end
+end GetSelection
+
+procedure DrawOutline(F: Frame; Q: D3.Mask; sx, sy: int16)
+  var
+    act: Element
+    x0, y0: int16
+begin
+  act := F.seloutline
+  if act # nil then
+    act := act.next
+  end
+  while act # nil do
+    x0 := sx + act.x * F.zoom
+    y0 := sy + act.y * F.zoom
+    D3.ReplConst(Q, F.selcolor, x0, y0, F.zoom, F.zoom, Display.invert)
+    act := act.next
+  end
+end DrawOutline
+
+procedure DrawSelection(F: Frame; Q: D3.Mask; x, y: int16)
+  var
+    ox, oy: int16
+begin
+  PicttoScreen(F, x, y, F.sx, F.sy, @ox, @oy)
+  Oberon.FadeCursor(@Oberon.Mouse)
+  if (F.selection = Block) or (F.selection = Image) then
+    D3.Rect(Q, F.selcolor, Display.solid, ox - F.zoom, oy - F.zoom, (F.sw + 2) * F.zoom, (F.sh + 2) * F.zoom, F.zoom, Display.invert)
+  else
+    // Freehand or Object
+    DrawOutline(F, Q, ox, oy)
+  end
+end DrawSelection
+
+// Kopiert Picture-Palette
+procedure CopyPalette*(S, D: Pictures.Picture)
+  var
+    i, r, g, b: int16
+begin
+  i := 0
+  while i < sigc(shl(val(int32, 1), usig(val(int32, S.depth)))) do
+    Pictures.GetColor(S, i, @r, @g, @b)
+    Pictures.SetColor(D, i, r, g, b)
+    inc(i)
+  end
+end CopyPalette
+
+// Gibt die letzte Selektion in Form eines Pictures zurück
+procedure GetSelectedPict*(P: pointer to Pictures.Picture; x, y, w, h: pointer to int16)
+  var
+    F: Frame
+    time: int32
+    act: Element
+begin
+  GetSelection(@F, P, @time, x, y, w, h)
+  if time # -1 then
+    if (F # nil) & (F.selection >= Object) then
+      newgc(P^) // tk
+      Rembrandt0.AllocatePictureMem(P, w^, h^, F.pict.depth)
+      CopyPalette(F.pict, P^)
+      if F.selection = Object then
+        act := F.selstruct
+        while act # nil do
+          Pictures.ReplConst(P^, F.selcol, act.x, act.y, act.w, 1, Display.replace)
+          act := act.next
+        end
+
+      else
+        act := F.selstruct
+        while act # nil do
+          Rembrandt0.CopyBlock(F.pict, P^, x^ + act.x, y^ + act.y, act.w, 1, act.x, act.y, Display.replace)
+          act := act.next
+        end
+      end
+
+      x^ := 0
+      y^ := 0
+    end
+
+  else
+    newgc(P^)
+    P^ := nil
+  end
+end GetSelectedPict
+
+// Gibt Selektion innerhalb eines bestimmten Frames zurück
+procedure GetSelectioninFrame*(F: Frame; P: pointer to Pictures.Picture; x, y, w, h: pointer to int16)
+  var
+    act: Element
+begin
+  if (F # nil) & (F.selection # No) then
+    w^ := F.sw
+    h^ := F.sh
+    x^ := F.sx
+    y^ := F.sy
+    // NEW(P); Rembrandt0.AllocatePictureMem(P, w, h, F.pict.depth);
+    // tk
+    if F.selection = Object then
+      newgc(P^) // tk
+      Rembrandt0.AllocatePictureMem(P, w^, h^, F.pict.depth)
+      CopyPalette(F.pict, P^)
+      act := F.selstruct
+      while act # nil do
+        Pictures.ReplConst(P^, F.selcol, act.x, act.y, act.w, 1, Display.replace)
+        act := act.next
+      end
+      x^ := 0
+      y^ := 0
+    elsif F.selection = Freehand then
+      newgc(P^) // tk
+      Rembrandt0.AllocatePictureMem(P, w^, h^, F.pict.depth)
+      CopyPalette(F.pict, P^)
+      act := F.selstruct
+      while act # nil do
+        Rembrandt0.CopyBlock(F.pict, P^, x^ + act.x, y^ + act.y, act.w, 1, act.x, act.y, Display.replace)
+        act := act.next
+      end
+      x^ := 0
+      y^ := 0
+    else
+      // Block or Image
+      P^ := F.pict
+    end
+
+  else
+    P^ := nil
+  end
+end GetSelectioninFrame
+
+procedure Select(F: Frame; x, y: int16; M: pointer to Display.SelectMsg)
+  var
+    F1: Frame
+begin
+  if M.id = Display.get then
+    if ((M.time - F.time < 0) or (M.time = -1)) & (F.time # -1) & (F.selection # No) then
+      M.time := F.time
+      M.sel := F
+      case M of
+      | PSelectMsg:
+        M.pict := F.pict
+        M.u := F.sx
+        M.v := F.sy
+        M.w := F.sw
+        M.h := F.sh
+
+      else
+        if F.seltime # F.time then
+          newgc(F.selpict)
+          Pictures.Create(F.selpict, F.sw, F.sh, F.pict.depth)
+          CopyPalette(F.pict, F.selpict) // tk
+          Pictures.CopyBlock(F.pict, F.selpict, F.sx, F.sy, F.sw, F.sh, 0, 0, Display.replace)
+          F.seltime := F.time
+        end
+
+        if F.selection >= Object then
+          M.obj := F
+        else
+          newgc(F1)
+          NewP(F1, F.selpict)
+          Attributes.SetBool(F1, "Locked", true)
+          Attributes.SetBool(F1, "Border", false)
+          M.obj := F1
+          M.sel := F
+        end
+      end
+    end
+
+  else
+    Gadgets.framehandle(F, M)
+  end
+end Select
+
+// Gibt einen String in den angegebenen Bereich aus
+procedure DisplayText*(sx, sy, sw, sh: int16; const text: pointer to array of char)
+  const
+    bg = 3
+  var
+    i, x: int16
+    f: Fonts.Font
+    dx, fx, fy, fw, fh: int16
+    pat: AnyPtr
+begin
+  Display.ReplConst(bg, sx, sy, sw, sh, Display.replace)
+  i := 0
+  x := sx + 4
+  f := Fonts.Default
+  while text[i] # 0X do
+    Fonts.GetChar(f, text[i], @dx, @fx, @fy, @fw, @fh, @pat)
+    Display.CopyPattern(D3.BG, pat, x + fx, sy + 4 + fy, Display.paint)
+    x := x + dx
+    inc(i)
+  end
+end DisplayText
+
+// Testet, ob die Koordinaten mx,my innerhalb des dargestellten Picture sind
+procedure InsidePict*(F: Frame; mx, my, x, y: int16): boolean
+  var
+    px, py: int16
+begin
+  PicttoScreen(F, x, y, 0, 0, @px, @py)
+  if Effects.Inside(mx, my, px, py, F.pict.width * F.zoom, F.pict.height * F.zoom) then
+    return true
+  else
+    return false
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end InsidePict
+
+procedure Defocus(F: Frame)
+  var
+    M: DrawCaretMsg
+begin
+  if F.car then
+    M.res := -1
+    M.F := F
+    Display.Broadcast(@M)
+    F.car := false
+  end
+end Defocus
+
+procedure Neutralize(F: Frame; x, y, w, h: int16)
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  Defocus(F)
+  RemoveSelection(F)
+end Neutralize
+
+procedure DrawGrid(F: Frame; Q: D3.Mask; x, y, w, h, picx, picy, picw, pich: int16)
+  var
+    px, py, sx, sy, dh: int16
+begin
+  if picx < 0 then
+    picw := picw + picx
+    picx := 0
+  end
+  if picx + picw > F.pict.width then
+    picw := F.pict.width - picx
+  end
+  if picy < 0 then
+    pich := pich + picy
+    picy := 0
+  end
+  if picy + pich > F.pict.height then
+    pich := F.pict.height - picy
+  end
+  PicttoScreen(F, x, y, picx, picy + pich, @sx, @sy)
+  if sx < x then
+    if x - sx < picw * F.zoom then
+      picx := picx + obdiv(x - sx, F.zoom)
+      picw := picw - obdiv(x - sx, F.zoom)
+      sx := x
+    else
+      picw := 0
+    end
+  end
+
+  if sx > x + w then
+    picw := 0
+  else
+    if sx + picw * F.zoom > x + w then
+      picw := picw - obdiv(sx + picw * F.zoom - (x + w), F.zoom)
+    end
+
+    if sy > y + h then
+      if sy - (y + h) < pich * F.zoom then
+        pich := pich - obdiv(sy - (y + h), F.zoom)
+        sy := y + h
+      else
+        pich := 0
+      end
+    end
+
+    if sy - pich * F.zoom < y then
+      dh := obdiv(y - (sy - pich * F.zoom), F.zoom)
+      picy := picy + dh
+      pich := pich - dh
+    end
+  end
+
+  if (picw > 0) & (pich > 0) then
+    px := 1
+    while px <= picw do
+      D3.ReplConst(Q, D3.black, sx + px * F.zoom - 1, sy - pich * F.zoom, 1, pich * F.zoom, Display.invert)
+      px := px + 1
+    end
+
+    py := 1
+    while py <= pich do
+      D3.ReplConst(Q, D3.black, sx, sy - py * F.zoom, picw * F.zoom, 1, Display.invert)
+      py := py + 1
+    end
+  end
+end DrawGrid
+
+procedure DisplayBlock(F: Frame; Q: D3.Mask; p: Pictures.Picture; x, y, w, h, picx, picy, picw, pich: int16)
+  // Stellt ein gezoomtes Gebiet auf dem Bildschirm dar
+  var
+    px, py, col, px0, dy, ox, oy, sx, sy, dh: int16
+begin
+  if picx < 0 then
+    picw := picw + picx
+    picx := 0
+  end
+  if picx + picw > p.width then
+    picw := p.width - picx
+  end
+  if picy < 0 then
+    pich := pich + picy
+    picy := 0
+  end
+  if picy + pich > p.height then
+    pich := p.height - picy
+  end
+  PicttoScreen(F, x, y, picx, picy + pich, @sx, @sy)
+  // Clipping
+  if sx < x then
+    if x - sx < picw * F.zoom then
+      picx := picx + obdiv(x - sx, F.zoom)
+      picw := picw - obdiv(x - sx, F.zoom)
+      sx := x
+    else
+      picw := 0
+    end
+  end
+
+  if sx > x + w then
+    picw := 0
+  else
+    if sx + picw * F.zoom > x + w then
+      picw := picw - obdiv(sx + picw * F.zoom - (x + w), F.zoom)
+    end
+
+    if sy > y + h then
+      if sy - (y + h) < pich * F.zoom then
+        pich := pich - obdiv(sy - (y + h), F.zoom)
+        sy := y + h
+      else
+        pich := 0
+      end
+    end
+
+    if sy - pich * F.zoom < y then
+      dh := obdiv(y - (sy - pich * F.zoom), F.zoom)
+      picy := picy + dh
+      pich := pich - dh
+    end
+  end
+
+  if (picw > 0) & (pich > 0) then
+    // Pixeloutput
+    ox := picx
+    oy := picy + pich - 1
+    py := oy
+    while py >= picy do
+      px := ox
+      dy := sy - (oy - py) * F.zoom - F.zoom
+      while px < picx + picw do
+        px0 := px
+        Pictures.GetRun(p, @col, @px, py)
+        if px > picx + picw then
+          px := picx + picw
+        end
+        D3.ReplConst(Q, col, sx + (px0 - ox) * F.zoom, dy, (px - px0) * F.zoom, F.zoom, Display.replace)
+      end
+
+      dec(py)
+    end
+
+    if F.grid then
+      DrawGrid(F, Q, x, y, w, h, picx, picy, picw, pich)
+    end
+  end
+end DisplayBlock
+
+// Zeichnet den Pictureausschnitt neu
+procedure RestorePict*(F: Frame; Q: D3.Mask; x, y, w, h, picx, picy, picw, pich: int16)
+  var
+    px, py: int16
+    p: Pictures.Picture
+begin
+  if F.locked & (F.lockdata.scaledpict # nil) then
+    p := F.lockdata.scaledpict
+  else
+    p := F.pict
+  end
+
+  if F.border then
+    D3.AdjustMask(Q, x + 1, y + 1, w - 2, h - 2)
+  end
+  if F.zoom = 1 then
+    PicttoScreen(F, x, y, picx, picy, @px, @py)
+    D3.Pict(Q, p, picx, picy, picw, pich, px, py, Display.replace)
+  else
+    DisplayBlock(F, Q, p, x, y, w, h, picx, picy, picw, pich)
+  end
+end RestorePict
+
+procedure Restore(F: Frame; Q: D3.Mask; x, y, w, h, picx, picy, picw, pich: int16)
+  // Zeichnet ein bestimmtes Gebiet neu inkl Background
+  var
+    sx, sy: int16
+    M: D3.Mask
+    pw, ph: real
+    L: Lockrec
+begin
+  newgc(M)
+  D3.Open(M)
+  D3.Copy(Q, @M)
+  if F.locked then
+    L := F.lockdata
+    pw := val(real, w) / val(real, L.lw)
+    ph := val(real, h) / val(real, L.lh)
+    picx := val(int16, val(int16, floor(val(real, picx) * pw + 0.5)))
+    picy := val(int16, val(int16, floor(val(real, picy) * ph + 0.5)))
+    picw := val(int16, val(int16, floor(val(real, F.pict.width) * pw + 0.5)))
+    pich := val(int16, val(int16, floor(val(real, F.pict.height) * ph + 0.5)))
+
+    if (pw = val(real, 1)) & (ph = val(real, 1)) then
+      L.scaledpict := nil
+    elsif (w # L.actlw) or (h # L.actlh) then
+      L.actlw := w
+      L.actlh := h
+      F.px := val(int16, val(int16, floor(val(real, L.lpx) * pw + 0.5)))
+      F.py := val(int16, val(int16, floor(val(real, L.lpy) * ph + 0.5)))
+      newgc(L.scaledpict)
+      Rembrandt0.AllocatePictureMem(@L.scaledpict, picw, pich, F.pict.depth) // tk
+      CopyPalette(F.pict, L.scaledpict)
+      if L.scaledpict # nil then
+        Pictures.Copy(F.pict, L.scaledpict, 0, 0, F.pict.width, F.pict.height, 0, 0, L.scaledpict.width, L.scaledpict.height, Display.replace)
+      else
+        Out.String(" out of memory")
+        Out.Ln()
+      end
+    end
+
+    F.lockdata := L
+  end
+
+  RestorePict(F, M, x, y, w, h, picx, picy, picw, pich)
+  if F.border then
+    D3.AdjustMask(M, x + 1, y + 1, w - 2, h - 2)
+  end
+  // Restore Background
+  PicttoScreen(F, x, y, picx, picy, @sx, @sy)
+  if sx > x then
+    // left
+    D3.ReplConst(M, F.col, x, sy, sx - x, pich * F.zoom, Display.replace)
+  end
+
+  if sx + picw * F.zoom < x + w then
+    // right
+    D3.ReplConst(M, F.col, sx + picw * F.zoom, sy, x + w - sx - picw * F.zoom, pich * F.zoom, Display.replace)
+  end
+
+  if sy + pich * F.zoom < y + h then
+    // top
+    D3.ReplConst(M, F.col, x, sy + pich * F.zoom, w, y + h - sy - pich * F.zoom, Display.replace)
+  end
+
+  if sy > y then
+    // bottom
+    D3.ReplConst(M, F.col, x, y, w, sy - y, Display.replace)
+  end
+
+  // Rand
+  if F.border then
+    D3.Rect3D(Q, D3.topC, D3.bottomC, x, y, w, h, 1, Display.replace)
+  end
+  if Gadgets.selected in F.state then
+    D3.FillPattern(Q, D3.white, D3.selectpat, x, y, x, y, w, h, Display.paint) // Version 1.6
+  end
+end Restore
+
+procedure DrawCaret(Q: D3.Mask; x, y: int16)
+begin
+  Oberon.FadeCursor(@Oberon.Mouse)
+  D3.CopyPattern(Q, D3.black, Display.cross, x - 6, y - 6, Display.invert)
+end DrawCaret
+
+procedure SetCaret(F: Frame; cx, cy: int16)
+  var
+    M: DrawCaretMsg
+begin
+  Oberon.Defocus()
+  F.car := true
+  F.cx := cx
+  F.cy := cy
+  M.res := -1
+  M.F := F
+  Display.Broadcast(@M)
+end SetCaret
+
+procedure Print(F: Frame; M: pointer to Display.DisplayMsg)
+  var
+    R: D3.Mask
+
+  procedure PP(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end PP
+begin
+  if M.id = Display.contents then
+    newgc(R)
+    D3.Open(R)
+    D3.Add(R, Printer.FrameX, Printer.FrameY, Printer.FrameW, Printer.FrameH)
+    R.X := Printer.FrameX
+    R.Y := Printer.FrameY
+    R.W := Printer.FrameW
+    R.H := Printer.FrameH
+    R.x := 0
+    R.y := 0
+    Printer3.Pict(R, F.pict, Printer.FrameX, Printer.FrameY + Printer.FrameH - PP(F.pict.height), PP(F.pict.width), PP(F.pict.height), Display.replace)
+
+    Printer.Page(1)
+  else
+    Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+    Printer3.Pict(R, F.pict, M.x, M.y, PP(F.W), PP(F.H), Display.replace)
+  end
+end Print
+
+// Kopiert ein Rembrandt-Gadget
+procedure Copy*(M: pointer to Objects.CopyMsg; from, to_: Frame)
+  var
+    obj: Objects.Object
+    C: Objects.CopyMsg
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  to_.col := from.col
+  to_.px := from.px
+  to_.py := from.py
+  to_.selection := No
+  to_.selstruct := nil
+  to_.locked := from.locked
+  to_.lockdata := from.lockdata
+  to_.zoom := from.zoom
+  to_.grid := from.grid
+  to_.car := false
+  to_.border := from.border
+  to_.time := from.time
+  to_.seltime := from.seltime
+  to_.selpict := from.selpict
+  to_.selcol := from.selcol
+
+  obj := Gadgets.CopyPtr(M, from.pict)
+  if obj # nil then
+    to_.pict := obj(Pictures.Picture)
+  end
+
+  if from.lockdata.scaledpict # nil then
+    C.id := Objects.deep
+    C.obj := nil
+    Objects.Stamp(@C)
+    from.lockdata.scaledpict.handle(from.lockdata.scaledpict, @C)
+    to_.lockdata.scaledpict := C.obj(Pictures.Picture)
+  end
+end Copy
+
+procedure StoreFrame(F: Frame; M: pointer to Objects.FileMsg)
+begin
+  Files.WriteInt(@M.R, 16971)
+  Gadgets.framehandle(F, M)
+  Files.WriteInt(@M.R, F.col)
+  Files.WriteBool(@M.R, F.locked)
+  if F.locked then
+    Files.WriteInt(@M.R, F.lockdata.lw)
+    Files.WriteInt(@M.R, F.lockdata.lh)
+    Files.WriteInt(@M.R, F.lockdata.lpx)
+    Files.WriteInt(@M.R, F.lockdata.lpy)
+    Files.WriteInt(@M.R, F.lockdata.actlw)
+    Files.WriteInt(@M.R, F.lockdata.actlh)
+    Files.WriteInt(@M.R, F.pict.width)
+    Files.WriteInt(@M.R, F.pict.height)
+  end
+
+  Files.WriteBool(@M.R, F.border)
+  Files.WriteInt(@M.R, F.px)
+  Files.WriteInt(@M.R, F.py)
+  Files.WriteInt(@M.R, F.W)
+  Files.WriteInt(@M.R, F.H)
+  Gadgets.WriteRef(@M.R, F.lib, F.pict)
+end StoreFrame
+
+procedure LoadFrame(F: Frame; M: pointer to Objects.FileMsg)
+  var
+    version, w, h: int16
+    obj: Objects.Object
+begin
+  Files.ReadInt(@M.R, @version)
+  if (version # 16970) & (version # 16971) then
+    halt(99)
+  end
+  Gadgets.framehandle(F, M)
+  Files.ReadInt(@M.R, @F.col)
+  Files.ReadBool(@M.R, @F.locked)
+  if F.locked then
+    Files.ReadInt(@M.R, @F.lockdata.lw)
+    Files.ReadInt(@M.R, @F.lockdata.lh)
+    Files.ReadInt(@M.R, @F.lockdata.lpx)
+    Files.ReadInt(@M.R, @F.lockdata.lpy)
+    Files.ReadInt(@M.R, @F.lockdata.actlw)
+    Files.ReadInt(@M.R, @F.lockdata.actlh)
+    Files.ReadInt(@M.R, @w)
+    Files.ReadInt(@M.R, @h)
+  end
+
+  Files.ReadBool(@M.R, @F.border)
+  Files.ReadInt(@M.R, @F.px)
+  Files.ReadInt(@M.R, @F.py)
+  Files.ReadInt(@M.R, @F.W)
+  Files.ReadInt(@M.R, @F.H)
+  if version = 16970 then
+    F.pict.handle(F.pict, M)
+    if (F.lib # nil) & (F.lib.name # "") & (F.pict.lib # F.lib) then
+      Gadgets.BindObj(F.pict, F.lib)
+    end
+  elsif version = 16971 then
+    Gadgets.ReadRef(@M.R, F.lib, @obj)
+    if (obj # nil) & (obj is Pictures.Picture) then
+      F.pict := obj(Pictures.Picture)
+    else
+      Out.String("  discarding picture object ")
+      if (obj # nil) & (obj is Objects.Dummy) then
+        Out.String(@obj(Objects.Dummy).GName)
+      end
+      Out.Ln()
+      newgc(F.pict)
+      Pictures.Create(F.pict, 32, 32, Display.Depth(0))
+    end
+
+  else
+    halt(99)
+  end
+
+  if F.locked then
+    F.lockdata.actlw := 0
+    F.lockdata.actlh := 0
+  end
+end LoadFrame
+
+// Sichert den angegebenen Bereich des Picture als Undo-Information
+procedure SavePicture*(P: Pictures.Picture; x, y, w, h: int16)
+begin
+  if undo = nil then
+    newgc(undo)
+  end
+  newgc(undo.P)
+  Rembrandt0.AllocatePictureMem(@undo.P, w, h, P.depth)
+  CopyPalette(P, undo.P) // tk
+  if undo.P # nil then
+    Pictures.CopyBlock(P, undo.P, x, y, w, h, 0, 0, Display.replace)
+    undo.px := x
+    undo.py := y
+    undo.pict := P
+    undo.next := nil
+  end
+end SavePicture
+
+procedure ScanBorder(S: Pictures.Picture; y0: int16; list: pointer to Element)
+  var
+    i, x, y, decx, decy, x0: int16
+    vertex, act, last: Element
+begin
+  y := y0
+  x0 := 0
+  while Pictures.Get(S, x0 + 1, y0) = 0 do
+    inc(x0)
+  end
+  x := x0
+  i := 3
+  newgc(vertex)
+  vertex.x := -2
+  vertex.y := -2
+  list^ := vertex
+  newgc(vertex)
+  vertex.x := x0 - 1
+  vertex.y := y0 - 1
+  vertex.next := nil
+  list^.next := vertex
+  repeat
+    while Pictures.Get(S, seldir[i].dx + x, seldir[i].dy + y) # 0 do
+      i := band(i + 1, 3)
+    end
+    x := x + seldir[i].dx
+    y := y + seldir[i].dy
+    decx := x - 1
+    decy := y - 1
+    // Add to sorted List
+    act := list^
+    while (act.y < decy) & (act.next # nil) do
+      last := act
+      act := act.next
+    end
+    while (act.x < decx) & (act.y = decy) & (act.next # nil) do
+      last := act
+      act := act.next
+    end
+    if (act.y # decy) or (act.x # decx) then
+      newgc(vertex)
+      vertex.x := decx
+      vertex.y := decy
+      if (act.next = nil) & ((act.y < decy) or (act.x < decx) & (act.y = decy)) then
+        last := act
+      end
+      vertex.next := last.next
+      last.next := vertex
+    end
+
+    i := seldir[i].ind
+  until (x = x0) & (y = y0)
+end ScanBorder
+
+procedure SelectArea(F: Frame; P: Pictures.Picture; x0, y0: int16)
+  const
+    size_ = 10
+
+  type
+    Stack = pointer to StackDesc
+    StackDesc = record
+      x, y: array 10 (* size_ *) of int16
+      prev, next: Stack
+    end
+
+  var
+    st: Stack
+    bg, fg, x, y, l: int16 // left and right border of actual line
+    r, l0: int16 // left and right border of previous line
+    r0, l2, r2, pos: int16 // stack pointer
+    first, act: Element
+
+  procedure PUT(x, y: int16; pos: pointer to int16; st: pointer to Stack)
+  begin
+    // put the pair x, y onto the stack
+
+    if pos^ = size_ then
+      if st^.next = nil then
+        newgc(st^.next)
+        st^.next.prev := st^
+      end
+      st^ := st^.next
+      pos^ := 0
+      // if
+    end
+    st^.x[pos^] := x
+    st^.y[pos^] := y
+    inc(pos^)
+  end PUT
+
+  procedure GET(x, y: pointer to int16; pos: pointer to int16; st: pointer to Stack): boolean
+  begin
+    // fetch the pair x, y from the stack, return FALSE<=>stack is empty
+
+    if pos^ = 0 then
+      st^ := st^.prev
+      pos^ := size_
+    end
+
+    if st^ # nil then
+      dec(pos^)
+      x^ := st^.x[pos^]
+      y^ := st^.y[pos^]
+      return true
+    else
+      return false
+      // if
+    end
+    return false // TODO o2m: Micron requires a result on all control paths
+  end GET
+
+  procedure ScanRight(x0, lim, y: int16; background: boolean; P: pointer to Pictures.Picture; bg: pointer to int16): int16
+  begin
+    // scan line on y to first pixel in col, starting at x0
+
+    if background then
+      while (x0 < lim) & (bg^ # Pictures.Get(P^, x0, y)) do
+        inc(x0)
+      end
+    else
+      while (x0 < lim) & (bg^ = Pictures.Get(P^, x0, y)) do
+        inc(x0)
+      end
+    end
+    return x0
+  end ScanRight
+
+  procedure ScanLeft(x0, lim, y: int16; background: boolean; P: pointer to Pictures.Picture; bg: pointer to int16): int16
+  begin
+    // scan line on y to first pixel in col, starting at x0
+
+    if background then
+      while (x0 > lim) & (bg^ # Pictures.Get(P^, x0, y)) do
+        dec(x0)
+      end
+    else
+      while (x0 > lim) & (bg^ = Pictures.Get(P^, x0, y)) do
+        dec(x0)
+      end
+    end
+    return x0
+  end ScanLeft
+
+  procedure FillLine(x, y: int16; l, r: pointer to int16; F: pointer to Frame; P: pointer to Pictures.Picture; bg: pointer to int16; fg: pointer to int16; first: pointer to Element)
+    // fill line starting at x, y with black, return left & right end of line
+    var
+      p: Element
+  begin
+    l^ := ScanLeft(x, -1, y, false, P, bg) + 1
+    if l^ > x then
+      // no line to fill
+      r^ := x - 1
+    else
+      r^ := ScanRight(x, P^.width, y, false, P, bg) - 1
+      if r^ >= P^.width then
+        r^ := P^.width - 1
+      end
+      newgc(p)
+      p.x := l^
+      p.y := y
+      p.w := r^ - l^ + 1
+      p.next := first^
+      first^ := p
+      Pictures.ReplConst(P^, fg^, l^, y, p.w, 1, Display.replace)
+      F^.sx := Min(F^.sx, l^)
+      F^.sy := Min(F^.sy, y)
+      F^.sw := Max(F^.sw, r^ + 1)
+      F^.sh := Max(F^.sh, y)
+      // if
+    end
+  end FillLine
+begin
+  F.sx := 32767
+  F.sy := 32767
+  F.sw := 0
+  F.sh := 0
+  bg := Pictures.Get(P, x0, y0)
+  first := nil
+  if Rembrandt0.color.col = bg then
+    fg := Rembrandt0.color.col + 1
+  else
+    fg := Rembrandt0.color.col
+  end
+  newgc(st)
+  pos := 0
+  PUT(x0, y0, @pos, @st)
+  while GET(@x, @y, @pos, @st) do
+    while (y > 0) & (Pictures.Get(P, x, y - 1) = bg) do
+      dec(y)
+    end
+    r0 := x - 1
+    l0 := x + 1
+    repeat
+      FillLine(x, y, @l, @r, @F, @P, @bg, @fg, @first)
+      if (r - r0 > 1) & (y > 0) then
+        // fill area to the right beneath y
+        l2 := r0 + 1
+        loop
+          l2 := ScanRight(l2, r + 1, y - 1, true, @P, @bg)
+          if l2 <= r then
+            r2 := ScanRight(l2, P.width, y - 1, false, @P, @bg) - 1
+            PUT(asr(l2 + r2, 1), y - 1, @pos, @st)
+            l2 := r2 + 1
+          else
+            exit
+            // if
+          end
+          // loop
+        end
+      elsif r0 - r > 1 then
+        // fill area to the right above y
+        l2 := r + 1
+        loop
+          l2 := ScanRight(l2, r0 + 1, y, true, @P, @bg)
+          if l2 <= r0 then
+            r2 := ScanRight(l2, P.width, y, false, @P, @bg) - 1
+            PUT(asr(l2 + r2, 1), y, @pos, @st)
+            l2 := r2 + 1
+          else
+            exit
+            // if
+          end
+          // loop
+        end
+        // if
+      end
+      if (l0 - l > 1) & (y > 0) then
+        // fill area to the left beneath y
+        r2 := l0 - 1
+        loop
+          r2 := ScanLeft(r2, l - 1, y - 1, true, @P, @bg)
+          if r2 >= l then
+            l2 := ScanLeft(r2, -1, y - 1, false, @P, @bg) + 1
+            PUT(asr(l2 + r2, 1), y - 1, @pos, @st)
+            r2 := l2 - 1
+          else
+            exit
+            // if
+          end
+          // loop
+        end
+      elsif l - l0 > 1 then
+        // fill area to the left above y
+        r2 := l - 1
+        loop
+          r2 := ScanLeft(r2, l0 - 1, y, true, @P, @bg)
+          if r2 >= l0 then
+            l2 := ScanLeft(r2, -1, y, false, @P, @bg) + 1
+            PUT(asr(l2 + r2, 1), y, @pos, @st)
+            r2 := l2 - 1
+          else
+            exit
+            // if
+          end
+          // loop
+        end
+        // if
+      end
+      inc(y)
+      l0 := l
+      r0 := r
+    until (y = P.height) or (l > r)
+
+    // while
+  end
+  F.sw := F.sw - F.sx
+  F.sh := F.sh - F.sy + 1
+  act := first
+  F.selcol := bg
+  // Koordinaten relativieren
+  while act # nil do
+    Pictures.ReplConst(P, bg, act.x, act.y, act.w, 1, Display.replace)
+    act.x := act.x - F.sx
+    act.y := act.y - F.sy
+    act := act.next
+  end
+
+  F.selstruct := first
+end SelectArea
+
+procedure TrackObjectSelection(F: Frame; M: pointer to Oberon.InputMsg; x, y: int16)
+  var
+    x0, y0, oldsel: int16
+    keysum: set
+    P: Pictures.Picture
+    act: Element
+    f: Frame
+    fM: FocusMsg
+begin
+  oldsel := F.selection
+  RemoveSelection(F)
+  keysum := M.keys
+  if (MR in keysum) & (keysum # Cancel) & (oldsel # Object) then
+    ScreentoPict(F, x, y, M.X, M.Y, @x0, @y0)
+    if Effects.Inside(x0, y0, 0, 0, F.pict.width, F.pict.height) then
+      SelectArea(F, F.pict, x0, y0)
+      newgc(P) // tk
+      Rembrandt0.AllocatePictureMem(@P, F.sw + 2, F.sh + 2, F.pict.depth)
+      CopyPalette(F.pict, P)
+      act := F.selstruct
+      while act # nil do
+        Pictures.ReplConst(P, D3.FG, act.x + 1, act.y + 1, act.w, 1, Display.replace)
+        act := act.next
+      end
+
+      ScanBorder(P, y0 + 1 - F.sy, @F.seloutline)
+      SetSelection(F, Object)
+    end
+  end
+
+  repeat
+    Oberon.DrawCursor(@Oberon.Mouse, @cursor, M.X, M.Y)
+    Input.Mouse(@M.keys, @M.X, @M.Y)
+    keysum := keysum + M.keys
+  until M.keys = {}
+
+  if keysum = {MR,ML} then
+    // Selektion löschen
+    SavePicture(F.pict, F.sx, F.sy, F.sw, F.sh)
+    act := F.selstruct
+    while act # nil do
+      Pictures.ReplConst(F.pict, D3.BG, F.sx + act.x, F.sy + act.y, act.w, 1, Display.replace)
+      act := act.next
+    end
+
+    Pictures.Update(F.pict, F.sx, F.sy, F.sw, F.sh)
+  elsif keysum = {MR,MM} then
+    // Selektion kopieren
+    fM.F := nil
+    fM.res := -1
+    Display.Broadcast(@fM)
+    if (fM.F # nil) & (fM.F is Frame) then
+      f := fM.F(Frame)
+      SavePicture(f.pict, f.cx, f.cy, F.sw, F.sh)
+      act := F.selstruct
+      while act # nil do
+        Rembrandt0.ReplConst(f.pict, F.selcol, f.cx + act.x, f.cy + act.y, act.w, 1)
+        act := act.next
+      end
+
+      Pictures.Update(f.pict, f.cx, f.cy, F.sw, F.sh)
+    end
+  end
+end TrackObjectSelection
+
+procedure ProcessList(F: Frame; first: pointer to Element)
+  var
+    act: Element
+    P: Pictures.Picture
+    x0, y0, col: int16
+begin
+  col := D3.FG
+  y0 := asr(F.sh, 1)
+  x0 := 1
+  first^ := first^.next
+  newgc(P) // tk
+  Rembrandt0.AllocatePictureMem(@P, F.sw + 2, F.sh + 2, F.pict.depth)
+  CopyPalette(F.pict, P)
+  if P # nil then
+    while first^ # nil do
+      Pictures.Dot(P, col, first^.x - F.sx + 1, first^.y - F.sy + 1, Display.replace)
+      if y0 = first^.y - F.sy then
+        x0 := first^.x - F.sx
+      end
+      first^ := first^.next
+    end
+
+    ScanBorder(P, y0, @F.seloutline)
+    Rembrandt0.AllocatePictureMem(@P, F.sw + 2, F.sh + 2, F.pict.depth) // tk
+    CopyPalette(F.pict, P)
+    if P # nil then
+      act := F.seloutline.next
+      while act # nil do
+        Pictures.ReplConst(P, col, act.x, act.y, 1, 1, Display.replace)
+        act := act.next
+      end
+
+      SelectArea(F, P, x0, y0)
+      act := F.selstruct.next
+      first^ := act
+      if act = nil then
+        F.selstruct := nil
+      end
+    else
+      first^ := nil
+    end
+
+  else
+    first^ := nil
+  end
+end ProcessList
+
+procedure Line(x0, y0, x1, y1: int16; first: pointer to Element)
+  var
+    x, y, d, dx, dy, incx, incy, oldy: int16
+
+  procedure AddtoList(x, y, w: int16; first: pointer to Element)
+    var
+      p: Element
+  begin
+    newgc(p)
+    p.x := x
+    p.y := y
+    p.w := w
+    p.next := first^.next
+    first^.next := p
+  end AddtoList
+begin
+  x := x0
+  y := y0
+  dx := (x1 - x0) * 2
+  dy := (y1 - y0) * 2
+  incx := 0
+  if dx < 0 then
+    incx := -1
+    dx := -dx
+  elsif dx > 0 then
+    incx := 1
+  end
+  incy := 0
+  if dy < 0 then
+    incy := -1
+    dy := -dy
+  elsif dy > 0 then
+    incy := 1
+  end
+  d := incx * (x0 - x1)
+  oldy := y
+  AddtoList(x, y, 1, first)
+  if dx > dy then
+    while x # x1 do
+      inc(x, incx)
+      inc(d, dy)
+      if d > 0 then
+        inc(y, incy)
+        dec(d, dx)
+      end
+      AddtoList(x, y, oldy - y, first)
+      oldy := y
+    end
+
+  else
+    while y # y1 do
+      inc(y, incy)
+      inc(d, dx)
+      if d > 0 then
+        inc(x, incx)
+        dec(d, dy)
+      end
+      AddtoList(x, y, oldy - y, first)
+      oldy := y
+    end
+  end
+end Line
+
+// Zeichnet eine Linie von x0, y0 nach x1, y1 mit Dicke dw; kann als Gummilinie benutzt werden
+procedure DisplayLine*(F: Frame; x, y: int16; Q: D3.Mask; col, x0, y0, x1, y1, dw: int16)
+  var
+    lx, ly, d, dx, dy, incx, incy, sx, sy: int16
+begin
+  ScreentoPict(F, x, y, x0, y0, @x0, @y0)
+  ScreentoPict(F, x, y, x1, y1, @x1, @y1)
+  lx := x0
+  ly := y0
+  PicttoScreen(F, x, y, lx, ly, @sx, @sy)
+  D3.ReplConst(Q, col, sx, sy, dw, dw, Display.invert)
+  dx := (x1 - x0) * 2
+  dy := (y1 - y0) * 2
+  incx := 0
+  if dx < 0 then
+    incx := -1
+    dx := -dx
+  elsif dx > 0 then
+    incx := 1
+  end
+  incy := 0
+  if dy < 0 then
+    incy := -1
+    dy := -dy
+  elsif dy > 0 then
+    incy := 1
+  end
+  d := incx * (x0 - x1)
+  if dx > dy then
+    while lx # x1 do
+      inc(lx, incx)
+      inc(d, dy)
+      if d > 0 then
+        inc(ly, incy)
+        dec(d, dx)
+      end
+      PicttoScreen(F, x, y, lx, ly, @sx, @sy)
+      D3.ReplConst(Q, col, sx, sy, dw, dw, Display.invert)
+    end
+
+  else
+    while ly # y1 do
+      inc(ly, incy)
+      inc(d, dx)
+      if d > 0 then
+        inc(lx, incx)
+        dec(d, dy)
+      end
+      PicttoScreen(F, x, y, lx, ly, @sx, @sy)
+      D3.ReplConst(Q, col, sx, sy, dw, dw, Display.invert)
+    end
+  end
+end DisplayLine
+
+procedure TrackFreehandSelection(F: Frame; M: pointer to Oberon.InputMsg; x, y: int16)
+  var
+    x0, y0, ox, oy, mx, my, px0, py0, px1, py1, startx, starty, oldsel: int16
+    keysum: set
+    list: Element
+    ofsx, ofsy, ofsw, ofsh: int16
+    nomove: boolean
+    prev, last: record
+      x, y: int16
+    end
+    Q: D3.Mask
+begin
+  oldsel := F.selection
+  RemoveSelection(F)
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  newgc(list)
+  list.next := nil
+  list.x := -1
+  list.y := -1
+  nomove := true
+  ScreentoPict(F, x, y, M.X, M.Y, @startx, @starty)
+  PicttoScreen(F, x, y, startx, starty, @mx, @my)
+  x0 := mx
+  y0 := my
+  keysum := M.keys
+  ScreentoPict(F, x, y, mx, my, @px0, @py0)
+  while ~Effects.Inside(px0, py0, 0, 0, F.pict.width, F.pict.height) & (M.keys # {}) do
+    Input.Mouse(@M.keys, @mx, @my)
+    x0 := mx
+    y0 := my
+    ScreentoPict(F, x, y, mx, my, @px0, @py0)
+    startx := px0
+    starty := py0
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Cross, mx + asr(F.zoom, 1), my + asr(F.zoom, 1))
+  end
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+  DisplayLine(F, x, y, Q, F.selcolor, x0, y0, x0, y0, F.zoom)
+  F.sx := px0
+  F.sy := py0
+  F.sw := px0
+  F.sh := py0
+  prev.x := 32767
+  prev.y := 32767
+  last := prev
+  repeat
+    ox := mx
+    oy := my
+    Input.Mouse(@M.keys, @mx, @my)
+    ScreentoPict(F, x, y, mx, my, @px1, @py1)
+    PicttoScreen(F, x, y, px1, py1, @mx, @my)
+    if (mx # ox) or (my # oy) then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      DisplayLine(F, x, y, Q, F.selcolor, x0, y0, ox, oy, F.zoom)
+      DisplayLine(F, x, y, Q, F.selcolor, x0, y0, mx, my, F.zoom)
+    end
+
+    if keysum = {MR,MM} then
+      if (px0 # px1) or (py0 # py1) then
+        if Effects.Inside(px1, py1, 0, 0, F.pict.width, F.pict.height) then
+          Line(px0, py0, px1, py1, @list)
+          F.sx := Min(px1, F.sx)
+          F.sy := Min(py1, F.sy)
+          F.sw := Max(px1, F.sw)
+          F.sh := Max(py1, F.sh)
+          x0 := mx
+          y0 := my
+          nomove := false
+          px0 := px1
+          py0 := py1
+        end
+      end
+
+      keysum := keysum - {MM}
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Cross, mx + asr(F.zoom, 1), my + asr(F.zoom, 1))
+    keysum := keysum + M.keys
+  until M.keys = {}
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+  if (MR in keysum) & (keysum # Cancel) & ~nomove then
+    PicttoScreen(F, x, y, startx, starty, @px1, @py1)
+    DisplayLine(F, x, y, Q, F.selcolor, x0, y0, px1, py1, F.zoom)
+    Line(px0, py0, startx, starty, @list)
+    F.sw := F.sw - F.sx + 2
+    F.sh := F.sh - F.sy + 2
+    if (F.sw > 2) & (F.sh > 2) then
+      ofsx := F.sx
+      ofsy := F.sy
+      ofsw := F.sw
+      ofsh := F.sh
+      ProcessList(F, @list)
+      F.sx := ofsx
+      F.sy := ofsy
+      F.sw := ofsw
+      F.sh := ofsh
+      F.selcol := Rembrandt0.color.col
+      if keysum = {MR,ML} then
+        // Selektion löschen
+        SavePicture(F.pict, F.sx, F.sy, F.sw, F.sh)
+        while list # nil do
+          Pictures.ReplConst(F.pict, D3.BG, F.sx + list.x, F.sy + list.y, list.w, 1, Display.replace)
+          list := list.next
+        end
+        Pictures.Update(F.pict, F.sx, F.sy, F.sw, F.sh)
+      else
+        Pictures.Update(F.pict, F.sx, F.sy, F.sw, F.sh)
+        if list # nil then
+          SetSelection(F, Freehand)
+        end
+      end
+
+    else
+      Pictures.Update(F.pict, F.sx, F.sy, F.sw, F.sh)
+    end
+
+  elsif (keysum = {MR}) & nomove & (oldsel = No) then
+    F.seloutline := nil
+    F.sx := 0
+    F.sy := 0
+    F.sw := F.pict.width
+    F.sh := F.pict.height
+    Pictures.Update(F.pict, F.sx, F.sy, F.sw, F.sh)
+    SetSelection(F, Image)
+  else
+    DisplayLine(F, x, y, Q, F.selcolor, x0, y0, ox, oy, F.zoom)
+    Pictures.Update(F.pict, 0, 0, F.pict.width, F.pict.height)
+    F.seloutline := nil
+  end
+end TrackFreehandSelection
+
+(* PROCEDURE UndoRedo(VAR s, d: Region);
+VAR last, act: Region; p: Pictures.Picture;
+BEGIN
+IF s#NIL THEN
+NEW(p);
+Rembrandt0.AllocatePictureMem(p, s.P.width, s.P.height, s.P.depth);
+CopyPalette(s.F.pict, p); (* tk *)
+IF p#NIL THEN
+Pictures.CopyBlock(s.F.pict,  p, s.px, s.py, s.P.width, s.P.height, 0, 0, Display.replace);
+Pictures.CopyBlock(s.P, s.F.pict, 0, 0, s.P.width, s.P.height, s.px, s.py, Display.replace);
+last:= s; s:= s.next; last.next:= d; d:= last; d.P:= p;
+Pictures.Update(last.F.pict, 0, 0, last.F.pict.width, last.F.pict.height)
+ELSE
+WHILE (s#NIL) & (p=NIL) DO
+act:= s; last:= NIL; WHILE act.next#NIL DO last:= act; act:= act.next END;
+IF last=NIL THEN s:=NIL ELSE last.next:= NIL END;
+NEW(p);
+Rembrandt0.AllocatePictureMem(p, s.P.width, s.P.height, s.P.depth);
+CopyPalette(s.F.pict, p); (* tk *)
+END;
+IF p#NIL THEN
+Pictures.CopyBlock(s.F.pict,  p, s.px, s.py, s.P.width, s.P.height, 0, 0, Display.replace);
+Pictures.CopyBlock(s.P, s.F.pict, 0, 0, s.P.width, s.P.height, s.px, s.py, Display.replace);
+last:= s; s:= s.next; last.next:= d; d:= last; d.P:= p;
+Pictures.Update(last.F.pict, 0, 0, last.F.pict.width, last.F.pict.height)
+END
+END
+END
+END UndoRedo; *)
+
+// Undo; kopiert den zuvor gesicherten Bereich ins entsprechende Picture zurück
+procedure Undo*()
+  // Redo für 1 Level gleich
+  var
+    p: Pictures.Picture
+begin
+  // UndoRedo(undo, redo)
+  if (undo # nil) & (undo.P # nil) then
+    newgc(p)
+    Rembrandt0.AllocatePictureMem(@p, undo.P.width, undo.P.height, undo.P.depth)
+    CopyPalette(undo.pict, p)
+    if p # nil then
+      Pictures.CopyBlock(undo.pict, p, undo.px, undo.py, undo.P.width, undo.P.height, 0, 0, Display.replace)
+    end
+    Pictures.CopyBlock(undo.P, undo.pict, 0, 0, undo.P.width, undo.P.height, undo.px, undo.py, Display.replace)
+    if p # nil then
+      undo.P := p
+    end
+    Pictures.Update(undo.pict, 0, 0, undo.pict.width, undo.pict.height)
+  end
+end Undo
+
+(* PROCEDURE Redo*;
+BEGIN
+UndoRedo(redo, undo)
+END Redo; *)
+
+procedure WriteChar(F: Frame; lib: Objects.Library; col: int16; ch: char; px, py: pointer to int16)
+  // Schreibt einen Buchstaben an die Position px, py im Picture
+  var
+    dx: int16
+    obj: Objects.Object
+begin
+  if (px^ # F.string.x) or (py^ # F.string.y) then
+    F.string.len_ := 0
+    SavePicture(F.pict, 0, 0, F.pict.width, F.pict.height)
+  end
+
+  dx := 0
+  if ch = 0DX then
+    // Return-Taste gedrückt
+    py^ := py^ - lib(Fonts.Font).height
+    px^ := px^ - F.string.len_
+    F.string.len_ := 0
+  elsif (ch >= " ") or (ch = 9X) then
+    lib.GetObj(lib, val(int16, ord(ch)), @obj)
+    case obj of
+    | Fonts.Char:
+      dx := obj.dx
+      if (px^ >= 0) & (px^ + obj.w < F.pict.width) & (py^ >= 0) & (py^ + obj.h < F.pict.height) then
+        Pictures.CopyPattern(F.pict, Rembrandt0.color.col, obj.pat (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; Oberon: Pictures.CopyPattern(F.pict, Rembrandt0.color.col, obj.pat, px+obj.x, py+obj.y, Display.paint); *), px^ + obj.x, py^ + obj.y, Display.paint)
+      end
+    end
+  end
+
+  px^ := px^ + dx
+  inc(F.string.len_, dx)
+  F.string.x := px^
+  F.string.y := py^
+end WriteChar
+
+procedure Write(F: Frame; M: pointer to Oberon.InputMsg; x, y: int16)
+  var
+    obj: Objects.Object
+    px, py: int16
+begin
+  px := F.cx
+  py := F.cy
+  WriteChar(F, M.fnt, Rembrandt0.color.col, M.ch, @px, @py)
+  M.fnt.GetObj(M.fnt, val(int16, ord(M.ch)), @obj)
+  case obj of
+  | Fonts.Char:
+    Pictures.Update(F.pict, px - obj.dx + obj.x, py + obj.y, obj.w, obj.h)
+    SetCaret(F, px, py)
+  end
+
+  M.res := 0
+end Write
+
+procedure CopyText(F: Frame; text: Texts.Text; beg, end_: int32; x, y: int16)
+  // Kopiert einen selektierten Text an die Caretposition im Picture
+  var
+    R: Texts.Reader
+    ch: char
+    px, py: int16
+begin
+  Texts.OpenReader(@R, text, beg)
+  Texts.Read(@R, @ch)
+  px := F.cx
+  py := F.cy
+  while beg < end_ do
+    WriteChar(F, R.lib, R.col, ch, @px, @py)
+    Texts.Read(@R, @ch)
+    inc(beg)
+  end
+
+  Pictures.Update(F.pict, 0, 0, F.pict.width, F.pict.height)
+  SetCaret(F, px, py)
+end CopyText
+
+procedure CopyOver(F: Frame; P: Pictures.Picture; x, y: int16)
+begin
+  if F.car & (P # nil) then
+    Oberon.RemoveMarks(x, y, F.W, F.H)
+    SavePicture(F.pict, F.cx, F.cy, P.width, P.height)
+    Pictures.CopyBlock(P, F.pict, 0, 0, P.width, P.height, F.cx, F.cy, Display.replace)
+    Pictures.Update(F.pict, F.cx, F.cy, P.width, P.height)
+  end
+end CopyOver
+
+// Aufspannen eines Rechtecks mit der Maus; analog Effects.SizeRect jedoch zusätzlich mit Prozentangabe falls info=TRUE
+procedure SizeRect*(F: Frame; x, y: int16; Q: D3.Mask; keysum: pointer to set; mx, my, sx, sy, sw, sh: pointer to int16; info: boolean)
+  var
+    keys: set
+    ox, oy, opx, opy, dz, oldsw, oldsh, cmx, cmy: int16
+    disptext: array 22 of char
+
+  procedure ConvertNumberstoText(x, y: int32; text: pointer to array of char)
+  begin
+    text[0] := "X"
+    text[1] := ":"
+    text[2] := " "
+    if x > 999 then
+      text[3] := chr(obdiv(x, 1000) + 48)
+    else
+      text[3] := " "
+    end
+    text[4] := chr(obmod(x, 1000) div 100 + 48)
+    text[5] := chr(obmod(x, 100) div 10 + 48)
+    text[6] := chr(obmod(x, 10) + 48)
+    text[7] := " "
+    text[8] := "%"
+    text[9] := " "
+    text[10] := " "
+    text[11] := "Y"
+    text[12] := ":"
+    text[13] := " "
+    if y > 999 then
+      text[14] := chr(obdiv(y, 1000) + 48)
+    else
+      text[14] := " "
+    end
+    text[15] := chr(obmod(y, 1000) div 100 + 48)
+    text[16] := chr(obmod(y, 100) div 10 + 48)
+    text[17] := chr(obmod(y, 10) + 48)
+    text[18] := " "
+    text[19] := "%"
+    text[20] := 0X
+  end ConvertNumberstoText
+begin
+  keys := keysum^
+  oldsw := sw^
+  oldsh := sh^
+  dz := F.zoom
+  cmx := sx^ + asr(sw^ * dz, 1) - 50
+  cmy := sy^ + asr(sh^ * dz, 1)
+  ScreentoPict(F, x, y, mx^, my^, mx, my)
+  PicttoScreen(F, x, y, mx^, my^, mx, my)
+  ScreentoPict(F, x, y, sx^, sy^, sx, sy)
+  PicttoScreen(F, x, y, sx^, sy^, sx, sy)
+  if (sw^ = 0) or (sh^ = 0) then
+    ox := mx^
+    oy := my^
+    opx := ox
+    opy := oy
+  else
+    if sx^ + asr(sw^, 1) > mx^ then
+      if sy^ + asr(sh^, 1) > my^ then
+        opx := sx^ + sw^
+        opy := sy^ + sh^
+        ox := sx^
+        oy := sy^
+      else
+        opx := sx^ + sw^
+        opy := sy^
+        ox := sx^
+        oy := sy^ + sh^
+      end
+
+    else
+      if sy^ + asr(sh^, 1) > my^ then
+        opx := sx^
+        opy := sy^ + sh^
+        oy := sy^
+        ox := sx^ + sw^
+      else
+        opx := sx^
+        opy := sy^
+        oy := sy^
+        ox := sx^
+      end
+    end
+  end
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+  if info then
+    ConvertNumberstoText(obdiv(100 * val(int32, obdiv(sw^, F.zoom)), obdiv(oldsw, F.zoom)), obdiv(100 * val(int32, obdiv(sh^, F.zoom)), obdiv(oldsh, F.zoom)), @disptext)
+    Effects.OpenMenu(cmx, cmy, 100, 16)
+    DisplayText(cmx, cmy, 100, 16, @disptext)
+  end
+
+  D3.Rect(Q, selcolor, Display.solid, sx^, sy^, sw^, sh^, dz, Display.invert)
+  Oberon.DrawCursor(@Oberon.Mouse, @cursor, mx^, my^)
+  repeat
+    if (ox # mx^) or (oy # my^) then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      D3.Rect(Q, selcolor, Display.solid, sx^, sy^, sw^, sh^, dz, Display.invert)
+      if mx^ < opx then
+        sw^ := opx - mx^ + dz
+        sx^ := mx^
+      else
+        sw^ := mx^ - opx
+        sx^ := opx
+      end
+
+      if my^ < opy then
+        sh^ := opy - my^ + dz
+        sy^ := my^
+      else
+        sh^ := my^ - opy
+        sy^ := opy
+      end
+
+      D3.Rect(Q, selcolor, Display.solid, sx^, sy^, sw^, sh^, dz, Display.invert)
+      if info then
+        ConvertNumberstoText(obdiv(100 * val(int32, obdiv(sw^, F.zoom)), obdiv(oldsw, F.zoom)), obdiv(100 * val(int32, obdiv(sh^, F.zoom)), obdiv(oldsh, F.zoom)), @disptext)
+        DisplayText(cmx, cmy, 100, 16, @disptext)
+      end
+
+      Oberon.DrawCursor(@Oberon.Mouse, @cursor, mx^, my^)
+    end
+
+    ox := mx^
+    oy := my^
+    Input.Mouse(@keys, mx, my)
+    ScreentoPict(F, x, y, mx^, my^, mx, my)
+    PicttoScreen(F, x, y, mx^, my^, mx, my)
+    keysum^ := keysum^ + keys
+  until keys = {}
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+  D3.Rect(Q, selcolor, Display.solid, sx^, sy^, sw^, sh^, dz, Display.invert)
+  if info then
+    Effects.CloseMenu()
+  end
+  sw^ := obdiv(sw^, F.zoom)
+  sh^ := obdiv(sh^, F.zoom)
+end SizeRect
+
+// Handler für rechte Maustaste
+procedure TrackSelection*(F: Frame; M: pointer to Oberon.InputMsg; x, y, w, h: int16)
+  var
+    Q: D3.Mask
+    cM: Display.ConsumeMsg
+    ox, oy, fx, fy, oldsel: int16
+    P: Pictures.Picture
+    F0: Frame
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  F.selcolor := selcolor
+  if seltype = Freehand then
+    TrackFreehandSelection(F, M, x, y)
+  elsif seltype = Object then
+    TrackObjectSelection(F, M, x, y)
+  else
+    // Block or Image
+    oldsel := F.selection
+    RemoveSelection(F)
+    Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+    fx := M.X
+    fy := M.Y
+    F.sw := 0
+    F.sh := 0
+    SizeRect(F, x, y, Q, @M.keys, @M.X, @M.Y, @fx, @fy, @F.sw, @F.sh, false)
+    if (M.keys = {MR}) & (F.sw > 1) & (F.sh > 1) then
+      ScreentoPict(F, x, y, fx, fy, @ox, @oy)
+      if ox < 0 then
+        F.sw := F.sw + ox
+        ox := 0
+      end
+      if oy < 0 then
+        F.sh := F.sh + oy
+        oy := 0
+      end
+      if ox + F.sw > F.pict.width then
+        F.sw := F.pict.width - ox
+      end
+      if oy + F.sh > F.pict.height then
+        F.sh := F.pict.height - oy
+      end
+      F.sx := ox
+      F.sy := oy
+      if (F.sw = F.pict.width) & (F.sh = F.pict.height) then
+        SetSelection(F, Image)
+      else
+        SetSelection(F, Block)
+      end
+
+    elsif (M.keys = {MR}) & (oldsel = No) then
+      // Ganzes Picture selektieren falls vorher nichts sel. wurde
+      F.sx := 0
+      F.sy := 0
+      F.sw := F.pict.width
+      F.sh := F.pict.height
+      SetSelection(F, Image)
+    elsif M.keys = {MR,ML} then
+      // Selektion löschen
+      ScreentoPict(F, x, y, fx, fy, @ox, @oy)
+      if ox < 0 then
+        F.sw := F.sw + ox
+        ox := 0
+      end
+      if oy < 0 then
+        F.sh := F.sh + oy
+        oy := 0
+      end
+      if (F.sw <= 1) or (F.sh <= 1) then
+        F.sw := F.pict.width
+        F.sh := F.pict.height
+        ox := 0
+        oy := 0
+      end
+      SavePicture(F.pict, ox, oy, F.sw, F.sh)
+      Pictures.ReplConst(F.pict, D3.BG, ox, oy, F.sw, F.sh, Display.replace)
+      Pictures.Update(F.pict, ox, oy, F.sw, F.sh)
+    elsif (M.keys = {MR,MM}) & (F.sw > 1) & (F.sh > 1) then
+      // Copy selected Area to caret position
+      newgc(P)
+      Rembrandt0.AllocatePictureMem(@P, F.sw, F.sh, F.pict.depth)
+      CopyPalette(F.pict, P) // tk
+      ScreentoPict(F, x, y, fx, fy, @ox, @oy)
+      CopyPalette(F.pict, P)
+      Pictures.CopyBlock(F.pict, P, ox, oy, F.sw, F.sh, 0, 0, Display.replace)
+      newgc(F0)
+      NewP(F0, P)
+      Attributes.SetBool(F0, "Locked", true)
+      Attributes.SetBool(F0, "Border", false)
+      cM.obj := F0
+      cM.id := Display.integrate
+      cM.F := nil
+      Display.Broadcast(@cM)
+    end
+  end
+
+  M.res := 0
+end TrackSelection
+
+procedure MovePicture(F: Frame; M: pointer to Oberon.InputMsg; x, y: int16)
+  var
+    ox, oy, ow, oh: int16
+    f: Display.Frame
+    C: Display.ConsumeMsg
+    CM: Objects.CopyMsg
+begin
+  // Gadgets.MakeMask(F, x, y, M.dlink, Q);
+  ow := F.pict.width * F.zoom
+  oh := F.pict.height * F.zoom
+  PicttoScreen(F, x, y, 0, 0, @ox, @oy)
+  F.sx := ox
+  F.sy := oy
+  Effects.MoveRect(nil, @M.keys, @M.X, @M.Y, @ox, @oy, @ow, @oh) // Q
+  if M.keys = {MM} then
+    F.px := F.px + obdiv(ox - F.sx, F.zoom)
+    F.py := F.py - obdiv(oy - F.sy, F.zoom)
+    F.car := false
+    if F.selection = Image then
+      F.sx := 0
+      F.sy := 0
+      Gadgets.Update(F)
+      SetSelection(F, Image)
+
+    else
+      Gadgets.Update(F)
+    end
+
+  else
+    if F.selection = Image then
+      F.sx := 0
+      F.sy := 0
+      x := M.x + F.X
+      y := M.y + F.Y
+      Gadgets.ThisFrame(M.X, M.Y, @f, @ox, @oy)
+      if (f # nil) & (f # F) then
+        if M.keys = {MM,MR} then
+          CM.id := Objects.deep
+        elsif M.keys = {ML,MM} then
+          CM.id := Objects.shallow
+        else
+          CM.id := -1
+        end
+
+        if CM.id in {Objects.deep,Objects.shallow} then
+          Objects.Stamp(@CM) // copy the object
+          F.handle(F, @CM)
+          CM.obj.slink := nil
+          CM.obj(Display.Frame).W := F.pict.width
+          CM.obj(Display.Frame).H := F.pict.height
+          C.id := Display.drop
+          C.obj := CM.obj
+          C.F := f
+          C.u := ox + (x - M.X)
+          C.v := oy + (y - M.Y)
+          Display.Broadcast(@C)
+        end
+      end
+    end
+  end
+
+  M.res := 0
+end MovePicture
+
+procedure MakePictMask(F: Frame; x, y: int16; Q: D3.Mask)
+  var
+    ax, ay, aw, ah: int16
+begin
+  if F.px > 0 then
+    ax := x + F.px
+  else
+    ax := x + 1
+  end
+
+  if y > y + F.H - F.py - F.pict.height then
+    ay := y + 1
+  else
+    ay := y + F.H - F.py - F.pict.height
+  end
+
+  if F.W > F.px + F.pict.width then
+    aw := x + F.pict.width + F.px - ax
+  else
+    aw := x + F.W - ax - 1
+  end
+
+  if F.py > 0 then
+    ah := y + F.H - F.py - ay
+  else
+    ah := y + F.H - ay - 1
+  end
+
+  if F.border then
+    D3.AdjustMask(Q, ax, ay, aw, ah)
+  else
+    D3.AdjustMask(Q, ax - 1, ay - 1, aw + 2, ah + 2)
+  end
+end MakePictMask
+
+procedure MoveBlock(F: Frame; x, y: int16; Q: D3.Mask; M: pointer to Oberon.InputMsg; P: Pictures.Picture; sx, sy: pointer to int16; w, h: int16; interclick: boolean)
+  var
+    keys: set
+    omx, omy, px, py, dx, dy, opx, opy, dw, dh: int16
+    first: boolean
+begin
+  Oberon.RemoveMarks(x, y, F.W, F.H)
+  RemoveSelection(F)
+  if F.zoom = 1 then
+    MakePictMask(F, x, y, Q)
+    keys := M.keys
+    first := true
+    omx := M.X
+    omy := M.Y
+    dx := M.X - sx^
+    dy := M.Y - sy^
+    ScreentoPict(F, x, y, omx - dx, omy - dy, @opx, @opy)
+    D3.Pict(Q, P, 0, 0, w, h, M.X - dx, M.Y - dy, Display.replace)
+    repeat
+      if interclick & first & (keys = {MM,ML}) then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        first := false
+        ScreentoPict(F, x, y, omx - dx, omy - dy, @opx, @opy)
+        dw := M.X - omx
+        dh := M.Y - omy
+        if dw > 0 then
+          D3.Pict(Q, F.pict, opx, opy, dw, h, omx - dx, omy - dy, Display.replace)
+          if dh > 0 then
+            D3.Pict(Q, F.pict, opx + dw, opy, w - dw, dh, omx - dx + dw, omy - dy, Display.replace)
+          else
+            D3.Pict(Q, F.pict, opx + dw, opy + h + dh, w - dw, -dh, omx - dx + dw, omy - dy + h + dh, Display.replace)
+          end
+
+        else
+          D3.Pict(Q, F.pict, opx + w + dw, opy, -dw, h, omx + w + dw - dx, omy - dy, Display.replace)
+          if dh > 0 then
+            D3.Pict(Q, F.pict, opx, opy, w - dw, dh, omx - dx, omy - dy, Display.replace)
+          else
+            D3.Pict(Q, F.pict, opx, opy + h + dh, w + dw, -dh, omx - dx, omy - dy + h + dh, Display.replace)
+          end
+        end
+
+        ScreentoPict(F, x, y, M.X - dx, M.Y - dy, @opx, @opy)
+        clipboard.Paste(F.pict, opx, opy)
+        MakePictMask(F, x, y, Q)
+        keys := keys - {ML}
+        Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, M.X, M.Y)
+      elsif (omx # M.X) or (omy # M.Y) then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        first := true
+        ScreentoPict(F, x, y, omx - dx, omy - dy, @opx, @opy)
+        dw := M.X - omx
+        dh := M.Y - omy
+        if dw > 0 then
+          D3.Pict(Q, F.pict, opx, opy, dw, h, omx - dx, omy - dy, Display.replace)
+          if dh > 0 then
+            D3.Pict(Q, F.pict, opx + dw, opy, w - dw, dh, omx - dx + dw, omy - dy, Display.replace)
+          else
+            D3.Pict(Q, F.pict, opx + dw, opy + h + dh, w - dw, -dh, omx - dx + dw, omy - dy + h + dh, Display.replace)
+          end
+
+        else
+          D3.Pict(Q, F.pict, opx + w + dw, opy, -dw, h, omx + w + dw - dx, omy - dy, Display.replace)
+          if dh > 0 then
+            D3.Pict(Q, F.pict, opx, opy, w - dw, dh, omx - dx, omy - dy, Display.replace)
+          else
+            D3.Pict(Q, F.pict, opx, opy + h + dh, w + dw, -dh, omx - dx, omy - dy + h + dh, Display.replace)
+          end
+        end
+
+        D3.Pict(Q, P, 0, 0, w, h, M.X - dx, M.Y - dy, Display.replace)
+        Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, M.X, M.Y)
+      end
+
+      omx := M.X
+      omy := M.Y
+      Input.Mouse(@keys, @M.X, @M.Y)
+      M.keys := M.keys + keys
+    until keys = {}
+
+    sx^ := M.X - dx
+    sy^ := M.Y - dy
+  else
+    // falls zoom dann nur Gummirechteck verschieben
+    Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+    w := w * F.zoom
+    h := h * F.zoom
+    F.selcolor := selcolor
+    ScreentoPict(F, x, y, M.X, M.Y, @opx, @opy)
+    PicttoScreen(F, x, y, opx, opy, @M.X, @M.Y)
+    Oberon.FadeCursor(@Oberon.Mouse)
+    first := true
+    D3.Rect(Q, F.selcolor, Display.solid, sx^ - F.zoom, sy^ - F.zoom, w + 2 * F.zoom, h + 2 * F.zoom, F.zoom, Display.invert)
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, M.X, M.Y)
+    repeat
+      ScreentoPict(F, x, y, M.X, M.Y, @px, @py)
+      if interclick & first & (keys = {MM,ML}) then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        first := false
+        D3.Rect(Q, F.selcolor, Display.solid, sx^ - F.zoom, sy^ - F.zoom, w + 2 * F.zoom, h + 2 * F.zoom, F.zoom, Display.invert)
+        sx^ := sx^ + (px - opx) * F.zoom
+        sy^ := sy^ + (py - opy) * F.zoom
+        ScreentoPict(F, x, y, sx^, sy^, @opx, @opy)
+        clipboard.Paste(F.pict, opx, opy)
+        keys := keys - {ML}
+        D3.Rect(Q, F.selcolor, Display.solid, sx^ - F.zoom, sy^ - F.zoom, w + 2 * F.zoom, h + 2 * F.zoom, F.zoom, Display.invert)
+        PicttoScreen(F, x, y, px, py, @M.X, @M.Y)
+        Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, M.X, M.Y)
+      elsif (opx # px) or (opy # py) then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        first := true
+        D3.Rect(Q, F.selcolor, Display.solid, sx^ - F.zoom, sy^ - F.zoom, w + 2 * F.zoom, h + 2 * F.zoom, F.zoom, Display.invert)
+        sx^ := sx^ + (px - opx) * F.zoom
+        sy^ := sy^ + (py - opy) * F.zoom
+        D3.Rect(Q, F.selcolor, Display.solid, sx^ - F.zoom, sy^ - F.zoom, w + 2 * F.zoom, h + 2 * F.zoom, F.zoom, Display.invert)
+        PicttoScreen(F, x, y, px, py, @M.X, @M.Y)
+        Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, M.X, M.Y)
+      end
+
+      opx := px
+      opy := py
+      Input.Mouse(@keys, @M.X, @M.Y)
+      M.keys := M.keys + keys
+    until keys = {}
+
+    Oberon.FadeCursor(@Oberon.Mouse)
+    D3.Rect(Q, F.selcolor, Display.solid, sx^ - F.zoom, sy^ - F.zoom, w + 2 * F.zoom, h + 2 * F.zoom, F.zoom, Display.invert)
+    w := obdiv(w, F.zoom)
+    h := obdiv(h, F.zoom)
+  end
+end MoveBlock
+
+procedure MoveStructure(F: Frame; x, y: int16; M: pointer to Oberon.InputMsg; fselcol, typ: int16; fp: Pictures.Picture; struct: Element; first: boolean; selx, sely, selw, selh: pointer to int16; interclick: boolean)
+  var
+    Q: D3.Mask
+    keys: set
+    sx, sy, xx, yy, ox, oy, opx, opy, oldbw, oldbh: int16
+    P: Pictures.Picture
+
+  procedure DrawUniSel(dx, dy: int16; P: pointer to Pictures.Picture; fselcol: pointer to int16; struct: pointer to Element)
+    var
+      act: Element
+  begin
+    act := struct^
+    while act # nil do
+      Rembrandt0.ReplConst(P^, fselcol^, dx + act.x, dy + act.y, act.w, 1)
+      act := act.next
+    end
+  end DrawUniSel
+
+  procedure DrawPolySel(dx, dy: int16; P: pointer to Pictures.Picture; fp: pointer to Pictures.Picture; opx: pointer to int16; opy: pointer to int16; struct: pointer to Element)
+    var
+      act: Element
+  begin
+    act := struct^
+    while act # nil do
+      Rembrandt0.CopyBlock(fp^, P^, opx^ + act.x, opy^ + act.y, act.w, 1, dx + act.x, dy + act.y, Display.replace)
+      act := act.next
+    end
+  end DrawPolySel
+
+  procedure DoubleBuffering(w, h: int16; F: pointer to Frame; P: pointer to Pictures.Picture; Q: pointer to D3.Mask; fp: pointer to Pictures.Picture; fselcol: pointer to int16; oldbh: pointer to int16; oldbw: pointer to int16; opx: pointer to int16; opy: pointer to int16; selh: pointer to int16; selw: pointer to int16; selx: pointer to int16; sely: pointer to int16; struct: pointer to Element; typ: pointer to int16; x: pointer to int16; y: pointer to int16)
+    var
+      dx, dy, fromx, fromy, bw, bh: int16
+  begin
+    if w > 0 then
+      fromx := selx^
+      dx := w
+      bw := selw^ + w
+    else
+      fromx := selx^ + w
+      dx := 0
+      bw := selw^ - w
+    end
+
+    if h > 0 then
+      fromy := sely^
+      dy := h
+      bh := selh^ + h
+    else
+      fromy := sely^ + h
+      dy := 0
+      bh := selh^ - h
+    end
+
+    // Copy Block
+    if fromx < 0 then
+      bw := bw + fromx
+      dx := dx + fromx
+      fromx := 0
+    end
+    if fromy < 0 then
+      bh := bh + fromy
+      dy := dy + fromy
+      fromy := 0
+    end
+    if (bw > 0) & (bh > 0) then
+      if (bw > oldbw^) or (bh > oldbh^) then
+        oldbw^ := Max(oldbw^, bw)
+        oldbh^ := Max(oldbh^, bh)
+        Rembrandt0.AllocatePictureMem(P, oldbw^, oldbh^, F^.pict.depth)
+        CopyPalette(F^.pict, P^) // tk
+      end
+
+      if P^ # nil then
+        Pictures.CopyBlock(F^.pict, P^, fromx, fromy, bw, bh, 0, 0, Display.replace)
+        if typ^ = Object then
+          DrawUniSel(dx, dy, P, fselcol, struct)
+        else
+          DrawPolySel(dx, dy, P, fp, opx, opy, struct)
+        end
+        PicttoScreen(F^, x^, y^, fromx, fromy, @fromx, @fromy)
+        D3.Pict(Q^, P^, 0, 0, bw, bh, fromx, fromy, Display.replace)
+      end
+    end
+
+    selx^ := selx^ + w
+    sely^ := sely^ + h
+  end DoubleBuffering
+begin
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  RemoveSelection(F)
+  PicttoScreen(F, x, y, selx^, sely^, @sx, @sy)
+  if interclick then
+    opx := 0
+    opy := 0
+  else
+    opx := selx^
+    opy := sely^
+  end
+  Oberon.FadeCursor(@Oberon.Mouse)
+  if F.zoom = 1 then
+    MakePictMask(F, x, y, Q)
+    newgc(P)
+    oldbw := 0
+    oldbh := 0
+    if first then
+      ox := M.X
+      oy := M.Y
+    else
+      ox := sx
+      oy := sy
+    end
+    first := true
+    keys := M.keys
+    repeat
+      if interclick & first & (keys = {MM,ML}) then
+        DoubleBuffering(M.X - ox, M.Y - oy, @F, @P, @Q, @fp, @fselcol, @oldbh, @oldbw, @opx, @opy, selh, selw, selx, sely, @struct, @typ, @x, @y)
+        ScreentoPict(F, x, y, M.X, M.Y, @ox, @oy)
+        first := false
+        clipboard.Paste(F.pict, ox, oy)
+        MakePictMask(F, x, y, Q)
+        keys := keys - {ML}
+      elsif (ox # M.X) or (oy # M.Y) then
+        DoubleBuffering(M.X - ox, M.Y - oy, @F, @P, @Q, @fp, @fselcol, @oldbh, @oldbw, @opx, @opy, selh, selw, selx, sely, @struct, @typ, @x, @y)
+        first := true
+      end
+
+      ox := M.X
+      oy := M.Y
+      Input.Mouse(@keys, @M.X, @M.Y)
+      M.keys := M.keys + keys
+    until keys = {}
+
+  else
+    ScreentoPict(F, x, y, M.X, M.Y, @M.X, @M.Y)
+    PicttoScreen(F, x, y, M.X, M.Y, @M.X, @M.Y)
+    ox := M.X
+    oy := M.Y
+    xx := ox
+    yy := oy
+    first := true
+    DrawOutline(F, Q, sx + M.X - xx, sy + M.Y - yy)
+    keys := M.keys
+    repeat
+      ScreentoPict(F, x, y, M.X, M.Y, @M.X, @M.Y)
+      PicttoScreen(F, x, y, M.X, M.Y, @M.X, @M.Y)
+      if interclick & first & (keys = {MM,ML}) then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        first := false
+        DrawOutline(F, Q, sx + ox - xx, sy + oy - yy)
+        ScreentoPict(F, x, y, sx + ox - xx, sy + oy - yy, @ox, @oy)
+        clipboard.Paste(F.pict, ox, oy)
+        DrawOutline(F, Q, sx + M.X - xx, sy + M.Y - yy)
+        keys := keys - {ML}
+        Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, M.X, M.Y)
+      elsif (ox # M.X) or (oy # M.Y) then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        first := true
+        DrawOutline(F, Q, sx + ox - xx, sy + oy - yy)
+        DrawOutline(F, Q, sx + M.X - xx, sy + M.Y - yy)
+        Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, M.X, M.Y)
+      end
+
+      ox := M.X
+      oy := M.Y
+      Input.Mouse(@keys, @M.X, @M.Y)
+      M.keys := M.keys + keys
+    until keys = {}
+
+    selx^ := selx^ + obdiv(ox - xx, F.zoom)
+    sely^ := sely^ + obdiv(oy - yy, F.zoom)
+  end
+end MoveStructure
+
+procedure HandleStructure(F: Frame; x, y: int16; M: pointer to Oberon.InputMsg; f: Frame; struct: Element; same: boolean; selx, sely, selw, selh: int16)
+  var
+    typ: int16
+    act: Element
+    P: Pictures.Picture
+    opx, opy: int16
+
+  procedure DrawPolySel(P: pointer to Pictures.Picture; f: pointer to Frame; opx: pointer to int16; opy: pointer to int16; struct: pointer to Element)
+    var
+      act: Element
+  begin
+    act := struct^
+    while act # nil do
+      Rembrandt0.CopyBlock(f^.pict, P^, opx^ + act.x, opy^ + act.y, act.w, 1, act.x, act.y, Display.replace)
+      act := act.next
+    end
+  end DrawPolySel
+begin
+  typ := f.selection
+  opx := selx
+  opy := sely
+  MoveStructure(F, x, y, M, f.selcol, f.selection, f.pict, struct, same, @selx, @sely, @selw, @selh, false)
+  Oberon.FadeCursor(@Oberon.Mouse)
+  if M.keys = {MM} then
+    SavePicture(F.pict, 0, 0, F.pict.width, F.pict.height)
+    if typ = Freehand then
+      newgc(P)
+      Rembrandt0.AllocatePictureMem(@P, selw, selh, F.pict.depth)
+      CopyPalette(F.pict, P) // tk
+      DrawPolySel(@P, @f, @opx, @opy, @struct)
+      act := struct
+      while act # nil do
+        Rembrandt0.ReplConst(F.pict, D3.BG, opx + act.x, opy + act.y, act.w, 1)
+        act := act.next
+      end
+
+      act := struct
+      while act # nil do
+        Rembrandt0.CopyBlock(P, F.pict, act.x, act.y, act.w, 1, selx + act.x, sely + act.y, Display.replace)
+        act := act.next
+      end
+
+    else
+      act := struct
+      while act # nil do
+        Pictures.ReplConst(F.pict, D3.BG, opx + act.x, opy + act.y, act.w, 1, Display.replace)
+        act := act.next
+      end
+
+      act := struct
+      while act # nil do
+        Rembrandt0.ReplConst(F.pict, f.selcol, selx + act.x, sely + act.y, act.w, 1)
+        act := act.next
+      end
+    end
+
+    Pictures.Update(F.pict, opx, opy, selw, selh)
+  elsif M.keys = {ML,MM} then
+    SavePicture(F.pict, 0, 0, F.pict.width, F.pict.height)
+    if typ = Freehand then
+      newgc(P)
+      Rembrandt0.AllocatePictureMem(@P, selw, selh, F.pict.depth)
+      CopyPalette(F.pict, P)
+      DrawPolySel(@P, @f, @opx, @opy, @struct)
+      act := struct
+      while act # nil do
+        Rembrandt0.CopyBlock(P, F.pict, act.x, act.y, act.w, 1, selx + act.x, sely + act.y, Display.replace)
+        act := act.next
+      end
+
+    else
+      act := struct
+      while act # nil do
+        Rembrandt0.ReplConst(F.pict, f.selcol, selx + act.x, sely + act.y, act.w, 1)
+        act := act.next
+      end
+    end
+  end
+
+  Pictures.Update(F.pict, selx, sely, selw, selh)
+end HandleStructure
+
+procedure HandleMove(F: Frame; M: pointer to Oberon.InputMsg; x, y: int16)
+  // Verschiebt selektierter Teil
+  var
+    Q: D3.Mask
+    px, py, ux, uy, uw, uh, ox, oy: int16
+    P: Pictures.Picture
+begin
+  if F.selection = Image then
+    MovePicture(F, M, x, y)
+  elsif F.selection = Block then
+    PicttoScreen(F, x, y, F.sx, F.sy, @ox, @oy)
+    Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+    RemoveSelection(F)
+    newgc(P)
+    Rembrandt0.AllocatePictureMem(@P, F.sw, F.sh, F.pict.depth)
+    CopyPalette(F.pict, P) // tk
+    Pictures.CopyBlock(F.pict, P, F.sx, F.sy, F.sw, F.sh, 0, 0, Display.replace)
+    MoveBlock(F, x, y, Q, M, P, @ox, @oy, F.sw, F.sh, false)
+    if M.keys = {MM} then
+      // Block verschieben
+      ScreentoPict(F, x, y, ox, oy, @px, @py)
+      if F.sx < px then
+        ux := F.sx
+        uw := px + F.sw - ux
+      else
+        ux := px
+        uw := F.sx + F.sw - ux
+      end
+
+      if F.sy < py then
+        uy := F.sy
+        uh := py + F.sh - uy
+      else
+        uy := py
+        uh := F.sy + F.sh - uy
+      end
+
+      SavePicture(F.pict, ux, uy, uw, uh)
+      Pictures.ReplConst(F.pict, D3.BG, F.sx, F.sy, F.sw, F.sh, Display.replace)
+      Rembrandt0.CopyBlock(P, F.pict, 0, 0, F.sw, F.sh, px, py, Display.replace)
+      Pictures.Update(F.pict, F.sx, F.sy, F.sw, F.sh)
+      Pictures.Update(F.pict, px, py, F.sw, F.sh)
+    elsif M.keys = {MM,ML} then
+      // Block kopieren
+      ScreentoPict(F, x, y, ox, oy, @px, @py)
+      SavePicture(F.pict, px, py, F.sw, F.sh)
+      Rembrandt0.CopyBlock(P, F.pict, 0, 0, F.sw, F.sh, px, py, Display.replace)
+      Pictures.Update(F.pict, px, py, F.sw, F.sh)
+    else
+      Pictures.Update(F.pict, 0, 0, F.pict.width, F.pict.height)
+    end
+
+  elsif F.selection >= Object then
+    HandleStructure(F, x, y, M, F, F.selstruct, true, F.sx, F.sy, F.sw, F.sh)
+  end
+
+  M.res := 0
+end HandleMove
+
+procedure HandleStamp(F: Frame; M: pointer to Oberon.InputMsg; x, y: int16)
+  var
+    px, py, mx, my, w, h: int16
+    Q: D3.Mask
+begin
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  SavePicture(F.pict, 0, 0, F.pict.width, F.pict.height)
+  ScreentoPict(F, x, y, M.X, M.Y, @mx, @my)
+  PicttoScreen(F, x, y, mx, my, @mx, @my)
+  w := asr(clipboard.sw, 1) * F.zoom
+  h := asr(clipboard.sh, 1) * F.zoom
+  px := mx - w
+  py := my - h
+  if clipboard.id = Block then
+    MoveBlock(F, x, y, Q, M, clipboard.P, @px, @py, clipboard.sw, clipboard.sh, true)
+  else
+    ScreentoPict(F, x, y, px, py, @px, @py)
+    MoveStructure(F, x, y, M, clipboard.col, clipboard.id, clipboard.P, clipboard.selstruct, false, @px, @py, @clipboard.sw, @clipboard.sh, true)
+  end
+
+  Pictures.Update(F.pict, 0, 0, F.pict.width, F.pict.height)
+  M.keys := {}
+  M.res := 0
+end HandleStamp
+
+procedure TrackCaret(F: Frame; M: pointer to Oberon.InputMsg; x, y: int16)
+  var
+    f: Frame
+    p: Pictures.Picture
+    sx, sy, sw, sh, dx, dy: int16
+    time, time2: int32
+    text: Texts.Text
+    beg, end_: int32
+    keys: set
+    Q: D3.Mask
+    mx, my: int16
+begin
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  keys := M.keys
+  ScreentoPict(F, x, y, M.X, M.Y, @M.X, @M.Y)
+  PicttoScreen(F, x, y, M.X, M.Y, @M.X, @M.Y)
+  mx := M.X
+  my := M.Y
+  DrawCaret(Q, mx, my)
+  repeat
+    if (mx # M.X) or (my # M.Y) then
+      DrawCaret(Q, mx, my)
+      DrawCaret(Q, M.X, M.Y)
+    end
+
+    // Oberon.DrawCursor(Oberon.Mouse, cursor, M.X, M.Y);
+    mx := M.X
+    my := M.Y
+    Input.Mouse(@keys, @M.X, @M.Y)
+    ScreentoPict(F, x, y, M.X, M.Y, @M.X, @M.Y)
+    PicttoScreen(F, x, y, M.X, M.Y, @M.X, @M.Y)
+    M.keys := M.keys + keys
+  until (keys = {}) or (keys = {ML,MM})
+
+  DrawCaret(Q, mx, my)
+  if M.keys = {ML} then
+    ScreentoPict(F, x, y, M.X, M.Y, @sx, @sy)
+    if Effects.Inside(sx, sy, 0, 0, F.pict.width, F.pict.height) then
+      SetCaret(F, sx, sy)
+    end
+  elsif M.keys = {ML,MM} then
+    GetSelection(@f, @p, @time, @sx, @sy, @sw, @sh)
+    Oberon.GetSelection(@text, @beg, @end_, @time2)
+    if (time > time2) & (time # -1) then
+      if (f # nil) & (f.selection >= Object) then
+        ScreentoPict(F, x, y, M.X, M.Y, @mx, @my)
+        HandleStructure(F, x, y, M, f, f.selstruct, false, f.sx, f.sy, sw, sh)
+        ScreentoPict(F, x, y, M.X, M.Y, @sx, @sy)
+        if sx < 0 then
+          sx := 0
+        end
+        if sy < 0 then
+          sy := 0
+        end
+        Pictures.Update(F.pict, sx, sy, sw, sh)
+      else
+        ScreentoPict(F, x, y, M.X, M.Y, @mx, @my)
+        PicttoScreen(F, x, y, mx, my, @mx, @my)
+        MoveBlock(F, x, y, Q, M, p, @mx, @my, sw, sh, false)
+        ScreentoPict(F, x, y, mx, my, @sx, @sy)
+        if M.keys # Cancel then
+          M.X := mx
+          M.Y := my
+          if sx < 0 then
+            sw := sw + sx
+            dx := 0
+            sx := -sx
+          else
+            dx := sx
+            sx := 0
+          end
+          if sy < 0 then
+            sh := sh + sy
+            dy := 0
+            sy := -sy
+          else
+            dy := sy
+            sy := 0
+          end
+          SavePicture(F.pict, dx, dy, sw, sh)
+          Rembrandt0.CopyBlock(p, F.pict, sx, sy, sw, sh, dx, dy, Display.replace)
+          Pictures.Update(F.pict, dx, dy, sw, sh)
+        else
+          Pictures.Update(F.pict, sx, sy, sw, sh)
+        end
+      end
+
+    elsif time2 # -1 then
+      keys := M.keys
+      mx := M.X
+      my := M.Y
+      DrawCaret(Q, mx, my)
+      repeat
+        if (mx # M.X) or (my # M.Y) then
+          DrawCaret(Q, mx, my)
+          DrawCaret(Q, M.X, M.Y)
+        end
+
+        mx := M.X
+        my := M.Y
+        Input.Mouse(@keys, @M.X, @M.Y)
+        M.keys := M.keys + keys
+      until keys = {}
+
+      DrawCaret(Q, mx, my)
+      ScreentoPict(F, x, y, M.X, M.Y, @sx, @sy)
+      if Effects.Inside(sx, sy, 0, 0, F.pict.width, F.pict.height) then
+        SetCaret(F, sx, sy)
+        CopyText(F, text, beg, end_, x, y)
+      end
+    end
+  end
+end TrackCaret
+
+procedure TrackEffects(F: Frame; M: pointer to Oberon.InputMsg; x, y, w, h: int16)
+  var
+    keys: set
+begin
+  if trackMM # nil then
+    trackMM(F, M, x, y)
+  else
+    keys := M.keys
+    repeat
+      Oberon.DrawCursor(@Oberon.Mouse, @cursor, M.X, M.Y)
+      Input.Mouse(@keys, @M.X, @M.Y)
+      M.keys := M.keys + keys
+    until keys = {}
+
+    M.keys := keys
+    M.res := 0
+  end
+end TrackEffects
+
+procedure Edit(F: Frame; M: pointer to Oberon.InputMsg; x, y, w, h: int16)
+begin
+  if M.keys = {MR} then
+    if ~Effects.InBorder(M.X, M.Y, x, y, w, h) then
+      selcolor := D3.FG
+      TrackSelection(F, M, x, y, w, h)
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif (M.keys = {MM}) & ~InsidePict(F, M.X, M.Y, x, y) then
+    MovePicture(F, M, x, y)
+    M.res := 0
+  elsif (M.keys = {MM}) & (F.selection # No) then
+    Defocus(F)
+    trackSelMM.track(F, M, x, y)
+    M.res := 0
+  elsif (M.keys = {ML}) & InsidePict(F, M.X, M.Y, x, y) then
+    TrackCaret(F, M, x, y)
+    M.res := 0
+  elsif M.keys = {MM} then
+    TrackEffects(F, M, x, y, w, h)
+    M.res := 0
+  elsif (trackSelMM.id = idMove) & (F.selection = Image) then
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, M.X, M.Y)
+    M.res := 0
+  else
+    Oberon.DrawCursor(@Oberon.Mouse, @cursor, M.X, M.Y)
+    M.res := 0
+  end
+end Edit
+
+procedure Zoom(F: Frame; Q: D3.Mask; x, y, w, h, factor: int16)
+begin
+  if (F.selection # No) & (F.selection # Image) then
+    Neutralize(F, x, y, w, h)
+    F.px := -F.sx
+    F.py := -F.pict.height + F.sh + F.sy
+  else
+    Neutralize(F, x, y, w, h)
+    if F.px > 0 then
+      F.px := 0
+    end
+    if F.py > 0 then
+      F.py := 0
+    end
+  end
+
+  F.zoom := factor
+  Restore(F, Q, x, y, w, h, 0, 0, F.pict.width, F.pict.height)
+end Zoom
+
+// Zoomfaktor abfragen bzw. setzen
+procedure GetZoom*(F: Frame; factor: pointer to int16)
+begin
+  factor^ := F.zoom
+end GetZoom
+
+procedure SetZoom*(F: Frame; factor: int16)
+  var
+    zM: ZoomMsg
+begin
+  zM.F := F
+  zM.zoom := factor
+  Display.Broadcast(@zM)
+end SetZoom
+
+// Gitterlinien abfragen bzw. setzen
+procedure GetGrid*(F: Frame; set_: pointer to boolean)
+begin
+  set_^ := F.grid
+end GetGrid
+
+procedure SetGrid*(F: Frame; set_: boolean)
+  var
+    M: DrawGridMsg
+begin
+  F.grid := set_
+  M.F := F
+  M.res := -1
+  M.u := 0
+  M.v := 0
+  M.w := F.pict.width
+  M.h := F.pict.height
+  Display.Broadcast(@M)
+end SetGrid
+
+// Attribut locked abfragen bzw. setzen
+procedure GetLocked*(F: Frame; locked: pointer to boolean)
+begin
+  locked^ := F.locked
+end GetLocked
+
+procedure SetLocked*(F: Frame; locked: boolean)
+  var
+    M: Objects.AttrMsg
+begin
+  M.id := Objects.set_
+  M.class := Objects.Bool
+  copy(@M.name, "Locked", 32)
+  M.b := locked
+  M.res := -1
+  F.handle(F, @M)
+end SetLocked
+
+// Attribut border abfragen bzw. setzen
+procedure GetBorder*(F: Frame; border: pointer to boolean)
+begin
+  border^ := F.border
+end GetBorder
+
+procedure SetBorder*(F: Frame; border: boolean)
+  var
+    M: Objects.AttrMsg
+begin
+  M.id := Objects.set_
+  M.class := Objects.Bool
+  copy(@M.name, "Border", 32)
+  M.b := border
+  M.res := -1
+  F.handle(F, @M)
+end SetBorder
+
+// Selektionsoperation verschieben aktivieren
+procedure Move*()
+begin
+  trackSelMM.id := idMove
+  trackSelMM.track := HandleMove
+  cursor := Effects.Cross
+end Move
+
+// Operation Stamp für Clipboard
+procedure ClipboardStamp*()
+begin
+  trackMM := HandleStamp
+  cursor := Effects.Cross
+end ClipboardStamp
+
+procedure ClipboardDraw(D: Pictures.Picture; dx, dy: int16)
+  var
+    act: Element
+begin
+  if clipboard.id = Block then
+    Rembrandt0.CopyBlock(clipboard.P, D, 0, 0, clipboard.sw, clipboard.sh, dx, dy, Display.replace)
+    Pictures.Update(D, dx, dy, clipboard.sw, clipboard.sh)
+  elsif clipboard.id = Object then
+    act := clipboard.selstruct
+    while act # nil do
+      Rembrandt0.ReplConst(D, clipboard.col, dx + act.x, dy + act.y, act.w, 1)
+      act := act.next
+    end
+
+    Pictures.Update(D, dx, dy, clipboard.sw, clipboard.sh)
+  elsif clipboard.id = Freehand then
+    act := clipboard.selstruct
+    while act # nil do
+      Rembrandt0.CopyBlock(clipboard.P, D, act.x, act.y, act.w, 1, dx + act.x, dy + act.y, Display.replace)
+      act := act.next
+    end
+
+    Pictures.Update(D, dx, dy, clipboard.sw, clipboard.sh)
+  end
+end ClipboardDraw
+
+procedure CutCopy(clear: boolean)
+  var
+    P, D: Pictures.Picture
+    F: Frame
+    px, py, pw, ph: int16
+    time: int32
+    act: Element
+begin
+  P := nil
+  F := nil
+  GetSelection(@F, @P, @time, @px, @py, @pw, @ph)
+  if (F # nil) & (P # nil) & (F.selection = Object) then
+    newgc(P) // tk
+    Rembrandt0.AllocatePictureMem(@P, pw, ph, F.pict.depth)
+    CopyPalette(F.pict, P)
+    act := F.selstruct
+    while act # nil do
+      Pictures.ReplConst(P, F.selcol, act.x, act.y, act.w, 1, Display.replace)
+      act := act.next
+    end
+
+    clipboard.P := P
+    clipboard.id := Object
+    clipboard.col := F.selcol
+    clipboard.selstruct := F.selstruct
+    clipboard.sw := pw
+    clipboard.sh := ph
+    if clear then
+      SavePicture(F.pict, px, py, pw, ph)
+      act := F.selstruct
+      while act # nil do
+        Pictures.ReplConst(F.pict, D3.BG, px + act.x, py + act.y, act.w, 1, Display.replace)
+        act := act.next
+      end
+
+      Pictures.Update(F.pict, px, py, pw, ph)
+    end
+
+  elsif (F # nil) & (P # nil) & (F.selection = Freehand) then
+    newgc(P) // tk
+    Rembrandt0.AllocatePictureMem(@P, pw, ph, F.pict.depth)
+    CopyPalette(F.pict, P)
+    act := F.selstruct
+    while act # nil do
+      Rembrandt0.CopyBlock(F.pict, P, px + act.x, py + act.y, act.w, 1, act.x, act.y, Display.replace)
+      act := act.next
+    end
+
+    clipboard.id := Freehand
+    clipboard.P := P
+    clipboard.selstruct := F.selstruct
+    clipboard.sw := pw
+    clipboard.sh := ph
+    if clear then
+      SavePicture(F.pict, px, py, pw, ph)
+      act := F.selstruct
+      while act # nil do
+        Pictures.ReplConst(F.pict, D3.BG, px + act.x, py + act.y, act.w, 1, Display.replace)
+        act := act.next
+      end
+
+      Pictures.Update(F.pict, px, py, pw, ph)
+    end
+
+  elsif P # nil then
+    // Block
+    newgc(D) // tk
+    Rembrandt0.AllocatePictureMem(@D, pw, ph, P.depth)
+    CopyPalette(P, D)
+    Pictures.CopyBlock(P, D, px, py, pw, ph, 0, 0, Display.replace)
+    clipboard.id := Block
+    clipboard.selstruct := nil
+    clipboard.P := D
+    clipboard.sw := pw
+    clipboard.sh := ph
+    if clear then
+      SavePicture(F.pict, F.sx, F.sy, pw, ph)
+      Pictures.ReplConst(F.pict, D3.BG, F.sx, F.sy, pw, ph, Display.replace)
+      Pictures.Update(F.pict, F.sx, F.sy, pw, ph)
+    end
+  end
+
+  if F # nil then
+    RemoveSelection(F)
+  end
+end CutCopy
+
+// Clipboardfunktionen
+procedure ClipboardCopy*()
+begin
+  CutCopy(false)
+end ClipboardCopy
+
+procedure ClipboardCut*()
+begin
+  CutCopy(true)
+end ClipboardCut
+
+procedure ClipboardPaste*()
+  var
+    F: Frame
+    M: FocusMsg
+begin
+  M.F := nil
+  M.res := -1
+  Display.Broadcast(@M)
+  if (M.F # nil) & (M.F is Frame) then
+    F := M.F(Frame)
+    clipboard.Paste(F.pict, F.cx, F.cy)
+  end
+end ClipboardPaste
+
+// Selektionsarten aktivieren
+procedure BlockSelect*()
+begin
+  seltype := Block
+  cursor := Effects.Cross
+end BlockSelect
+
+procedure ObjectSelect*()
+begin
+  seltype := Object
+  cursor := Effects.Cross
+end ObjectSelect
+
+procedure FreehandSelect*()
+begin
+  seltype := Freehand
+  cursor := Effects.Cross
+end FreehandSelect
+
+// Generiert Pattern-Code aus der letzten Block-Selektion; sollte nicht grösser als 32*32 sein
+procedure MakePattern*()
+  var
+    F: Frame
+    P: Pictures.Picture
+    sx, sy, sw, sh, x0, x1, y: int16
+    time: int32
+    first: boolean
+begin
+  GetSelection(@F, @P, @time, @sx, @sy, @sw, @sh)
+  if time # -1 then
+    if (sw >= 32) or (sh >= 32) then
+      Out.String("Patternsize too big")
+      Out.Ln()
+    else
+      y := 0
+      Out.String("VAR pattern: ARRAY ")
+      Out.Int(P.height, 2)
+      Out.String(" OF SET;")
+      Out.Ln()
+      Out.String("       pat: LONGINT;")
+      Out.Ln()
+      while y < P.height do
+        x0 := 0
+        Out.String("pattern[")
+        Out.Int(y, 2)
+        Out.String("]:={")
+        first := true
+        while x0 < P.width do
+          x1 := x0
+          while (Pictures.Get(P, x0, y) # D3.BG) & (x0 < P.width) do
+            inc(x0)
+          end
+          if x0 - x1 > 1 then
+            if first then
+              first := false
+            else
+              Out.String(", ")
+            end
+            Out.Int(x1, 0)
+            Out.String("..")
+            Out.Int(x0 - 1, 0)
+          elsif x0 - x1 = 1 then
+            if first then
+              first := false
+            else
+              Out.String(", ")
+            end
+            Out.Int(x1, 0)
+          end
+
+          inc(x0)
+        end
+
+        Out.String("};")
+        Out.Ln()
+        inc(y)
+      end
+
+      Out.String("pat:= Display.NewPattern(")
+      Out.Int(x0, 2)
+      Out.Char(",")
+      Out.Int(y, 2)
+      Out.String(", pattern);")
+      Out.Ln()
+    end
+  end
+end MakePattern
+
+// Haupthandler
+procedure Handle*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h, ox, oy: int16
+    F1: Frame
+    Q: D3.Mask
+begin
+  case F of
+  | Frame:
+    case M of
+    | Display.PFrameMsg:
+      if (M.F = nil) or (M.F = F) then
+        // message addressed to box
+        x := M.x + F.X
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        if M is Display.PDisplayMsg then
+          if M(Display.PDisplayMsg) is PZoomMsg then
+            Gadgets.MakeMask(F, x, y, M(Display.PDisplayMsg).dlink, @Q)
+            Zoom(F, Q, x, y, w, h, M(PZoomMsg).zoom)
+          elsif M(Display.PDisplayMsg).device = Display.screen then
+            if (M(Display.PDisplayMsg).id = Display.full) or (M(Display.PDisplayMsg).F = nil) then
+              Neutralize(F, x, y, w, h)
+              Gadgets.MakeMask(F, x, y, M(Display.PDisplayMsg).dlink, @Q)
+              Restore(F, Q, x, y, w, h, 0, 0, F.pict.width, F.pict.height)
+            elsif M(Display.PDisplayMsg).id = Display.area then
+              Neutralize(F, x, y, w, h)
+              Gadgets.MakeMask(F, x, y, M(Display.PDisplayMsg).dlink, @Q)
+              D3.AdjustMask(Q, x + M(Display.PDisplayMsg).u, y + h - 1 + M(Display.PDisplayMsg).v, M(Display.PDisplayMsg).w, M(Display.PDisplayMsg).h)
+              Restore(F, Q, x, y, w, h, 0, 0, F.pict.width, F.pict.height)
+            end
+
+          elsif M(Display.PDisplayMsg).device = Display.printer then
+            Print(F, M(Display.PDisplayMsg))
+          end
+
+        elsif M is PDrawCaretMsg then
+          Gadgets.MakeMask(F, x, y, M(PDrawCaretMsg).dlink, @Q)
+          PicttoScreen(F, x, y, F.cx, F.cy, @ox, @oy)
+          DrawCaret(Q, ox, oy)
+        elsif M is PDrawSelectionMsg then
+          Gadgets.MakeMask(F, x, y, M(PDrawSelectionMsg).dlink, @Q)
+          DrawSelection(F, Q, x, y)
+        elsif (M is PDrawGridMsg) & (M.F = F) then
+          M1 := M
+          case M1 of
+          | PDrawGridMsg:
+            Neutralize(F, x, y, w, h)
+            Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+            DrawGrid(F, Q, x, y, w, h, M1.u, M1.v, M1.w, M1.h)
+          end
+
+        elsif M is Pictures.PUpdateMsg then
+          if M(Pictures.PUpdateMsg).pict = F.pict then
+            if M(Pictures.PUpdateMsg).id = Pictures.redraw then
+              Neutralize(F, x, y, w, h)
+              Gadgets.MakeMask(F, x, y, M(Pictures.PUpdateMsg).dlink, @Q)
+              RestorePict(F, Q, x, y, w, h, M(Pictures.PUpdateMsg).u, M(Pictures.PUpdateMsg).v, M(Pictures.PUpdateMsg).w, M(Pictures.PUpdateMsg).h)
+            elsif M(Pictures.PUpdateMsg).id = Pictures.resize then
+              Gadgets.MakeMask(F, x, y, M(Pictures.PUpdateMsg).dlink, @Q)
+              Restore(F, Q, x, y, w, h, 0, 0, F.pict.width, F.pict.height)
+            else
+              Gadgets.framehandle(F, M(Pictures.PUpdateMsg))
+            end
+
+          else
+            Gadgets.framehandle(F, M(Pictures.PUpdateMsg))
+          end
+
+        elsif M is Oberon.PInputMsg then
+          if (M(Oberon.PInputMsg).id = Oberon.track) & Gadgets.InActiveArea(F, M(Oberon.PInputMsg)) & ~F.locked then
+            Edit(F, M(Oberon.PInputMsg), x, y, w, h)
+          elsif (M(Oberon.PInputMsg).id = Oberon.consume) & F.car & ~F.locked then
+            Write(F, M(Oberon.PInputMsg), x, y)
+            M(Oberon.PInputMsg).res := 0
+          else
+            Gadgets.framehandle(F, M(Oberon.PInputMsg))
+          end
+
+        elsif M is Display.PModifyMsg then
+          Gadgets.framehandle(F, M(Display.PModifyMsg))
+        elsif M is PFocusMsg then
+          if F.car then
+            M(PFocusMsg).F := F
+            M(PFocusMsg).u := x
+            M(PFocusMsg).v := y
+            M(PFocusMsg).res := 0
+          end
+        elsif M is Oberon.PControlMsg then
+          if M(Oberon.PControlMsg).id = Oberon.defocus then
+            Defocus(F)
+          elsif M(Oberon.PControlMsg).id = Oberon.neutralize then
+            Neutralize(F, x, y, w, h)
+          else
+            Gadgets.framehandle(F, M(Oberon.PControlMsg))
+          end
+
+        elsif M is Oberon.PConsumeMsg then
+          if F.car then
+            CopyText(F, M(Oberon.PConsumeMsg).text, M(Oberon.PConsumeMsg).beg, M(Oberon.PConsumeMsg).end_, x, y)
+
+          end
+
+        elsif M is Display.PSelectMsg then
+          Select(F, x, y, M(Display.PSelectMsg))
+        elsif M is Display.PConsumeMsg then
+          if M(Display.PConsumeMsg).id = Display.integrate then
+            if M(Display.PConsumeMsg).obj is Pictures.Picture then
+              CopyOver(F, M(Display.PConsumeMsg).obj(Pictures.Picture), x, y)
+            elsif M(Display.PConsumeMsg).obj is Frame then
+              CopyOver(F, M(Display.PConsumeMsg).obj(Frame).pict, x, y)
+            end
+          end
+
+        else
+          Gadgets.framehandle(F, M)
+        end
+      end
+
+    | Objects.PAttrMsg:
+      FrameAttributes(F, M(Objects.PAttrMsg))
+    | Objects.PBindMsg:
+      F.pict.handle(F.pict, M)
+      Gadgets.framehandle(F, M)
+    | Objects.PLinkMsg:
+      FrameLinks(F, M(Objects.PLinkMsg))
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        StoreFrame(F, M)
+      elsif M.id = Objects.load then
+        LoadFrame(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F1)
+        F.stamp := M.stamp
+        F.dlink := F1
+        Copy(M, F, F1)
+        M.obj := F1
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end Handle
+
+// Erstellt ein neues Gadget
+procedure New*()
+  var
+    F: Frame
+    P: Pictures.Picture
+begin
+  newgc(F)
+  F.col := 14
+  F.px := 1
+  F.py := 1
+  F.handle := Handle
+  F.zoom := 1
+  newgc(P)
+  Pictures.Create(P, 20, 20, 8)
+  F.pict := P
+  F.car := false
+  F.border := true
+  F.selection := No
+  F.grid := false
+  F.locked := false
+  F.lockdata.scaledpict := nil
+  F.selcolor := D3.FG
+  F.W := F.pict.width
+  F.H := F.pict.height
+  Objects.NewObj := F
+end New
+
+// Fügt ein als Parameter angegebenes Picture als Rembrandt-Frame in ein Panel ein
+procedure Insert*()
+  var
+    F: Frame
+    P: Pictures.Picture
+    S: Attributes.Scanner
+    name: array 64 of char
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if S.class = Attributes.Name then
+    copy(@name, @S.s, 64)
+  else
+    copy(@name, "Default.Pict", 64)
+  end
+  newgc(F)
+  F.col := 14
+  F.px := 0
+  F.py := 0
+  F.handle := Handle
+  F.zoom := 1
+  newgc(P)
+  Pictures.Open(P, @name, true)
+  F.pict := P
+  F.car := false
+  F.border := false
+  F.selection := No
+  F.grid := false
+  F.selcolor := D3.FG
+  F.W := F.pict.width
+  F.H := F.pict.height
+  F.lockdata.scaledpict := nil
+  SetLocked(F, true)
+  Gadgets.Integrate(F)
+end Insert
+
+// Erstellt ein neues Gadgets mit dem Picture pict
+procedure NewP*(F: Frame; pict: Pictures.Picture)
+begin
+  F.col := 14
+  F.px := 1
+  F.py := 1
+  F.handle := Handle
+  F.zoom := 1
+  if pict = nil then
+    Rembrandt0.AllocatePictureMem(@pict, 320, 200, 8)
+  end
+  F.pict := pict
+  F.car := false
+  F.border := true
+  F.selection := No
+  F.grid := false
+  F.locked := false
+  F.lockdata.scaledpict := nil
+  F.selcolor := D3.FG
+  F.W := F.pict.width
+  F.H := F.pict.height
+end NewP
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Undo" end return Undo end
+  if i = 1 then if name # nil then name^ := "Move" end return Move end
+  if i = 2 then if name # nil then name^ := "ClipboardStamp" end return ClipboardStamp end
+  if i = 3 then if name # nil then name^ := "ClipboardCopy" end return ClipboardCopy end
+  if i = 4 then if name # nil then name^ := "ClipboardCut" end return ClipboardCut end
+  if i = 5 then if name # nil then name^ := "ClipboardPaste" end return ClipboardPaste end
+  if i = 6 then if name # nil then name^ := "BlockSelect" end return BlockSelect end
+  if i = 7 then if name # nil then name^ := "ObjectSelect" end return ObjectSelect end
+  if i = 8 then if name # nil then name^ := "FreehandSelect" end return FreehandSelect end
+  if i = 9 then if name # nil then name^ := "MakePattern" end return MakePattern end
+  if i = 10 then if name # nil then name^ := "New" end return New end
+  if i = 11 then if name # nil then name^ := "Insert" end return Insert end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Rembrandt", cmd_)
+  cursor := Effects.Cross
+  undo := nil
+  selcolor := D3.FG
+  trackMM := nil
+  trackSelMM.track := HandleMove
+  trackSelMM.id := idMove
+  clipboard.id := No
+  clipboard.Paste := ClipboardDraw
+  seldir[0].dx := 0
+  seldir[0].dy := 1
+  seldir[0].ind := 3
+  seldir[1].dx := -1
+  seldir[1].dy := 0
+  seldir[1].ind := 0
+  seldir[2].dx := 0
+  seldir[2].dy := -1
+  seldir[2].ind := 1
+  seldir[3].dx := 1
+  seldir[3].dy := 0
+  seldir[3].ind := 2
+  (*
+  Out.String("Rembrandt, DP 10.3.95"); Out.Ln
+  *)
+end Rembrandt.

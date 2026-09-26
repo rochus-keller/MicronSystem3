@@ -1,0 +1,943 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Colors [level=5]
+
+import Files, Objects, Displays, Display, Strings, Modules
+// portable *
+// eos
+
+(**
+Color conversions and abstract color objects
+**)
+
+const
+  undefined* = -1 // hues *
+  red* = 0
+  yellow* = val(real, 1) / val(real, 6)
+  green* = val(real, 2) / val(real, 6)
+  cyan* = val(real, 3) / val(real, 6)
+  blue* = val(real, 4) / val(real, 6)
+  magenta* = val(real, 5) / val(real, 6)
+
+// color objects *
+
+type
+  Color* = pointer to ColorDesc
+  ColorDesc* = object (Objects.ObjDesc)
+    r: real // internal representation is RGB
+    g, b: real
+  end
+
+  // inverse color lookup table *
+  Index* = record
+    bits_: int16 // number of bits per component in color cube
+    cube: pointer to array of char // maps RGB triples to palette indices, size is (2^bits)^3
+  end
+
+var
+  DisplayIndex*: Index // inverse color lookup table for display palette *
+  DisplayBits*: int16 // number of bits used for DisplayIndex *
+  Red*: array 256 of int16 // copy of display palette (faster lookup) *
+  Green*, Blue*: array 256 of int16
+
+// --- Inverse Color Lookup ---*
+
+// return index of best match in inverse color lookup table *
+procedure Match*(index: Index; bits_, red, green, blue: int16): int16
+  var
+    cbits, nbits: uint32
+begin
+  if bits_ > 6 then
+    bits_ := 6
+  end
+  // components are in 0..255 and bits_ in 0..6, so the shifts are right by 8-bits_ and left by bits_
+  cbits := usig(val(int32, bits_))
+  nbits := 8 - cbits
+  return val(int16, ord(index.cube[shl(shr(usig(val(int32, red)), nbits), 2 * cbits) +
+                    shl(shr(usig(val(int32, green)), nbits), cbits) + shr(usig(val(int32, blue)), nbits)]))
+end Match
+
+// initialize inverse color lookup table *
+procedure MakeIndex*(index: pointer to Index; bits_, colors: int16; red, green, blue: pointer to array of int16)
+
+  var
+    nbits, x, colormax, cur, rcol, gcol, bcol: int16
+    xsqr, txsqr, rstride, gstride, size_, i, rdist, gdist, bdist, cdist: int32
+    dbuf: pointer to array of int32
+    rcenter, gcenter, bcenter, ghere, bhere, gmin, bmin, gmax, bmax: int16
+    incr, incg, incb, p, rp, gp, ginc, binc: int32
+
+  procedure blueloop(bhere: pointer to int16; binc: pointer to int32; bmax: pointer to int16; bmin: pointer to int16; cur: pointer to int16; dbuf: pointer to pointer to array of int32; gdist: pointer to int32; gp: pointer to int32; index: pointer to Index; txsqr: pointer to int32): boolean
+    var
+      detect: boolean
+      blue: int16
+      bp, bdist, bxx: int32
+  begin
+    detect := false
+    blue := bhere^
+    bp := gp^
+    bdist := gdist^
+    bxx := binc^
+    while (blue < bmax^) & (dbuf^[bp] <= bdist) do
+      inc(blue)
+      inc(bp)
+      inc(bdist, bxx)
+      inc(bxx, txsqr^)
+    end
+
+    if blue < bmax^ then
+      // found applicable cell
+      if blue > bhere^ then
+        bhere^ := blue
+        gp^ := bp
+        gdist^ := bdist
+        binc^ := bxx
+      end
+
+      detect := true
+      while (blue < bmax^) & (dbuf^[bp] > bdist) do
+        dbuf^[bp] := bdist
+        index.cube[bp] := chr(cur^)
+        inc(blue)
+        inc(bp)
+        inc(bdist, bxx)
+        inc(bxx, txsqr^)
+      end
+    end
+
+    blue := bhere^ - 1
+    bp := gp^ - 1
+    bxx := binc^ - txsqr^
+    bdist := gdist^ - bxx
+    if ~detect then
+      while (blue >= bmin^) & (dbuf^[bp] <= bdist) do
+        dec(blue)
+        dec(bp)
+        dec(bxx, txsqr^)
+        dec(bdist, bxx)
+      end
+
+      if blue >= bmin^ then
+        bhere^ := blue
+        gp^ := bp
+        gdist^ := bdist
+        binc^ := bxx
+        detect := true
+      end
+    end
+
+    while (blue >= bmin^) & (dbuf^[bp] > bdist) do
+      dbuf^[bp] := bdist
+      index.cube[bp] := chr(cur^)
+      dec(blue)
+      dec(bp)
+      dec(bxx, txsqr^)
+      dec(bdist, bxx)
+    end
+
+    return detect
+  end blueloop
+
+  procedure greenloop(bcenter: pointer to int16; bhere: pointer to int16; binc: pointer to int32; bmax: pointer to int16; bmin: pointer to int16; colormax: pointer to int16; cur: pointer to int16; dbuf: pointer to pointer to array of int32; gdist: pointer to int32; ghere: pointer to int16; ginc: pointer to int32; gmax: pointer to int16; gmin: pointer to int16; gp: pointer to int32; gstride: pointer to int32; incb: pointer to int32; index: pointer to Index; rdist: pointer to int32; rp: pointer to int32; txsqr: pointer to int32): boolean
+    var
+      detect: boolean
+      green: int16
+      ggp, ggdist, gxx: int32
+  begin
+    detect := false
+    bhere^ := bcenter^ // restart blueloop
+    bmin^ := 0
+    bmax^ := colormax^
+    binc^ := incb^
+    green := ghere^
+    gp^ := rp^
+    ggp := gp^
+    gdist^ := rdist^
+    ggdist := gdist^
+    gxx := ginc^
+    while green < gmax^ do
+      if blueloop(bhere, binc, bmax, bmin, cur, dbuf, gdist, gp, index, txsqr) then
+        if ~detect then
+          if green > ghere^ then
+            ghere^ := green
+            rp^ := ggp
+            rdist^ := ggdist
+            ginc^ := gxx
+          end
+
+          detect := true
+        end
+
+        inc(green)
+        inc(gp^, gstride^)
+        inc(ggp, gstride^)
+        inc(gdist^, gxx)
+        inc(ggdist, gxx)
+        inc(gxx, txsqr^)
+      elsif ~detect then
+        green := gmax^
+      else
+        inc(green)
+        inc(gp^, gstride^)
+        inc(ggp, gstride^)
+        inc(gdist^, gxx)
+        inc(ggdist, gxx)
+        inc(gxx, txsqr^)
+      end
+    end
+
+    bhere^ := bcenter^ // restart blueloop
+    bmin^ := 0
+    bmax^ := colormax^
+    binc^ := incb^
+    green := ghere^ - 1
+    gp^ := rp^ - gstride^
+    ggp := gp^
+    gxx := ginc^ - txsqr^
+    gdist^ := rdist^ - gxx
+    ggdist := gdist^
+    while green >= gmin^ do
+      if blueloop(bhere, binc, bmax, bmin, cur, dbuf, gdist, gp, index, txsqr) then
+        if ~detect then
+          ghere^ := green
+          rp^ := ggp
+          rdist^ := ggdist
+          ginc^ := gxx
+          detect := true
+        end
+
+        dec(green)
+        dec(gp^, gstride^)
+        dec(ggp, gstride^)
+        dec(gxx, txsqr^)
+        dec(gdist^, gxx)
+        dec(ggdist, gxx)
+      elsif ~detect then
+        green := gmin^ - 1
+      else
+        dec(green)
+        dec(gp^, gstride^)
+        dec(ggp, gstride^)
+        dec(gxx, txsqr^)
+        dec(gdist^, gxx)
+        dec(ggdist, gxx)
+      end
+    end
+
+    return detect
+  end greenloop
+
+  procedure redloop(bcenter: pointer to int16; bhere: pointer to int16; binc: pointer to int32; bmax: pointer to int16; bmin: pointer to int16; cdist: pointer to int32; colormax: pointer to int16; cur: pointer to int16; dbuf: pointer to pointer to array of int32; gcenter: pointer to int16; gdist: pointer to int32; ghere: pointer to int16; ginc: pointer to int32; gmax: pointer to int16; gmin: pointer to int16; gp: pointer to int32; gstride: pointer to int32; incb: pointer to int32; incg: pointer to int32; incr: pointer to int32; index: pointer to Index; p: pointer to int32; rcenter: pointer to int16; rdist: pointer to int32; rp: pointer to int32; rstride: pointer to int32; txsqr: pointer to int32)
+    var
+      detect: boolean
+      red: int16
+      rxx: int32
+  begin
+    // red up loop
+    detect := false
+    ghere^ := gcenter^ // restart greenloop
+    gmin^ := 0
+    gmax^ := colormax^
+    ginc^ := incg^
+    red := rcenter^
+    rp^ := p^
+    rdist^ := cdist^
+    rxx := incr^
+    while red < colormax^ do
+      if greenloop(bcenter, bhere, binc, bmax, bmin, colormax, cur, dbuf, gdist, ghere, ginc, gmax, gmin, gp, gstride, incb, index, rdist, rp, txsqr) then
+        detect := true
+        inc(red)
+        inc(rp^, rstride^)
+        inc(rdist^, rxx)
+        inc(rxx, txsqr^)
+      elsif detect then
+        red := colormax^ // leave loop
+      else
+        inc(red)
+        inc(rp^, rstride^)
+        inc(rdist^, rxx)
+        inc(rxx, txsqr^)
+      end
+    end
+
+    // red down loop
+    ghere^ := gcenter^ // restart greenloop
+    gmin^ := 0
+    gmax^ := colormax^
+    ginc^ := incg^
+    red := rcenter^ - 1
+    rp^ := p^ - rstride^
+    rxx := incr^ - txsqr^
+    rdist^ := cdist^ - rxx
+    while red >= 0 do
+      if greenloop(bcenter, bhere, binc, bmax, bmin, colormax, cur, dbuf, gdist, ghere, ginc, gmax, gmin, gp, gstride, incb, index, rdist, rp, txsqr) then
+        detect := true
+        dec(red)
+        dec(rp^, rstride^)
+        dec(rxx, txsqr^)
+        dec(rdist^, rxx)
+      elsif detect then
+        red := -1 // leave loop
+      else
+        dec(red)
+        dec(rp^, rstride^)
+        dec(rxx, txsqr^)
+        dec(rdist^, rxx)
+      end
+    end
+  end redloop
+begin
+  // uses Spencer W. Thomas' algorithm from Graphics Gems II (ugly as it is)
+  assert(colors <= 256)
+  if bits_ > 6 then
+    bits_ := 6 // (2^6)^3 = 262144!
+  end
+  nbits := 8 - bits_
+  // bits_ is in 1..6, so nbits is in 2..7 and all the following shifts are to the left
+  x := val(int16, shl(val(uint32, 1), usig(val(int32, nbits))))
+  xsqr := val(int32, shl(val(uint32, 1), usig(val(int32, 2 * nbits))))
+  txsqr := 2 * xsqr
+  colormax := val(int16, shl(val(uint32, 1), usig(val(int32, bits_))))
+  rstride := val(int32, shl(val(uint32, 1), usig(val(int32, 2 * bits_))))
+  gstride := colormax
+
+  // fill buffer with maximal distance
+  size_ := val(int32, shl(val(uint32, 1), usig(val(int32, 3 * bits_))))
+  newgc(dbuf, size_)
+  i := 0
+  while i < size_ do
+    dbuf[i] := 2147483647
+    inc(i)
+  end
+  if (index.cube = nil) or (val(int32, val(int16, 0 (* TODO o2m: the length of this open array is not available; Oberon: IF (index.cube = NIL) OR (LEN(index.cube^) < size) THEN NEW(index.cube, size) END; *))) < size_) then
+    newgc(index.cube, size_)
+  end
+  index.bits_ := bits_
+
+  cur := 0
+  while cur < colors do
+    rcol := red[cur]
+    rcenter := val(int16, asr(val(int32, rcol), usig(val(int32, nbits))))
+    rdist := rcol - (rcenter * x + asr(x, 1))
+    gcol := green[cur]
+    gcenter := val(int16, asr(val(int32, gcol), usig(val(int32, nbits))))
+    gdist := gcol - (gcenter * x + asr(x, 1))
+    bcol := blue[cur]
+    bcenter := val(int16, asr(val(int32, bcol), usig(val(int32, nbits))))
+    bdist := bcol - (bcenter * x + asr(x, 1))
+    cdist := rdist * rdist + gdist * gdist + bdist * bdist
+    incr := 2 * ((rcenter + 1) * xsqr - rcol * x)
+    incg := 2 * ((gcenter + 1) * xsqr - gcol * x)
+    incb := 2 * ((bcenter + 1) * xsqr - bcol * x)
+    p := rcenter * rstride + gcenter * gstride + bcenter
+    redloop(@bcenter, @bhere, @binc, @bmax, @bmin, @cdist, @colormax, @cur, @dbuf, @gcenter, @gdist, @ghere, @ginc, @gmax, @gmin, @gp, @gstride, @incb, @incg, @incr, index, @p, @rcenter, @rdist, @rp, @rstride, @txsqr)
+    inc(cur)
+  end
+end MakeIndex
+
+// update the inverse color lookup table for the display palette *
+procedure Update*()
+  var
+    colors, n: int16
+    d: Displays.PDisplay
+    col: int32
+begin
+  d := Displays.main
+  if (d # nil) & (d.format = Displays.index8) then
+    // use real palette
+    if d.IndexToColor(0) = d.IndexToColor(16) then
+      colors := 16
+    else
+      colors := 256
+    end
+    for n := 0 to colors - 1 do
+      col := d.IndexToColor(n)
+      Red[n] := val(int16, band(asr(col, 16), 255))
+      Green[n] := val(int16, band(asr(col, 8), 255))
+      Blue[n] := val(int16, band(col, 255))
+    end
+
+    MakeIndex(@DisplayIndex, DisplayBits, colors, @Red, @Green, @Blue)
+  else
+    colors := val(int16, sigc(shl(val(int32, 1), usig(val(int32, Display.Depth(Display.ColLeft))))))
+    if colors > 256 then
+      colors := 256
+    end
+    for n := 0 to colors - 1 do
+      Display.GetColor(n, @Red[n], @Green[n], @Blue[n])
+    end
+
+    MakeIndex(@DisplayIndex, DisplayBits, colors, @Red, @Green, @Blue)
+  end
+end Update
+
+// --- Conversion Routines ---*
+
+// Oberon display model *
+procedure DisplayToRGB*(dcol: int32; r, g, b: pointer to real)
+  var
+    dr, dg, db: int16
+begin
+  if dcol < 0 then
+    Display.GetColor(dcol, @dr, @dg, @db)
+  else
+    dr := Red[dcol]
+    dg := Green[dcol]
+    db := Blue[dcol]
+  end
+
+  r^ := val(real, 1) / val(real, 255) * val(real, dr)
+  g^ := val(real, 1) / val(real, 255) * val(real, dg)
+  b^ := val(real, 1) / val(real, 255) * val(real, db)
+end DisplayToRGB
+
+procedure RGBToDisplay*(r, g, b: real; dcol: pointer to int32)
+  var
+    dr, dg, db: int32
+begin
+  dr := val(int32, floor(val(real, 255) * r))
+  dg := val(int32, floor(val(real, 255) * g))
+  db := val(int32, floor(val(real, 255) * b))
+  if Display.TrueColor(Display.ColLeft) then
+    dcol^ := Display.RGB(dr, dg, db)
+  else
+    dcol^ := Match(DisplayIndex, DisplayBits, val(int16, dr), val(int16, dg), val(int16, db))
+  end
+end RGBToDisplay
+
+// HSV (Hue Saturation Value) model *
+procedure RGBToHSV*(r, g, b: real; h, s, v: pointer to real)
+  var
+    min_, d: real
+begin
+  // conversion algorithm: Foley et al. fig 13.33
+  if r < g then
+    if g < b then
+      min_ := r
+      v^ := b
+    elsif b < r then
+      min_ := b
+      v^ := g
+    else
+      min_ := r
+      v^ := g
+    end
+
+  else
+    if b > r then
+      min_ := g
+      v^ := b
+    elsif g > b then
+      min_ := b
+      v^ := r
+    else
+      min_ := g
+      v^ := r
+    end
+  end
+
+  d := v^ - min_
+  if v^ = val(real, 0) then
+    s^ := val(real, 0) // black is a special case with saturation 0
+  else
+    s^ := d / v^
+  end
+
+  if s^ = val(real, 0) then
+    // achromatic case
+    h^ := val(real, undefined)
+  else
+    if r = v^ then
+      h^ := (g - b) / d // hue between yellow and magenta
+    elsif g = v^ then
+      h^ := val(real, 2) + (b - r) / d // hue between cyan and yellow
+    else
+      h^ := val(real, 4) + (r - g) / d // hue between magenta and cyan
+    end
+
+    h^ := val(real, 1) / val(real, 6) * h^
+    if h^ < val(real, 0) then
+      h^ := h^ + val(real, 1)
+    elsif h^ >= val(real, 1) then
+      h^ := h^ - val(real, 1)
+    end
+  end
+end RGBToHSV
+
+procedure HSVToRGB*(h, s, v: real; r, g, b: pointer to real)
+  var
+    i: int32
+    f, p, q, t: real
+begin
+  // conversion algorithm: Foley et al. fig 13.34
+  if s = val(real, 0) then
+    // achromatic case
+    r^ := v
+    g^ := v
+    b^ := v
+  else
+    h := val(real, 6) * h
+    i := val(int32, floor(h))
+    f := h - val(real, i)
+    p := v * (val(real, 1) - s)
+    q := v * (val(real, 1) - s * f)
+    t := v * (val(real, 1) - s * (val(real, 1) - f))
+    case obmod(i, 6) of
+      0:
+      r^ := v
+      g^ := t
+      b^ := p
+    | 1:
+      r^ := q
+      g^ := v
+      b^ := p
+    | 2:
+      r^ := p
+      g^ := v
+      b^ := t
+    | 3:
+      r^ := p
+      g^ := q
+      b^ := v
+    | 4:
+      r^ := t
+      g^ := p
+      b^ := v
+    | 5:
+      r^ := v
+      g^ := p
+      b^ := q
+    end
+  end
+end HSVToRGB
+
+// CMY (Cyan Magenta Yellow) model *
+procedure RGBToCMY*(r, g, b: real; c, m, y: pointer to real)
+begin
+  c^ := val(real, 1) - r
+  m^ := val(real, 1) - g
+  y^ := val(real, 1) - b
+end RGBToCMY
+
+procedure CMYToRGB*(c, m, y: real; r, g, b: pointer to real)
+begin
+  r^ := val(real, 1) - c
+  g^ := val(real, 1) - m
+  b^ := val(real, 1) - y
+end CMYToRGB
+
+// CMYK (Cyan Magenta Yellow blacK) model *
+procedure RGBToCMYK*(r, g, b: real; c, m, y, k: pointer to real)
+begin
+  c^ := val(real, 1) - r
+  m^ := val(real, 1) - g
+  y^ := val(real, 1) - b
+  if r < g then
+    if b < r then
+      k^ := b
+    else
+      k^ := r
+    end
+
+  else
+    if b < g then
+      k^ := b
+    else
+      k^ := g
+    end
+  end
+
+  c^ := c^ - k^
+  m^ := m^ - k^
+  y^ := y^ - k^
+end RGBToCMYK
+
+procedure CMYKToRGB*(c, m, y, k: real; r, g, b: pointer to real)
+begin
+  r^ := val(real, 1) - (k + c)
+  g^ := val(real, 1) - (k + m)
+  b^ := val(real, 1) - (k + y)
+end CMYKToRGB
+
+// --- Colors ---*
+
+// copy color contents *
+procedure Copy*(msg: pointer to Objects.CopyMsg; from, to_: Color)
+begin
+  to_.handle := from.handle
+  to_.r := from.r
+  to_.g := from.g
+  to_.b := from.b
+end Copy
+
+// message handler *
+procedure Handle*(obj: Objects.Object; msg: pointer to Objects.ObjMsg)
+  var
+    col, copy_: Color
+    x, y, z, w: real
+    lib: Objects.Library
+    ref: int16
+    ver: int32
+begin
+  col := obj(Color)
+  case msg of
+  | Objects.PAttrMsg:
+    if msg.id = Objects.enum then
+      msg.Enum("RedGB")
+      msg.Enum("RGreenB")
+      msg.Enum("RGBlue")
+      msg.Enum("Color")
+      msg.Enum("HueSV")
+      msg.Enum("HSaturationV")
+      msg.Enum("HSValue")
+      msg.Enum("CyanMY")
+      msg.Enum("CMagentaY")
+      msg.Enum("CMYellow")
+      msg.Enum("CyanMYK")
+      msg.Enum("CMagentaYK")
+      msg.Enum("CMYellowK")
+      msg.Enum("CMYblacK")
+    elsif msg.id = Objects.get then
+      if msg.name = "Gen" then
+        msg.class := Objects.String
+        copy(@msg.s, "Colors.New", 64)
+        msg.res := 0
+      elsif msg.name = "RedGB" then
+        msg.class := Objects.Real
+        msg.x := col.r
+        msg.res := 0
+      elsif msg.name = "RGreenB" then
+        msg.class := Objects.Real
+        msg.x := col.g
+        msg.res := 0
+      elsif msg.name = "RGBlue" then
+        msg.class := Objects.Real
+        msg.x := col.b
+        msg.res := 0
+      elsif msg.name = "Color" then
+        msg.class := Objects.Int
+        RGBToDisplay(col.r, col.g, col.b, @msg.i)
+        msg.res := 0
+      elsif msg.name = "HueSV" then
+        msg.class := Objects.Real
+        RGBToHSV(col.r, col.g, col.b, @msg.x, @x, @y)
+        msg.res := 0
+      elsif msg.name = "HSaturationV" then
+        msg.class := Objects.Real
+        RGBToHSV(col.r, col.g, col.b, @x, @msg.x, @y)
+        msg.res := 0
+      elsif msg.name = "HSValue" then
+        msg.class := Objects.Real
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @msg.x)
+        msg.res := 0
+      elsif msg.name = "CyanMY" then
+        msg.class := Objects.Real
+        RGBToCMY(col.r, col.g, col.b, @msg.x, @x, @y)
+        msg.res := 0
+      elsif msg.name = "CMagentaY" then
+        msg.class := Objects.Real
+        RGBToCMY(col.r, col.g, col.b, @x, @msg.x, @y)
+        msg.res := 0
+      elsif msg.name = "CMYellow" then
+        msg.class := Objects.Real
+        RGBToCMY(col.r, col.g, col.b, @x, @y, @msg.x)
+        msg.res := 0
+      elsif msg.name = "CyanMYK" then
+        msg.class := Objects.Real
+        RGBToCMYK(col.r, col.g, col.b, @msg.x, @x, @y, @z)
+        msg.res := 0
+      elsif msg.name = "CMagentaYK" then
+        msg.class := Objects.Real
+        RGBToCMYK(col.r, col.g, col.b, @x, @msg.x, @y, @z)
+        msg.res := 0
+      elsif msg.name = "CMYellowK" then
+        msg.class := Objects.Real
+        RGBToCMYK(col.r, col.g, col.b, @x, @y, @msg.x, @z)
+        msg.res := 0
+      elsif msg.name = "CMYblacK" then
+        msg.class := Objects.Real
+        RGBToCMYK(col.r, col.g, col.b, @x, @y, @z, @msg.x)
+        msg.res := 0
+      elsif msg.name = "Red255" then
+        msg.class := Objects.Int
+        msg.i := val(int32, floor(val(real, 255) * col.r))
+        msg.res := 0
+      elsif msg.name = "Green255" then
+        msg.class := Objects.Int
+        msg.i := val(int32, floor(val(real, 255) * col.g))
+        msg.res := 0
+      elsif msg.name = "Blue255" then
+        msg.class := Objects.Int
+        msg.i := val(int32, floor(val(real, 255) * col.b))
+        msg.res := 0
+      elsif msg.name = "Hue360" then
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @z)
+        if x < val(real, 0) then
+          msg.class := Objects.String
+          copy(@msg.s, "", 64)
+          msg.res := 0
+        else
+          msg.class := Objects.Int
+          msg.i := val(int32, floor(val(real, 360) * x))
+          msg.res := 0
+        end
+
+      elsif msg.name = "Saturation100" then
+        msg.class := Objects.Int
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @z)
+        msg.i := val(int32, floor(val(real, 100) * y))
+        msg.res := 0
+      elsif msg.name = "Value100" then
+        msg.class := Objects.Int
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @z)
+        msg.i := val(int32, floor(val(real, 100) * z))
+        msg.res := 0
+      end
+
+    elsif msg.id = Objects.set_ then
+      if msg.class = Objects.Int then
+        msg.x := val(real, msg.i)
+      elsif msg.class = Objects.LongReal then
+        msg.x := val(real, msg.y)
+        msg.i := val(int32, floor(msg.x))
+      elsif msg.class = Objects.String then
+        Strings.StrToReal(@msg.s, @msg.y)
+        msg.x := val(real, msg.y)
+        Strings.StrToInt(@msg.s, @msg.i)
+      elsif msg.class = Objects.Real then
+        msg.i := val(int32, floor(msg.x))
+      else
+        return
+      end
+
+      if (msg.name = "RedGB") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        col.r := msg.x
+        msg.res := 0
+      elsif (msg.name = "RGreenB") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        col.g := msg.x
+        msg.res := 0
+      elsif (msg.name = "RGBlue") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        col.b := msg.x
+        msg.res := 0
+      elsif (msg.name = "Color") & (msg.i < 256) then
+        DisplayToRGB(msg.i, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "HueSV") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @z)
+        HSVToRGB(msg.x, y, z, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "HSaturationV") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @z)
+        HSVToRGB(x, msg.x, z, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "HSValue") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @z)
+        HSVToRGB(x, y, msg.x, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "CyanMY") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToCMY(col.r, col.g, col.b, @x, @y, @z)
+        CMYToRGB(msg.x, y, z, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "CMagentaY") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToCMY(col.r, col.g, col.b, @x, @y, @z)
+        CMYToRGB(x, msg.x, z, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "CMYellow") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToCMY(col.r, col.g, col.b, @x, @y, @z)
+        CMYToRGB(x, y, msg.x, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "CyanMYK") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToCMYK(col.r, col.g, col.b, @x, @y, @z, @w)
+        CMYKToRGB(msg.x, y, z, w, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "CMagentaYK") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToCMYK(col.r, col.g, col.b, @x, @y, @z, @w)
+        CMYKToRGB(x, msg.x, z, w, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "CMYellowK") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToCMYK(col.r, col.g, col.b, @x, @y, @z, @w)
+        CMYKToRGB(x, y, msg.x, w, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "CMYblacK") & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        RGBToCMYK(col.r, col.g, col.b, @x, @y, @z, @w)
+        CMYKToRGB(x, y, z, msg.x, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "Red255") & (0 <= msg.i) & (msg.i < 256) then
+        col.r := val(real, msg.i) / val(real, 255)
+        msg.res := 0
+      elsif (msg.name = "Green255") & (0 <= msg.i) & (msg.i < 256) then
+        col.g := val(real, msg.i) / val(real, 255)
+        msg.res := 0
+      elsif (msg.name = "Blue255") & (0 <= msg.i) & (msg.i < 256) then
+        col.b := val(real, msg.i) / val(real, 255)
+        msg.res := 0
+      elsif (msg.name = "Hue360") & (0 <= msg.i) & (msg.i < 360) then
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @z)
+        if (msg.class = Objects.String) & (msg.s = "") then
+          HSVToRGB(val(real, -1), val(real, 0), z, @col.r, @col.g, @col.b)
+          msg.res := 0
+        else
+          HSVToRGB(val(real, msg.i) / val(real, 360), y, z, @col.r, @col.g, @col.b)
+          msg.res := 0
+        end
+
+      elsif (msg.name = "Saturation100") & (0 <= msg.i) & (msg.i <= 100) then
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @z)
+        HSVToRGB(x, val(real, msg.i) / val(real, 100), z, @col.r, @col.g, @col.b)
+        msg.res := 0
+      elsif (msg.name = "Value100") & (0 <= msg.i) & (msg.i <= 100) then
+        RGBToHSV(col.r, col.g, col.b, @x, @y, @z)
+        HSVToRGB(x, y, val(real, msg.i) / val(real, 100), @col.r, @col.g, @col.b)
+        msg.res := 0
+      end
+    end
+
+  | Objects.PCopyMsg:
+    if msg.stamp # col.stamp then
+      newgc(copy_)
+      col.dlink := copy_
+      col.stamp := msg.stamp
+      Copy(msg, col, copy_)
+    end
+
+    msg.obj := col.dlink
+
+  | Objects.PBindMsg:
+    lib := msg(Objects.PBindMsg).lib
+    if (lib # nil) & ((col.lib = nil) or (col.lib.name[0] = 0X) & (col.lib # lib)) then
+      lib.GenRef(lib, @ref)
+      if ref >= 0 then
+        lib.PutObj(lib, ref, col)
+      end
+    end
+
+  | Objects.PFileMsg:
+    if msg.id = Objects.store then
+      Files.WriteNum(@msg.R, 1)
+      Files.WriteReal(@msg.R, col.r)
+      Files.WriteReal(@msg.R, col.g)
+      Files.WriteReal(@msg.R, col.b)
+    elsif msg.id = Objects.load then
+      Files.ReadNum(@msg.R, @ver)
+      Files.ReadReal(@msg.R, @col.r)
+      Files.ReadReal(@msg.R, @col.g)
+      Files.ReadReal(@msg.R, @col.b)
+    end
+
+  end
+end Handle
+
+// generator command *
+procedure New*()
+  var
+    col: Color
+begin
+  newgc(col)
+  col.handle := Handle
+  Objects.NewObj := col
+end New
+
+// initialization *
+procedure InitRGB*(col: Color; r, g, b: real)
+begin
+  col.handle := Handle
+  col.r := r
+  col.g := g
+  col.b := b
+end InitRGB
+
+procedure InitDisplay*(col: Color; dcol: int32)
+begin
+  col.handle := Handle
+  DisplayToRGB(dcol, @col.r, @col.g, @col.b)
+end InitDisplay
+
+procedure InitHSV*(col: Color; h, s, v: real)
+begin
+  col.handle := Handle
+  HSVToRGB(h, s, v, @col.r, @col.g, @col.b)
+end InitHSV
+
+procedure InitCMY*(col: Color; c, m, y: real)
+begin
+  col.handle := Handle
+  CMYToRGB(c, m, y, @col.r, @col.g, @col.b)
+end InitCMY
+
+procedure InitCMYK*(col: Color; c, m, y, k: real)
+begin
+  col.handle := Handle
+  CMYKToRGB(c, m, y, k, @col.r, @col.g, @col.b)
+end InitCMYK
+
+// get color values *
+procedure GetRGB*(col: Color; r, g, b: pointer to real)
+begin
+  r^ := col.r
+  g^ := col.g
+  b^ := col.b
+end GetRGB
+
+procedure GetDisplay*(col: Color; dcol: pointer to int32)
+begin
+  RGBToDisplay(col.r, col.g, col.b, dcol)
+end GetDisplay
+
+procedure GetHSV*(col: Color; h, s, v: pointer to real)
+begin
+  RGBToHSV(col.r, col.g, col.b, h, s, v)
+end GetHSV
+
+procedure GetCMY*(col: Color; c, m, y: pointer to real)
+begin
+  RGBToCMY(col.r, col.b, col.b, c, m, y)
+end GetCMY
+
+procedure GetCMYK*(col: Color; c, m, y, k: pointer to real)
+begin
+  RGBToCMYK(col.r, col.g, col.b, c, m, y, k)
+end GetCMYK
+
+// set color values *
+procedure SetRGB*(col: Color; r, g, b: real)
+begin
+  col.r := r
+  col.g := g
+  col.b := b
+end SetRGB
+
+procedure SetDisplay*(col: Color; dcol: int32)
+begin
+  DisplayToRGB(dcol, @col.r, @col.g, @col.b)
+end SetDisplay
+
+procedure SetHSV*(col: Color; h, s, v: real)
+begin
+  HSVToRGB(h, s, v, @col.r, @col.g, @col.b)
+end SetHSV
+
+procedure SetCMY*(col: Color; c, m, y: real)
+begin
+  CMYToRGB(c, m, y, @col.r, @col.b, @col.b)
+end SetCMY
+
+procedure SetCMYK*(col: Color; c, m, y, k: real)
+begin
+  CMYKToRGB(c, m, y, k, @col.r, @col.b, @col.b)
+end SetCMYK
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Update" end return Update end
+  if i = 1 then if name # nil then name^ := "New" end return New end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Colors", cmd_)
+  DisplayBits := 4
+  Update()
+end Colors.

@@ -1,0 +1,2040 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module TextFields [level=5]
+
+import Objects, Gadgets, Display, Display3, Effects, Oberon, Texts, Files, Input, Printer, Printer3, Fonts, Attributes, Strings, Modules
+// portable
+// jm 16.11.95
+
+(** Module TextFields implements text captions and textfields.
+*)
+
+(*
+JM 4.2.93 - Textfields sends update message down
+jm 9.2.93 - correct response on Viewers.ViewerMsg
+jm 11.2.93 - Display.ControlMsg
+jm 22.2.93 - ConsumeText corrected
+13.4.93 - takes no focus if unmoveable
+5.4.94 - selection is returned in full
+2.5.94 - Added Lineup for TF
+2.5.94 - Fixed Tab'ing
+27.5.94 - Added vertical offsets to captions
+The text captions are a complete hack due to the wrong placement of the optimizations (kr).
+They should be rewritten.
+15.11.94 - InsertObj deleted
+6.12.94 - Can set textcaptions with link message
+2.1.95 - replaced the text captions with completely new implementation
+23.2.95 - fixed caption focus when no contents
+19.4.95 - added delete right support for TF
+15.5.95 - fixed empty string delete in TF
+26.10.95 - added scrolling support to TextFields
+16.11.95 - Fixed copy of selected caption in panel
+12.12.95 - tk added underlined attribute
+22.4.97 - ps added Font attribute
+*)
+
+const
+  MaxLen = 64
+  CarHeight = 14
+  CarWidth = 2
+  Yoffset = 5
+  Xoffset = 5
+
+// Captions  for displaying a text.
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  
+  Caption* = pointer to CaptionDesc
+  CaptionDesc* = object (Gadgets.FrameDesc)
+    focused*: boolean // Has the keyboard focus or not ?
+    underlined*: boolean // Is text underlined ?
+    text*: Texts.Text // Displayed Text.
+    time: int32
+  end
+
+  TextField* = pointer to TextFieldDesc
+  TextFieldDesc* = object (Gadgets.FrameDesc)
+    selbeg*: int16 // Starting and ending position of selected characters [selbeg, selend).
+    selend*: int16
+    time*: int32 // Selection time.
+    carpos*: int16 // Caret position and relative coordinates.
+    carx*, cary*: int16
+    val_*: array 64 (* MaxLen *) of char // Current value.
+    consistent*: boolean // Is the textfield consistent with its model value ?
+    col*: int16 // Background color.
+    start: int16
+  end
+
+  TextFieldUpdateMsg = object (Gadgets.UpdateMsg)
+    beg: int32
+  end
+  PTextFieldUpdateMsg = pointer to TextFieldUpdateMsg
+
+  PassFocusMsg = object (Display.FrameMsg)
+    X, Y, foundX, foundY: int16
+    from, to_: TextField
+  end
+  PPassFocusMsg = pointer to PassFocusMsg
+
+var
+  W: Texts.Writer
+  invTF: int16 // focus & selection color for text fields
+  linebuf: array 32 of int16
+  lastfont, lastlib: Fonts.Font
+
+procedure ^ LocatePos(F: TextField; pos: int16; x, y: pointer to int16)
+procedure ^ MakeConsistent(F: TextField; dlink: Objects.Object)
+
+procedure ForceString(F: Display.Frame; M: pointer to Objects.AttrMsg)
+begin
+  Gadgets.framehandle(F, M)
+  if M.res < 0 then
+    M.class := Objects.String
+    copy(@M.s, "", 64)
+    M.res := 0
+  end
+end ForceString
+
+// ------------------------- CAPTIONS ----------------------
+
+procedure Max(x, y: int16): int16
+begin
+  if x > y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Max
+
+procedure Min(x, y: int16): int16
+begin
+  if x < y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+// lookup the size of a character on the printer
+procedure Lookup(L: Fonts.Font; ch: char; minY, maxY, dx: pointer to int16)
+  var
+    obj: Objects.Object
+    metric: Fonts.Font
+
+  procedure Dev(x: int16): int16
+  begin
+    return val(int16, obdiv(val(int32, x) * Display.Unit, Printer.Unit))
+  end Dev
+begin
+  if L = lastfont then
+    metric := lastlib
+  else
+    metric := Printer.GetMetric(L)
+    lastlib := metric
+    lastfont := L
+  end
+
+  if metric # nil then
+    metric.GetObj(metric, val(int16, ord(ch)), @obj)
+    case obj of
+    | Fonts.Char:
+      minY^ := metric.minY
+      maxY^ := metric.maxY
+      dx^ := obj.dx
+    end
+  else
+    // scale display font
+    L.GetObj(L, val(int16, ord(ch)), @obj)
+    case obj of
+    | Fonts.Char:
+      minY^ := Dev(L.minY)
+      maxY^ := Dev(L.maxY)
+      dx^ := Dev(obj.dx)
+    end
+  end
+end Lookup
+
+procedure GetFont(T: Texts.Text; font: pointer to array of char; font_len: int32)
+  var
+    lib: Objects.Library
+    R: Texts.Reader
+    ch: char
+begin
+  Texts.OpenReader(@R, T, 0)
+  Texts.Read(@R, @ch)
+  lib := R.lib
+  while ~R.eot & (R.lib = lib) do
+    Texts.Read(@R, @ch)
+  end
+  if ~R.eot then
+    copy(font, "mixed", font_len)
+  elsif lib = nil then
+    copy(font, @Fonts.Default.name, font_len)
+  else
+    copy(font, @lib.name, font_len)
+  end
+end GetFont
+
+// Calculate the size and # of lines of caption. If displayspace then the size on the display is returned (adjusted according to the size on the printer) and if not, the size in printer pixels is returned.
+procedure CalcSize*(F: Caption; W, H, nolines: pointer to int16; displayspace: boolean)
+  var
+    R: Texts.Reader
+    ch: char
+    linew: int16 // for display
+    dsr, asr_, lineh, top, plinew: int16 // for printer
+    pdsr, pasr, pdx, plineh, d, a, pW, pH: int16
+    obj: Objects.Object
+    fnt, lastfnt: Fonts.Font
+begin
+  if F.text.len_ = 0 then
+    W^ := 5
+    H^ := 5
+    nolines^ := 0
+  else
+    W^ := 0
+    H^ := 0
+    pW := 0
+    pH := 0
+    lastfnt := nil
+    nolines^ := 0
+    top := 0
+    Texts.OpenReader(@R, F.text, 0)
+    Texts.Read(@R, @ch)
+    linew := 0
+    lineh := 0
+    asr_ := 0
+    dsr := 0
+    plinew := 0
+    plineh := 0
+    pasr := 0
+    pdsr := 0
+    while ~R.eot do
+      if R.lib is Fonts.Font then
+        fnt := R.lib(Fonts.Font)
+        fnt.GetObj(fnt, val(int16, ord(ch)), @obj)
+        case obj of
+        | Fonts.Char:
+          inc(linew, obj.dx)
+          Lookup(fnt, ch, @d, @a, @pdx)
+          inc(plinew, pdx)
+          if fnt # lastfnt then
+            dsr := Max(dsr, -fnt.minY)
+            asr_ := Max(asr_, fnt.maxY)
+            lineh := dsr + asr_
+
+            pdsr := Max(pdsr, abs(d))
+            pasr := Max(pasr, a)
+            plineh := pdsr + pasr
+            lastfnt := fnt
+          end
+
+          if ch = 0DX then
+            if displayspace then
+              dec(top, asr_)
+              linebuf[nolines^] := top
+              dec(top, dsr)
+            else
+              dec(top, pasr)
+              linebuf[nolines^] := top
+              dec(top, pdsr)
+            end
+
+            inc(nolines^)
+            inc(H^, lineh)
+            inc(pH, plineh)
+            if linew > W^ then
+              W^ := linew
+            end
+            if plinew > pW then
+              pW := plinew
+            end
+            asr_ := 0
+            dsr := 0
+            lineh := 0
+            linew := 0
+            pasr := 0
+            pdsr := 0
+            plineh := 0
+            plinew := 0
+            if nolines^ = val(int16, 32) then
+              return
+            end
+            lastfnt := nil
+          end
+        end
+      end
+
+      Texts.Read(@R, @ch)
+    end
+
+    if displayspace then
+      dec(top, asr_)
+      linebuf[nolines^] := top
+      dec(top, dsr)
+    else
+      dec(top, pasr)
+      linebuf[nolines^] := top
+      dec(top, pdsr)
+    end
+
+    inc(nolines^)
+    inc(H^, lineh)
+    inc(pH, plineh)
+    if linew > W^ then
+      W^ := linew
+    end
+    if plinew > pW then
+      pW := plinew
+    end
+
+    if displayspace then
+      pW := val(int16, val(int16, floor(val(real, val(int32, pW) * Printer.Unit) / val(real, Display.Unit)) + 1))
+      pH := val(int16, val(int16, floor(val(real, val(int32, pH) * Printer.Unit) / val(real, Display.Unit)) + 1))
+      if pW > W^ then
+        W^ := pW
+      end
+      if pH > H^ then
+        H^ := pH
+      end
+    else
+      W^ := pW
+      H^ := pH
+    end
+  end
+end CalcSize
+
+procedure Update(F: Caption)
+  var
+    A: Display.ModifyMsg
+    nolines: int16
+begin
+  CalcSize(F, @A.W, @A.H, @nolines, true)
+  A.id := Display.move
+  A.F := F
+  A.X := F.X
+  A.Y := F.Y + F.H - A.H
+  A.dX := A.X - F.X
+  A.dY := A.Y - F.Y
+  A.dH := A.H - F.H
+  A.dW := A.W - F.W
+  if (A.dX # 0) or (A.dY # 0) or (A.dW # 0) or (A.dH # 0) then
+    A.mode := Display.display
+    Display.Broadcast(@A)
+    if (F.W # A.W) or (F.H # A.H) then
+      F.W := A.W
+      F.H := A.H
+      F.mask := nil
+    end
+
+  else
+    Gadgets.Update(F)
+  end
+end Update
+
+procedure RestoreCaption(F: Caption; M: Display3.Mask; x, y, w, h: int16)
+  var
+    X, X0, Y, W, H, nolines, i: int16
+    R: Texts.Reader
+    ch: char
+    obj: Objects.Object
+    fnt: Fonts.Font
+begin
+  if F.text.len_ = 0 then
+    if F.focused then
+      Display3.Rect(M, Display3.red, Display.solid, x, y, w, h, 1, Display.replace)
+      Display3.ReplConst(M, Display.BG, x + 1, y + 1, w - 2, h - 2, Display.replace)
+    else
+      Display3.Rect(M, Display.FG, Display.solid, x, y, w, h, 1, Display.replace)
+    end
+
+  else
+    if F.focused then
+      Display3.Rect(M, Display3.red, Display.solid, x, y, w, h, 1, Display.replace)
+      Display3.ReplConst(M, Display.BG, x + 1, y + 1, w - 2, h - 2, Display.replace)
+    end
+
+    CalcSize(F, @W, @H, @nolines, true)
+    X := x
+    Y := y + h + linebuf[0]
+    i := 1
+    X0 := X
+    Texts.OpenReader(@R, F.text, 0)
+    Texts.Read(@R, @ch)
+    while ~R.eot & (i # val(int16, 32)) do
+      if R.lib is Fonts.Font then
+        fnt := R.lib(Fonts.Font)
+        fnt.GetObj(fnt, val(int16, ord(ch)), @obj)
+        case obj of
+        | Fonts.Char:
+          if ch = 0DX then
+            if F.underlined then
+              Display3.Line(M, 15, Display.grey1, X0 - 1, Y + fnt.minY, X + 1, Y + fnt.minY, 1, Display.replace)
+            end
+
+            Y := y + h + linebuf[i]
+            inc(i)
+            X := x
+            X0 := X
+          else
+            Display3.CopyPattern(M, R.col, obj.pat (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; Oberon: Display3.CopyPattern(M, R.col, obj.pat, X + obj.x, Y + obj.y, Display3.textmode); *), X + obj.x, Y + obj.y, Display3.textmode)
+            inc(X, obj.dx)
+          end
+        end
+      end
+
+      Texts.Read(@R, @ch)
+    end
+
+    if F.underlined & (X0 # X) then
+      Display3.Line(M, 15, Display.grey1, X0 - 1, Y + fnt.minY, X + 1, Y + fnt.minY, 1, Display.replace)
+    end
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(M, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreCaption
+
+procedure CaptionAttributes(F: Caption; M: pointer to Objects.AttrMsg)
+  var
+    str: array 64 of char
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "TextFields.NewCaption", 64)
+      M.res := 0
+    elsif M.name = "Value" then
+      Attributes.TxtToStr(F.text, @M.s, 64)
+      M.class := Objects.String
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := val(int32, abs(Fonts.Default.minY) + 1)
+      M.res := 0
+    elsif M.name = "Cmd" then
+      Gadgets.framehandle(F, M)
+      if M.res < 0 then
+        // no such attribute, simulate one
+        M.class := Objects.String
+        copy(@M.s, "", 64)
+        M.res := 0
+      end
+
+    elsif M.name = "Underlined" then
+      M.class := Objects.Bool
+      M.b := F.underlined
+      M.res := 0
+    elsif M.name = "Font" then
+      M.class := Objects.String
+      GetFont(F.text, @M.s, 64)
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Value" then
+      if M.class = Objects.String then
+        Attributes.TxtToStr(F.text, @str, 64)
+        if str # M.s then
+          GetFont(F.text, @str, 64)
+          Attributes.StrToTxt(@M.s, @F.text)
+          if str # "mixed" then
+            Texts.ChangeLooks(F.text, 0, F.text.len_, {0}, Fonts.This(@str), 0, 0)
+          end
+          Update(F)
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "Color" then
+      if M.class = Objects.Int then
+        Texts.ChangeLooks(F.text, 0, F.text.len_, {1}, nil, val(int8, val(int16, M.i)), 0)
+        M.res := 0
+      end
+
+    elsif M.name = "Underlined" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.underlined := true
+        else
+          F.underlined := false
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "Font" then
+      if M.class = Objects.String then
+        if M.s # "mixed" then
+          Texts.ChangeLooks(F.text, 0, F.text.len_, {0}, Fonts.This(@M.s), 0, 0)
+        end
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Value")
+    M.Enum("Font")
+    M.Enum("Cmd")
+    M.Enum("Underlined")
+    Gadgets.framehandle(F, M)
+  end
+end CaptionAttributes
+
+procedure PrintCaption(F: Caption; M: pointer to Display.DisplayMsg)
+  var
+    Q: Display3.Mask
+    X, X0, Y, W, H, nolines, i: int16
+    R: Texts.Reader
+    ch: char
+    fnt: Fonts.Font
+    d, pdx: int16
+
+    // buffer stuff
+    buf: array 1024 of char
+    bufpos, bufx, bufy: int16
+    lastfnt: Fonts.Font
+    lastcol: int16
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+
+  procedure InitBuf(bufpos: pointer to int16; lastcol: pointer to int16; lastfnt: pointer to Fonts.Font)
+  begin
+    bufpos^ := 0
+    lastfnt^ := nil
+    lastcol^ := -1
+  end InitBuf
+
+  procedure FlushBuf(Q: pointer to Display3.Mask; buf: pointer to array 1024 of char; bufpos: pointer to int16; bufx: pointer to int16; bufy: pointer to int16; lastcol: pointer to int16; lastfnt: pointer to Fonts.Font)
+  begin
+    if bufpos^ > 0 then
+      buf[bufpos^] := 0X
+      Printer3.String(Q^, lastcol^, bufx^, bufy^, lastfnt^, buf, Display.paint)
+      bufpos^ := 0
+      lastfnt^ := nil
+    end
+  end FlushBuf
+
+  procedure WriteChar(fnt: Fonts.Font; col: int16; ch: char; Q: pointer to Display3.Mask; X: pointer to int16; Y: pointer to int16; buf: pointer to array 1024 of char; bufpos: pointer to int16; bufx: pointer to int16; bufy: pointer to int16; lastcol: pointer to int16; lastfnt: pointer to Fonts.Font)
+  begin
+    if (fnt # lastfnt^) or (col # lastcol^) then
+      FlushBuf(Q, buf, bufpos, bufx, bufy, lastcol, lastfnt)
+      lastcol^ := col
+      lastfnt^ := fnt
+      bufx^ := X^
+      bufy^ := Y^
+    end
+
+    buf[bufpos^] := ch
+    inc(bufpos^)
+  end WriteChar
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @Q)
+  CalcSize(F, @W, @H, @nolines, false)
+
+  X := M.x
+  Y := M.y + P(F.H) + linebuf[0]
+  i := 1
+  X0 := X
+
+  InitBuf(@bufpos, @lastcol, @lastfnt)
+
+  Texts.OpenReader(@R, F.text, 0)
+  Texts.Read(@R, @ch)
+  while ~R.eot do
+    if R.lib is Fonts.Font then
+      fnt := R.lib(Fonts.Font)
+      if ch = 0DX then
+        FlushBuf(@Q, @buf, @bufpos, @bufx, @bufy, @lastcol, @lastfnt)
+        if F.underlined then
+          Printer3.Line(Q, 15, Display.grey1, X0 - 1, Y + fnt.minY, X + 1, Y + fnt.minY, 1, Display.replace)
+        end
+
+        Y := M.y + P(F.H) + linebuf[i]
+        inc(i)
+        X := M.x
+        X0 := X
+      else
+        WriteChar(fnt, R.col, ch, @Q, @X, @Y, @buf, @bufpos, @bufx, @bufy, @lastcol, @lastfnt)
+        Lookup(fnt, ch, @d, @d, @pdx)
+        inc(X, pdx)
+      end
+    end
+
+    Texts.Read(@R, @ch)
+  end
+
+  FlushBuf(@Q, @buf, @bufpos, @bufx, @bufy, @lastcol, @lastfnt)
+  if F.underlined & (X0 # X) then
+    Printer3.Line(Q, 15, Display.grey1, X0 - 1, Y + fnt.minY, X + 1, Y + fnt.minY, 1, Display.replace)
+  end
+end PrintCaption
+
+procedure CopyCaption*(M: pointer to Objects.CopyMsg; from, to_: Caption)
+  var
+    B: Texts.Buffer
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  to_.focused := false
+  to_.underlined := from.underlined
+  newgc(to_.text)
+  Texts.Open(to_.text, "")
+  if from.text.len_ > 0 then
+    newgc(B)
+    Texts.OpenBuf(B)
+    Texts.Save(from.text, 0, from.text.len_, B)
+    Texts.Append(to_.text, B)
+  end
+end CopyCaption
+
+procedure ConsumeCh(F: Caption; ch: char; fnt: Objects.Library; col, voff: int8)
+  var
+    R: Texts.Reader
+    chr_: char
+begin
+  if ch = 7FX then
+    // DEL
+    if F.text.len_ > 0 then
+      Texts.Delete(F.text, F.text.len_ - 1, F.text.len_)
+    end
+  elsif (ch >= " ") or (ch = 9X) or (ch = 0DX) then
+    if F.text.len_ > 0 then
+      Texts.OpenReader(@R, F.text, F.text.len_ - 1)
+      Texts.Read(@R, @chr_)
+      if (R.lib # nil) & (R.lib is Fonts.Font) then
+        fnt := R.lib
+        col := R.col
+      end
+    end
+
+    Texts.SetFont(@W, fnt)
+    Texts.SetColor(@W, col)
+    Texts.SetOffset(@W, voff)
+    Texts.Write(@W, ch)
+    Texts.Append(F.text, W.buf)
+  end
+end ConsumeCh
+
+procedure LoadCaption(F: Caption; M: pointer to Objects.FileMsg)
+  var
+    ver, len_: int32
+    chr_: char
+    name: array 64 of char
+    i, col: int16
+    fnt: Objects.Library
+    ch: char
+begin
+  Files.ReadNum(@M.R, @ver)
+  if (ver = 4) or (ver = 5) then
+    if ver = 5 then
+      Files.ReadNum(@M.R, @ver)
+      F.underlined := ver = 1
+    end
+    Files.Read(@M.R, cast(BytePtr, @chr_)) // read TextBlockId
+    if chr_ # Texts.TextBlockId then
+      halt(99)
+    end
+    Texts.Load(F.text, Files.Base(@M.R), Files.Pos(@M.R), @len_)
+    Files.Set(@M.R, Files.Base(@M.R), Files.Pos(@M.R) + len_)
+    Gadgets.framehandle(F, M)
+  elsif (ver = 2) or (ver = 3) then
+    Files.Read(@M.R, cast(BytePtr, @chr_)) // read TextBlockId
+    if (chr_ = 1X) or (chr_ = Texts.TextBlockId) then
+      Texts.Load(F.text, Files.Base(@M.R), Files.Pos(@M.R), @len_)
+      Files.Set(@M.R, Files.Base(@M.R), Files.Pos(@M.R) + len_)
+      Gadgets.framehandle(F, M)
+    elsif chr_ = 2X then
+      Gadgets.framehandle(F, M)
+      if ver = 3 then
+        Files.ReadInt(@M.R, @col)
+      else
+        col := Display.FG
+      end
+      Files.ReadInt(@M.R, @i)
+      Objects.GetName(@F.lib.dict, i, @name, 64)
+      // IF name = "Elektra.Scn.Fnt" THEN name := "Electra.Scn.Fnt" END;
+      fnt := Objects.ThisLibrary(@name)
+      Texts.SetFont(@W, fnt)
+      Texts.SetColor(@W, val(int8, col))
+
+      i := 0
+      Files.Read(@M.R, cast(BytePtr, @ch))
+      while ch # 0X do
+        Texts.Write(@W, ch)
+        Files.Read(@M.R, cast(BytePtr, @ch))
+      end
+      Texts.Append(F.text, W.buf)
+      Texts.SetFont(@W, Fonts.Default)
+      Texts.SetColor(@W, Display.FG)
+      F.state := F.state + {Gadgets.transparent,Gadgets.lockedsize}
+    else
+      halt(99)
+    end
+
+  else
+    halt(99)
+  end
+end LoadCaption
+
+procedure CaptionHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M2: Display.PFrameMsg
+    x, y, w, h: int16
+    F1: Caption
+    Q: Display3.Mask
+    keysum: set
+    text: Texts.Text
+    tbeg, tend, time: int32
+    R: Texts.Reader
+    buf: Texts.Buffer
+    ch: char
+    len_: int32
+begin
+  case F of
+  | Caption:
+    case M of
+    | Display.PFrameMsg:
+      if (M.F = nil) or (M.F = F) then
+        // message addressed to box
+        x := M.x + F.X
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        M2 := M
+        case M2 of
+        | Display.PDisplayMsg:
+          if M2.device = Display.screen then
+            if (M2.id = Display.full) or (M2.F = nil) then
+              Gadgets.MakeMask(F, x, y, M2.dlink, @Q)
+              RestoreCaption(F, Q, x, y, w, h)
+            elsif M2.id = Display.area then
+              Gadgets.MakeMask(F, x, y, M2.dlink, @Q)
+              Display3.AdjustMask(Q, x + M2.u, y + h - 1 + M2.v, M2.w, M2.h)
+              RestoreCaption(F, Q, x, y, w, h)
+            end
+
+          elsif M2.device = Display.printer then
+            PrintCaption(F, M2)
+          end
+
+        | Oberon.PInputMsg:
+          if (M2.id = Oberon.consume) & F.focused then
+            ConsumeCh(F, M2.ch, M2.fnt, M2.col, M2.voff)
+            M2.res := 0
+          elsif (M2.id = Oberon.track) & (M2.keys = {2}) & Effects.Inside(M2.X, M2.Y, x, y, w, h) then
+            keysum := M2.keys
+            repeat
+              Effects.TrackMouse(@M2.keys, @M2.X, @M2.Y, Effects.Arrow)
+              keysum := keysum + M2.keys
+            until M2.keys = {}
+
+            M2.res := 0
+            if keysum = {2,0} then
+              // copy style over
+              Oberon.GetSelection(@text, @tbeg, @tend, @time)
+              if time # -1 then
+                Texts.OpenReader(@R, F.text, 0)
+                Texts.Read(@R, @ch)
+                Texts.ChangeLooks(text, tbeg, tend, {0,1,2}, R.lib, R.col, R.voff)
+              end
+
+            elsif keysum = {2,1} then
+              // copy from selection
+              Oberon.GetSelection(@text, @tbeg, @tend, @time)
+              if time # -1 then
+                newgc(buf)
+                Texts.OpenBuf(buf)
+                Texts.Save(text, tbeg, tend, buf)
+                Texts.Insert(F.text, F.text.len_, buf)
+              end
+
+            elsif ~F.focused & ~Gadgets.IsLocked(F, M2.dlink) then
+              Oberon.Defocus()
+              F.focused := true
+              Gadgets.Update(F)
+            end
+
+          elsif ~(Gadgets.selected in F.state) then
+            Gadgets.framehandle(F, M2)
+          end
+
+        | Texts.PUpdateMsg:
+          if M2.text = F.text then
+            Update(F)
+          end
+
+        | Oberon.PSelectMsg:
+          if (M2.id = Oberon.get) & (Gadgets.selected in F.state) & (F.time > M2.time) then
+            M2.text := F.text
+            M2.beg := 0
+            M2.end_ := F.text.len_
+            M2.time := F.time
+          end
+
+        | Oberon.PConsumeMsg:
+          if F.focused then
+            newgc(buf)
+            Texts.OpenBuf(buf)
+            Texts.Save(M2.text, M2.beg, M2.end_, buf)
+            Texts.Append(F.text, buf)
+            M2.res := 0
+          end
+
+        | Oberon.PControlMsg:
+          if F.focused & ((M2.id = Oberon.defocus) or (M2.id = Oberon.neutralize)) then
+            F.focused := false
+            Gadgets.Update(F)
+          end
+
+        | Display.PSelectMsg:
+          if M2.id = Display.set_ then
+            F.time := Oberon.Time() - 1
+          else
+            F.time := -1
+          end
+          Gadgets.framehandle(F, M2)
+
+        | Display.PControlMsg:
+          if M2.id = Display.newprinter then
+            lastfont := nil
+            lastlib := nil
+          end
+
+        else
+          Gadgets.framehandle(F, M2)
+        end
+      end
+
+    | Objects.PAttrMsg:
+      CaptionAttributes(F, M(Objects.PAttrMsg))
+    | Objects.PLinkMsg:
+      if M.id = Objects.get then
+        if M.name = "Model" then
+          M.obj := F.text
+          M.res := 0
+        else
+          Gadgets.framehandle(F, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if (M.name = "Model") & (M.obj is Texts.Text) then
+          F.text := M.obj(Texts.Text)
+          M.res := 0
+          Update(F)
+        else
+          Gadgets.framehandle(F, M)
+        end
+
+      else
+        Gadgets.framehandle(F, M)
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Files.WriteNum(@M.R, 5)
+        if F.underlined then
+          Files.WriteNum(@M.R, 1)
+        else
+          Files.WriteNum(@M.R, 0)
+        end
+        Texts.Store(F.text, Files.Base(@M.R), Files.Pos(@M.R), @len_)
+        Files.Set(@M.R, Files.Base(@M.R), Files.Pos(@M.R) + len_)
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        LoadCaption(F, M)
+        CalcSize(F, @F.W, @F.H, @x, true)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink // non-first arrival
+      else
+        // first arrival
+        newgc(F1)
+        F.stamp := M.stamp
+        F.dlink := F1
+        CopyCaption(M, F, F1)
+        M.obj := F1
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end CaptionHandler
+
+// initialize caption F with text T.
+procedure InitCaption*(F: Caption; T: Texts.Text)
+  var
+    nolines: int16
+begin
+  F.state := {Gadgets.transparent,Gadgets.lockedsize}
+  F.text := T
+  if T.len_ = 0 then
+    F.W := 5
+    F.H := 5
+  else
+    CalcSize(F, @F.W, @F.H, @nolines, true)
+  end
+
+  F.handle := CaptionHandler
+end InitCaption
+
+// Makes a caption out of the text object found in Objects.NewObj, returning the result in Objects.NewObj..
+procedure MakeCaption*()
+  var
+    F: Caption
+    T: Texts.Text
+begin
+  newgc(F)
+  F.H := 5
+  F.W := 5
+  F.handle := CaptionHandler
+  if (Objects.NewObj # nil) & (Objects.NewObj is Texts.Text) then
+    T := Objects.NewObj(Texts.Text)
+  else
+    newgc(T)
+    Texts.Open(T, "")
+  end
+
+  InitCaption(F, T)
+  F.focused := true
+  Objects.NewObj := F
+end MakeCaption
+
+procedure NewCaption*()
+  var
+    F: Caption
+    T: Texts.Text
+begin
+  newgc(F)
+  newgc(T)
+  Texts.Open(T, "")
+  InitCaption(F, T)
+  Objects.NewObj := F
+end NewCaption
+
+// ------------------------- TEXTFIELDS ----------------------
+
+procedure Length(S: pointer to array of char): int16
+  var
+    p: int16
+begin
+  p := 0
+  while S[p] # 0X do
+    inc(p)
+  end
+  return p
+end Length
+
+procedure InsertChar(S: pointer to array of char; S_len: int32; pos: int16; ch: char)
+  var
+    len_, p: int16
+begin
+  len_ := Length(S)
+  if pos > len_ then
+    pos := len_
+  elsif pos < 0 then
+    pos := 0
+  end
+  if len_ < val(int16, S_len) - 1 then
+    // space left
+    p := len_
+    S[len_ + 1] := 0X
+    while p > pos do
+      S[p] := S[p - 1]
+      dec(p)
+    end
+    S[pos] := ch
+  end
+end InsertChar
+
+procedure DeleteChar(S: pointer to array of char; S_len: int32; pos: int16)
+  var
+    len_, p: int16
+begin
+  len_ := Length(S)
+  if pos > len_ then
+    pos := len_
+  elsif pos < 0 then
+    pos := 0
+  end
+  if (pos < val(int16, S_len)) & (len_ > 0) then
+    p := pos
+    while S[p] # 0X do
+      S[p] := S[p + 1]
+      inc(p)
+    end
+  end
+end DeleteChar
+
+procedure Delete(S: pointer to array of char; beg, end_: int16)
+  // [beg, end)
+  var
+    len_, p: int16
+begin
+  if beg < 0 then
+    beg := 0
+  end
+  len_ := Length(S)
+  if end_ > len_ then
+    end_ := len_
+  end
+  p := end_
+  while p <= len_ do
+    S[beg] := S[p]
+    inc(beg)
+    inc(p)
+  end
+end Delete
+
+// --- passing of the focus to the next textfield ---
+
+procedure Pass(F: TextField; dlink: Objects.Object)
+  var
+    M: PassFocusMsg
+begin
+  if dlink # nil then
+    // determine my coordinates
+    M.F := F
+    M.x := 0
+    M.y := 0
+    M.dlink := nil
+    M.X := 0
+    M.Y := 0
+    M.from := F
+    M.to_ := nil
+    M.res := -1
+    dlink.handle(dlink, @M) // sets M.X, M.X
+
+    M.F := nil // M.X := F.X; M.Y := F.Y;
+    M.x := 0
+    M.y := 0
+    M.dlink := nil
+    M.from := F
+    M.to_ := nil
+    M.res := -1
+    M.foundX := 32767
+    M.foundY := (-32768i2)
+    dlink.handle(dlink, @M)
+    if M.to_ # nil then
+      // focus found
+      if F.carpos >= 0 then
+        F.carpos := -1
+        Gadgets.Update(F)
+      end
+      M.to_.carpos := 0
+      M.to_.start := 0
+      Gadgets.Update(M.to_)
+    end
+  end
+end Pass
+
+procedure passFocusMsg(F: TextField; M: pointer to PassFocusMsg)
+
+  procedure Distance(x, y: int32; M: pointer to PassFocusMsg): int32
+  begin
+    if y = M.Y then
+      // on the same line
+      if x < M.X then
+        return 2147483647
+      else
+        return x - M.X
+      end
+
+    else
+      if y > M.Y then
+        return 2147483647
+      else
+        return (M.Y - y) * 1000
+      end
+    end
+    return 0 // TODO o2m: Micron requires a result on all control paths
+  end Distance
+begin
+  if M.F = F then
+    // found
+    M.X := M.x + F.X
+    M.Y := M.y + F.Y
+  elsif M.F = nil then
+    if F # M.from then
+      if Distance(M.x + F.X, M.y + F.Y, M) < Distance(M.foundX, M.foundY, M) then
+        M.to_ := F
+        M.foundY := M.y + F.Y
+        M.foundX := M.x + F.X
+      end
+    end
+  end
+end passFocusMsg
+
+// -----------
+
+procedure Inval(F: TextField; hint: pointer to int32)
+begin
+  if F.consistent then
+    hint^ := -1
+    F.consistent := false
+  end
+end Inval
+
+procedure UpdateTextField(F: TextField; beg: int32)
+  var
+    M: TextFieldUpdateMsg
+begin
+  M.F := nil
+  M.obj := F
+  M.beg := beg
+  F.slink := nil
+  Display.Broadcast(@M)
+end UpdateTextField
+
+procedure ConsumeChar(F: TextField; ch: char; dlink: Objects.Object)
+  var
+    beg: int32
+    x, y: int16
+begin
+  beg := -1
+  if ch = 7FX then
+    if F.carpos > 0 then
+      dec(F.carpos)
+      DeleteChar(@F.val_, 64 (* MaxLen *), F.carpos)
+      beg := F.carpos
+      if F.selbeg >= 0 then
+        F.selbeg := -1
+        beg := -1
+      end
+      Inval(F, @beg)
+      if F.start > F.carpos then
+        dec(F.start)
+        beg := -1
+      end
+      UpdateTextField(F, beg)
+    end
+
+  elsif ch = 0A1X then
+    // Delete right
+    if F.val_[F.carpos] # 0X then
+      DeleteChar(@F.val_, 64 (* MaxLen *), F.carpos)
+      beg := F.carpos
+      if F.selbeg >= 0 then
+        F.selbeg := -1
+        beg := -1
+      end
+      Inval(F, @beg)
+      UpdateTextField(F, beg)
+    end
+
+  elsif ch = 0DX then
+    MakeConsistent(F, dlink)
+    Gadgets.ExecuteAttr(F, "Cmd", dlink, nil, nil)
+  elsif ch = 0C4X then
+    // left arrow
+    if F.carpos > 0 then
+      dec(F.carpos)
+      beg := F.carpos
+      if F.start > F.carpos then
+        dec(F.start)
+        beg := -1
+      end
+      if F.selbeg >= 0 then
+        F.selbeg := -1
+        beg := -1
+      end
+      UpdateTextField(F, beg)
+    end
+
+  elsif ch = 0C3X then
+    // right arrow
+    if F.val_[F.carpos] # 0X then
+      beg := F.carpos
+      inc(F.carpos)
+      LocatePos(F, F.carpos, @x, @y)
+      while (x >= F.W - 3) & (F.val_[F.start] # 0X) do
+        inc(F.start)
+        beg := -1
+        LocatePos(F, F.carpos, @x, @y)
+      end
+
+      if F.selbeg >= 0 then
+        F.selbeg := -1
+        beg := -1
+      end
+      UpdateTextField(F, beg)
+    end
+
+  elsif ch = 0A8X then
+    // home
+    if F.carpos > 0 then
+      F.carpos := 0
+      beg := F.carpos
+      if F.start > F.carpos then
+        F.start := F.carpos
+        beg := -1
+      end
+      if F.selbeg >= 0 then
+        F.selbeg := -1
+        beg := -1
+      end
+      UpdateTextField(F, beg)
+    end
+
+  elsif ch = 0A9X then
+    // end
+    if F.val_[F.carpos] # 0X then
+      beg := F.carpos
+      while F.val_[F.carpos] # 0X do
+        inc(F.carpos)
+      end
+
+      LocatePos(F, F.carpos, @x, @y)
+      while (x >= F.W - 3) & (F.val_[F.start] # 0X) do
+        inc(F.start)
+        beg := -1
+        LocatePos(F, F.carpos, @x, @y)
+      end
+
+      if F.selbeg >= 0 then
+        F.selbeg := -1
+        beg := -1
+      end
+      UpdateTextField(F, beg)
+    end
+
+  elsif ch = 9X then
+    // TAB
+    F.start := 0
+    MakeConsistent(F, dlink)
+    Gadgets.ExecuteAttr(F, "Cmd", dlink, nil, nil)
+    Pass(F, dlink)
+  elsif (ch >= " ") & (Length(@F.val_) < MaxLen - 1i1) then
+    beg := F.carpos
+    InsertChar(@F.val_, 64 (* MaxLen *), F.carpos, ch)
+    inc(F.carpos)
+    if F.selbeg >= 0 then
+      F.selbeg := -1
+      beg := -1
+    end
+    Inval(F, @beg)
+    LocatePos(F, F.carpos, @x, @y)
+    while (x >= F.W - 3) & (F.val_[F.start] # 0X) do
+      inc(F.start)
+      beg := -1
+      LocatePos(F, F.carpos, @x, @y)
+    end
+
+    UpdateTextField(F, beg)
+  end
+end ConsumeChar
+
+procedure LocateChar(F: TextField; x, mx: int16; pos: pointer to int16)
+  var
+    p: int16
+    r: Objects.Object
+    X: int16
+begin
+  p := F.start
+  X := x + Xoffset
+  while F.val_[p] # 0X do
+    Fonts.Default.GetObj(Fonts.Default, val(int16, ord(F.val_[p])), @r)
+    if mx < X + r(Fonts.Char).dx then
+      pos^ := p
+      return
+    end
+    inc(X, r(Fonts.Char).dx)
+    inc(p)
+  end
+
+  pos^ := p
+end LocateChar
+
+procedure LocatePos(F: TextField; pos: int16; x, y: pointer to int16)
+  var
+    r: Objects.Object
+    p: int16
+begin
+  x^ := Xoffset
+  y^ := Yoffset
+  p := F.start
+  while (F.val_[p] # 0X) & (p < pos) do
+    Fonts.Default.GetObj(Fonts.Default, val(int16, ord(F.val_[p])), @r)
+    inc(x^, r(Fonts.Char).dx)
+    inc(p)
+  end
+end LocatePos
+
+procedure FlipCaret(R: Display3.Mask; F: TextField; x, y: int16)
+begin
+  if F.carpos >= 0 then
+    Display3.ReplConst(R, invTF, x + F.carx, y + F.cary - 3, CarWidth, CarHeight, Display.invert)
+  end
+end FlipCaret
+
+procedure SetCaret(R: Display3.Mask; F: TextField; x, y, pos: int16)
+begin
+  LocatePos(F, pos, @F.carx, @F.cary)
+  Display3.ReplConst(R, invTF, x + F.carx, y + F.cary - 3, CarWidth, CarHeight, Display.invert)
+end SetCaret
+
+procedure RemoveCaret(R: Display3.Mask; F: TextField; x, y: int16)
+begin
+  if F.carpos >= 0 then
+    FlipCaret(R, F, x, y)
+    F.carpos := -1
+  end
+end RemoveCaret
+
+procedure TrackCaret(DR: pointer to Display3.Mask; F: TextField; x, y: int16)
+  var
+    mx, my, pos: int16
+    keys, keysum: set
+    time, beg, end_, p, hint: int32
+    text: Texts.Text
+    R: Texts.Reader
+    ch: char
+begin
+  RemoveCaret(DR^, F, x, y)
+  keysum := {}
+  loop
+    Input.Mouse(@keys, @mx, @my)
+    keysum := keysum + keys
+    if keys = {} then
+      exit
+    end
+    LocateChar(F, x, mx, @pos)
+    if pos # F.carpos then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      FlipCaret(DR^, F, x, y)
+      F.carpos := pos
+      LocatePos(F, F.carpos, @F.carx, @F.cary)
+      FlipCaret(DR^, F, x, y)
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, mx, my)
+  end
+
+  if keysum = {2,1} then
+    Oberon.GetSelection(@text, @beg, @end_, @time)
+    if time # -1 then
+      hint := F.carpos
+      p := beg
+      Texts.OpenReader(@R, text, p)
+      loop
+        if p = end_ then
+          exit
+        end
+        Texts.Read(@R, @ch)
+        if R.eot then
+          exit
+        end
+        if Length(@F.val_) >= MaxLen - 1i1 then
+          exit
+        end
+        if (" " <= ch) & (ch < 86X) or (ch = " ") or (ch = 9X) then
+          InsertChar(@F.val_, 64 (* MaxLen *), F.carpos, ch)
+          inc(F.carpos)
+        end
+
+        inc(p)
+      end
+
+      if F.selbeg >= 0 then
+        F.selbeg := -1
+        hint := -1
+      end
+      Inval(F, @hint)
+      UpdateTextField(F, hint)
+    end
+
+  else
+    Gadgets.Update(F)
+  end
+end TrackCaret
+
+procedure FlipSelection(R: Display3.Mask; F: TextField; x, y, spos, epos: int16)
+  var
+    sx, sy, ex, ey: int16
+begin
+  LocatePos(F, spos, @sx, @sy)
+  LocatePos(F, epos, @ex, @ey)
+  Display3.ReplConst(R, invTF, x + sx, y + sy - 3, ex - sx, Min(CarHeight, F.H - 4), Display.invert)
+end FlipSelection
+
+procedure RemoveSelection(R: Display3.Mask; F: TextField; x, y: int16)
+begin
+  if F.selbeg >= 0 then
+    FlipSelection(R, F, x, y, F.selbeg, F.selend)
+    F.selbeg := -1
+  end
+end RemoveSelection
+
+procedure TrackSelection(R: Display3.Mask; F: TextField; x, y: int16)
+  var
+    mx, my, pos, spos, epos, len_: int16
+    keys, keysum: set
+    time: int32
+    C: Oberon.ConsumeMsg
+begin
+  Oberon.FadeCursor(@Oberon.Mouse)
+  Input.Mouse(@keys, @mx, @my)
+  if keys = {} then
+    return
+  end
+  keysum := keys
+  len_ := Length(@F.val_)
+  LocateChar(F, x, mx, @spos)
+  if spos >= len_ then
+    dec(spos)
+  end
+  if (F.selbeg >= 0) & (F.selbeg = spos) & (F.selend = F.selbeg + 1) then
+    RemoveSelection(R, F, x, y)
+    epos := spos
+    spos := 0
+    FlipSelection(R, F, x, y, spos, epos + 1)
+  else
+    RemoveSelection(R, F, x, y)
+    epos := spos
+    FlipSelection(R, F, x, y, spos, epos + 1)
+  end
+
+  loop
+    Input.Mouse(@keys, @mx, @my)
+    keysum := keysum + keys
+    if keys = {} then
+      exit
+    end
+    LocateChar(F, x, mx, @pos)
+    if pos >= len_ then
+      dec(pos)
+    end
+    if (pos >= spos) & (pos # epos) then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      if pos < epos then
+        FlipSelection(R, F, x, y, pos + 1, epos + 1)
+      else
+        FlipSelection(R, F, x, y, epos + 1, pos + 1)
+      end
+
+      epos := pos
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, mx, my)
+  end
+
+  FlipSelection(R, F, x, y, spos, epos + 1)
+  F.selbeg := -1
+  if (keysum = {0}) & (spos # -1) then
+    F.time := Oberon.Time()
+    F.selbeg := spos
+    F.selend := epos + 1
+    Gadgets.Update(F)
+  elsif (keysum = {0,1}) & (spos # -1) then
+    // copy out
+    F.selbeg := spos
+    F.selend := epos + 1
+    F.time := Oberon.Time()
+    Gadgets.Update(F)
+    Oberon.GetSelection(@C.text, @C.beg, @C.end_, @time)
+    C.F := nil
+    C.res := -1
+    Display.Broadcast(@C)
+  elsif (keysum = {0,2}) & (spos # -1) then
+    // delete
+    if F.carpos < 0 then
+      Oberon.Defocus()
+    end
+    Delete(@F.val_, spos, epos + 1)
+    F.carpos := spos
+    Inval(F, @time)
+    UpdateTextField(F, -1)
+  else
+    Gadgets.Update(F)
+  end
+end TrackSelection
+
+procedure GetSelection(F: TextField; text: pointer to Texts.Text; beg, end_, time: pointer to int32)
+  var
+    p: int16
+    W: Texts.Writer
+begin
+  newgc(text^)
+  Texts.Open(text^, "")
+  (* old
+  p := F.selbeg; Texts.OpenWriter(W);
+  WHILE p < F.selend DO
+  Texts.Write(W, F.val[p]); INC(p);
+  END;
+  *)
+  p := 0
+  Texts.OpenWriter(@W)
+  while F.val_[p] # 0X do
+    Texts.Write(@W, F.val_[p])
+    inc(p)
+  end
+
+  Texts.Append(text^, W.buf)
+  beg^ := F.selbeg
+  end_^ := F.selend
+  time^ := F.time
+end GetSelection
+
+procedure TextFieldAttr(F: TextField; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "TextFields.NewTextField", 64)
+      M.res := 0
+    elsif M.name = "Value" then
+      M.class := Objects.String
+      copy(@M.s, @F.val_, 64)
+      M.res := 0
+    elsif M.name = "Color" then
+      M.class := Objects.Int
+      M.i := F.col
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := Yoffset
+      M.res := 0
+    elsif M.name = "Field" then
+      ForceString(F, M)
+    elsif M.name = "Cmd" then
+      ForceString(F, M)
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Value" then
+      if M.class = Objects.String then
+        copy(@F.val_, @M.s, 64 (* MaxLen *))
+        M.res := 0
+      end
+    elsif M.name = "Color" then
+      if M.class = Objects.Int then
+        F.col := val(int16, M.i)
+        M.res := 0
+      end
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Value")
+    M.Enum("Color")
+    M.Enum("Field")
+    M.Enum("Cmd")
+    Gadgets.framehandle(F, M)
+  end
+end TextFieldAttr
+
+procedure ConsumeText(F: TextField; M: pointer to Oberon.ConsumeMsg)
+  var
+    R: Texts.Reader
+    ch: char
+    pos, beg: int32
+begin
+  pos := M.beg
+  Texts.OpenReader(@R, M.text, pos)
+  beg := F.carpos
+  if F.selbeg >= 0 then
+    F.selbeg := -1
+    beg := -1
+  end
+  loop
+    if pos = M.end_ then
+      exit
+    end
+    Texts.Read(@R, @ch)
+    if R.eot then
+      exit
+    end
+    if Length(@F.val_) >= MaxLen - 1i1 then
+      exit
+    end
+    if (" " <= ch) or (ch = " ") or (ch = 9X) then
+      InsertChar(@F.val_, 64 (* MaxLen *), F.carpos, ch)
+      inc(F.carpos)
+    end
+
+    inc(pos)
+  end
+
+  Inval(F, @beg)
+  UpdateTextField(F, beg)
+end ConsumeText
+
+procedure RestoreTextField(R: Display3.Mask; F: TextField; x, y, w, h: int16; beg: int32)
+  var
+    p, X, Y, cx, cy, cw, ch: int16
+    r: Objects.Object
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+
+  if beg < 0 then
+    if F.consistent then
+      Display3.Rect3D(R, Display3.bottomC, Display3.topC, x, y, w, h, 1, Display.replace)
+    else
+      Display3.Rect3D(R, Display3.topC, Display3.bottomC, x, y, w, h, 1, Display.replace)
+    end
+
+    Display3.ReplConst(R, F.col, x + 1, y + 1, Xoffset, h - 2, Display.replace)
+  end
+
+  p := F.start
+  X := x + Xoffset
+  Y := y + Yoffset
+  cx := R.X
+  cy := R.Y
+  cw := R.W
+  ch := R.H
+  Display3.AdjustMask(R, x + 1, y + 1, w - 2, h - 2)
+  while F.val_[p] # 0X do
+    Fonts.Default.GetObj(Fonts.Default, val(int16, ord(F.val_[p])), @r)
+    case r of
+    | Fonts.Char:
+      if p >= beg then
+        Display3.ReplConst(R, F.col, X, y + 1, r.dx, h - 2, Display.replace)
+        Display3.CopyPattern(R, Display3.textC, r.pat (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; Oberon: Display3.CopyPattern(R, Display3.textC, r.pat, X + r.x, Y + r.y, Display3.textmode) *), X + r.x, Y + r.y, Display3.textmode)
+      end
+
+      inc(X, r.dx)
+      inc(p)
+    end
+  end
+
+  if X < x + w - 1 then
+    Display3.ReplConst(R, F.col, X, y + 1, x + w - X - 1, h - 2, Display.replace)
+  end
+
+  if F.carpos >= 0 then
+    if F.carpos > Length(@F.val_) then
+      F.carpos := Length(@F.val_)
+    end
+
+    SetCaret(R, F, x, y, F.carpos)
+  end
+
+  if F.selbeg >= 0 then
+    FlipSelection(R, F, x, y, F.selbeg, F.selend)
+  end
+
+  R.X := cx
+  R.Y := cy
+  R.W := cw
+  R.H := ch
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreTextField
+
+procedure PrintTextField(F: TextField; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask
+    x, y, w, h: int16
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  Printer3.Rect3D(R, Display3.bottomC, Display3.topC, x, y, w, h, P(1), Display.replace)
+  Printer3.ReplConst(R, F.col, x + P(1), y + P(1), w - P(2), h - P(2), Display.replace)
+  Display3.AdjustMask(R, x + P(1), y + P(1), w - P(2), h - P(2))
+  Printer3.String(R, Display3.textC, x + P(Xoffset), y + P(Yoffset), Fonts.Default, @F.val_, Display.replace)
+end PrintTextField
+
+// --- Model view consistency ---
+
+procedure Field(F: TextField; name: pointer to array of char; name_len: int32)
+  var
+    A: Objects.AttrMsg
+begin
+  A.id := Objects.get
+  copy(@A.name, "Field", 32)
+  A.class := Objects.Inval
+  copy(@A.s, "", 64)
+  F.handle(F, @A)
+  if (A.res >= 0) & (A.class = Objects.String) & (A.s # "") then
+    copy(name, @A.s, name_len)
+  else
+    copy(name, "Value", name_len)
+  end
+end Field
+
+procedure SetValue(obj: Objects.Object; const field, value: pointer to array of char; dlink: Objects.Object; res: pointer to int16)
+  var
+    A: Objects.AttrMsg
+begin
+  A.id := Objects.set_
+  copy(@A.name, field, 32)
+  copy(@A.s, value, 64)
+  A.class := Objects.String
+  A.res := -1
+  A.dlink := dlink
+  obj.handle(obj, @A)
+  res^ := A.res
+end SetValue
+
+procedure GetValue(obj: Objects.Object; const field: pointer to array of char; value: pointer to array of char; value_len: int32)
+  var
+    A: Objects.AttrMsg
+begin
+  A.id := Objects.get
+  copy(@A.name, field, 32)
+  A.class := Objects.Inval
+  copy(@A.s, "", 64)
+  A.res := -1
+  obj.handle(obj, @A)
+  if A.res >= 0 then
+    if A.class = Objects.String then
+      copy(value, @A.s, value_len)
+    elsif A.class = Objects.Int then
+      Strings.IntToStr(A.i, value, value_len)
+    elsif A.class = Objects.Real then
+      Strings.RealToStr(val(longreal, A.x), value, value_len)
+    elsif A.class = Objects.LongReal then
+      Strings.RealToStr(A.y, value, value_len)
+    else
+      value[0] := 0X
+    end
+
+  else
+    value[0] := 0X
+  end
+end GetValue
+
+procedure CopyTextField*(M: pointer to Objects.CopyMsg; from, to_: TextField)
+  var
+    field: array 64 of char
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  copy(@to_.val_, @from.val_, 64 (* MaxLen *))
+  to_.carpos := -1
+  to_.selbeg := -1
+  to_.col := from.col
+
+  Field(to_, @field, 64)
+  if to_.obj # nil then
+    GetValue(to_.obj, @field, @to_.val_, 64 (* MaxLen *))
+  end
+  to_.consistent := true
+end CopyTextField
+
+procedure Recall(F: TextField; dlink: Objects.Object)
+  var
+    buf: Texts.Buffer
+    t: Texts.Text
+    str: array 64 (* MaxLen *) of char
+    i: int32
+begin
+  newgc(buf)
+  Texts.OpenBuf(buf)
+  Texts.Recall(@buf)
+  newgc(t)
+  Texts.Open(t, "")
+  Texts.Append(t, buf)
+  Attributes.TxtToStr(t, @str, 64 (* MaxLen *))
+  i := 0
+  while (i < MaxLen) & (str[i] # 0X) do
+    ConsumeChar(F, str[i], dlink)
+    inc(i)
+  end
+end Recall
+
+procedure UpdateMsg(F: TextField; M: pointer to Gadgets.UpdateMsg)
+  var
+    field: array 64 of char
+    obj: Objects.Object
+begin
+  if F.obj # nil then
+    F.obj.handle(F.obj, M)
+  end
+  if M.obj = F.obj then
+    if M.stamp # F.stamp then
+      F.stamp := M.stamp
+      Field(F, @field, 64)
+      GetValue(F.obj, @field, @F.val_, 64 (* MaxLen *))
+      F.selbeg := -1
+      F.carpos := -1
+      F.consistent := true
+      UpdateTextField(F, -1)
+    end
+
+  else
+    obj := M.obj
+    while obj # nil do
+      if obj = F then
+        if F.obj # nil then
+          Field(F, @field, 64)
+          GetValue(F.obj, @field, @F.val_, 64 (* MaxLen *))
+        end
+
+        F.selbeg := -1
+        F.carpos := -1
+        F.consistent := true
+        Gadgets.framehandle(F, M)
+      end
+
+      obj := obj.slink
+    end
+  end
+end UpdateMsg
+
+procedure MakeConsistent(F: TextField; dlink: Objects.Object)
+  var
+    field: array 64 of char
+    res: int16
+begin
+  if ~F.consistent then
+    if F.obj # nil then
+      Field(F, @field, 64)
+      SetValue(F.obj, @field, @F.val_, dlink, @res)
+      F.start := 0
+      Gadgets.Update(F.obj) // even when successfull or not
+    else
+      F.consistent := true
+      Gadgets.Update(F)
+    end
+
+  else
+    Gadgets.Update(F)
+  end
+end MakeConsistent
+
+procedure TextFieldHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    F2: TextField
+    x, y, w, h: int16
+    R: Display3.Mask
+    ver: int32
+    field: array 64 of char
+begin
+  case F of
+  | TextField:
+    case M of
+    | Objects.PAttrMsg:
+      TextFieldAttr(F, M)
+
+    | Objects.PFileMsg:
+      if M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if (ver < 2) or (ver > 4) then
+          halt(99)
+        end
+        Files.ReadString(@M.R, @F.val_, 64 (* MaxLen *))
+        if ver >= 3 then
+          Files.ReadInt(@M.R, @F.col)
+          if (ver = 3) & (F.col = 0) then
+            F.col := Display3.textbackC
+          end
+        else
+          F.col := Display3.textbackC
+        end
+
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.store then
+        Files.WriteNum(@M.R, 4)
+        Files.WriteString(@M.R, @F.val_, 64 (* MaxLen *))
+        Files.WriteInt(@M.R, F.col)
+        Gadgets.framehandle(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F2)
+        F.stamp := M.stamp
+        F.dlink := F2
+        CopyTextField(M, F, F2)
+        M.obj := F2
+      end
+
+    | Display.PFrameMsg:
+      if M.res >= 0 then
+        return
+      end
+      x := M.x + F.X
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      M1 := M
+      case M1 of
+      | Display.PDisplayMsg:
+        if M1.device = Display.screen then
+          if (M1.F = nil) or (M1.id = Display.full) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            RestoreTextField(R, F, x, y, w, h, -1)
+          elsif (M1.id = Display.area) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            Display3.AdjustMask(R, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+            RestoreTextField(R, F, x, y, w, h, -1)
+          end
+
+        elsif M1.device = Display.printer then
+          PrintTextField(F, M1)
+        end
+
+      | Oberon.PControlMsg:
+        if (M1.id = Oberon.defocus) & (F.carpos >= 0) then
+          F.carpos := -1
+          F.start := 0
+          MakeConsistent(F, M1.dlink)
+        elsif (M1.id = Oberon.neutralize) & (F.carpos >= 0) then
+          F.carpos := -1
+          F.start := 0
+          F.selbeg := -1
+          if F.obj # nil then
+            Gadgets.Update(F.obj)
+          else
+            MakeConsistent(F, M1.dlink)
+          end
+        elsif (M1.id = Oberon.neutralize) & (F.selbeg >= 0) then
+          F.carpos := -1
+          F.start := 0
+          F.selbeg := -1
+          if F.obj # nil then
+            Gadgets.Update(F.obj)
+          else
+            MakeConsistent(F, M1.dlink)
+          end
+        elsif M1.id = Oberon.mark then
+          Oberon.DrawCursor(@Oberon.Pointer, @Oberon.Star, M1.X, M1.Y)
+        end
+
+      | PTextFieldUpdateMsg:
+        if M1.obj = F then
+          Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+          RestoreTextField(R, F, x, y, w, h, M1.beg)
+        end
+
+      | PPassFocusMsg:
+        passFocusMsg(F, M1)
+
+      | Gadgets.PUpdateMsg:
+        UpdateMsg(F, M1)
+
+      | Display.PControlMsg:
+        // !!!
+        if F.obj # nil then
+          F.obj.handle(F.obj, M1)
+        end
+        if (M1.id = Display.restore) & (F.obj # nil) then
+          if M1.stamp # F.stamp then
+            F.stamp := M1.stamp
+            Field(F, @field, 64)
+            GetValue(F.obj, @field, @F.val_, 64 (* MaxLen *))
+          end
+
+          F.selbeg := -1
+          F.carpos := -1
+          F.consistent := true
+        elsif M1.id = Display.newprinter then
+          lastfont := nil
+          lastlib := nil
+        end
+
+      | Oberon.PSelectMsg:
+        if (F.selbeg >= 0) & ((M1.time - F.time < 0) or (M1.time = -1)) then
+          GetSelection(F, @M1.text, @M1.beg, @M1.end_, @M1.time)
+        end
+
+      | Oberon.PConsumeMsg:
+        if (F.carpos >= 0) & (F.stamp # M1.stamp) then
+          F.stamp := M1.stamp
+          ConsumeText(F, M1)
+        end
+
+      | Oberon.PRecallMsg:
+        if F.carpos >= 0 then
+          Recall(F, M1.dlink)
+          M1.res := 0
+        end
+
+      | Oberon.PInputMsg:
+        if (M1.id = Oberon.track) & Gadgets.InActiveArea(F, M1) then
+          if 2 in M1.keys then
+            if F.carpos < 0 then
+              Oberon.Defocus()
+            end
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            TrackCaret(@R, F, x, y)
+            M1.res := 0
+          elsif 0 in M1.keys then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            TrackSelection(R, F, x, y)
+            M1.res := 0
+          end
+
+        elsif (M1.id = Oberon.consume) & (F.carpos >= 0) then
+          ConsumeChar(F, M1.ch, M1.dlink)
+          M1.res := 0
+        elsif ~(Gadgets.selected in F.state) then
+          Gadgets.framehandle(F, M1)
+        end
+
+      else
+        Gadgets.framehandle(F, M1)
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end TextFieldHandler
+
+procedure InitTextField*(F: TextField)
+begin
+  F.handle := TextFieldHandler
+  copy(@F.val_, "", 64 (* MaxLen *))
+  F.W := 100
+  F.H := 20
+  F.selbeg := -1
+  F.carpos := -1
+  F.consistent := true
+  F.col := Display3.textbackC
+end InitTextField
+
+procedure NewTextField*()
+  var
+    F: TextField
+begin
+  newgc(F)
+  InitTextField(F)
+  Objects.NewObj := F
+end NewTextField
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "MakeCaption" end return MakeCaption end
+  if i = 1 then if name # nil then name^ := "NewCaption" end return NewCaption end
+  if i = 2 then if name # nil then name^ := "NewTextField" end return NewTextField end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("TextFields", cmd_)
+  Texts.OpenWriter(@W)
+  invTF := 15i1 - 14i1
+end TextFields.

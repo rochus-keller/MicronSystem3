@@ -1,0 +1,707 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Bitmaps [level=5]
+
+import Display, SYS, Modules
+// non-portable
+
+// as 20.02.99, ported to Shark Oberon
+
+(* to do:
+o get rid of buffer
+o ASSERT bounds everywhere
+*)
+
+const
+  BufSize = 65536
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  CharPtr = pointer to char // helper type for a variable reinterpreted by SYSTEM.VAL
+  BytePtr = pointer to byte // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int8Ptr = pointer to int8 // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int16Ptr = pointer to int16 // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int32Ptr = pointer to int32 // helper type for a variable reinterpreted by SYSTEM.VAL
+  Bitmap* = pointer to BitmapDesc
+  BitmapDesc* = record
+    // cf. Display.DisplayBlock
+    width*: int16 // offset 0, 2, 4
+    height*, depth*: int16
+    wth*: int32 // offset 8, 12
+    address*: AnyPtr
+    size_: int32
+  end
+
+  Buffer = record
+    bytes: array 65536 (* BufSize *) of char
+  end
+
+var
+  buffer: pointer to Buffer
+
+procedure Define*(B: Bitmap; width, height, depth: int16; address: AnyPtr)
+begin
+  B.width := width
+  B.wth := width
+  B.height := height
+  B.depth := depth
+  B.address := address
+  B.size_ := val(int32, width) * height
+end Define
+
+procedure Get*(B: Bitmap; X, Y: int16): int16
+  var
+    ofs: int32
+    ch: char
+begin
+  ofs := Y * B.wth + X
+  assert((ofs >= 0) & (ofs < B.size_))
+  ch := cast(CharPtr, ptroff(B.address, ofs))^
+  return val(int16, ord(ch))
+end Get
+
+procedure Clear*(B: Bitmap)
+  var
+    adr: AnyPtr
+    size_: int32
+begin
+  size_ := B.size_
+  adr := B.address
+  while size_ >= 4 do
+    cast(Int32Ptr, adr)^ := 0
+    inc(adr, 4)
+    dec(size_, 4)
+  end
+
+  while size_ > 0 do
+    cast(CharPtr, adr)^ := 0X
+    inc(adr)
+    dec(size_)
+  end
+end Clear
+
+procedure Dot*(B: Bitmap; col: int16; X: AnyPtr; Y, mode: int16)
+  var
+    adr: AnyPtr
+    ch: char
+begin
+  adr := X
+  inc(adr, Y * B.wth)
+  assert((val(int32, ord(adr)) >= 0) & (val(int32, ord(adr)) < B.size_))
+  inc(adr, val(int32, ord(B.address)))
+  if mode = Display.invert then
+    ch := cast(CharPtr, adr)^
+    cast(CharPtr, adr)^ := chr(val(int32, ord(bset(usig(val(int32, val(int16, ord(ch))))) / bset(usig(val(int32, col))))))
+
+  else
+    cast(CharPtr, adr)^ := chr(col)
+  end
+end Dot
+
+procedure CopyBlock0(n, w, adr: int32; buf: AnyPtr; width: int32; from: boolean)
+begin
+  if from then
+    repeat
+      SYS.MOVE(ptroff(AnyPtr{0}, adr), buf, w)
+      dec(n)
+      inc(adr, width)
+      inc(buf, w)
+    until n = 0
+  else
+    repeat
+      SYS.MOVE(buf, ptroff(AnyPtr{0}, adr), w)
+      dec(n)
+      inc(adr, width)
+      inc(buf, w)
+    until n = 0
+  end
+end CopyBlock0
+
+procedure CopyBlock*(sB, dB: Bitmap; SX, SY, W, H, DX, DY, mode: int16)
+  var
+    SourceWth, DestWth, sx, sy, w, h, dx, dy, w0, h0, dx0, dy0, src, dst, n, bufLines: int32
+begin
+  // only the destination block is clipped
+  SourceWth := sB.wth
+  DestWth := dB.wth
+  sx := SX
+  sy := SY
+  w := W
+  h := H
+  dx := DX
+  dy := DY
+  w0 := w
+  h0 := h
+  dx0 := dx
+  dy0 := dy
+  if dx < 0 then
+    dx := 0
+    dec(w, dx - dx0)
+  end
+  if dy < 0 then
+    dy := 0
+    dec(h, dy - dy0)
+  end
+  if (w > 0) & (h > 0) & (w <= w0) & (h <= h0) then
+    if dx + w - 1 > dB.width - 1 then
+      dec(w, dx + w - 1 - (dB.width - 1))
+    end
+    if dy + h - 1 > dB.height - 1 then
+      dec(h, dy + h - 1 - (dB.height - 1))
+    end
+    if (w > 0) & (h > 0) & (w <= w0) & (h <= h0) then
+      src := sy * SourceWth + sx
+      assert((src >= 0) & (src < sB.size_))
+      dst := dy * DestWth + dx
+      assert((dst >= 0) & (dst < dB.size_))
+      bufLines := obdiv(BufSize, w) // lines to copy at a time
+      if bufLines > h then
+        bufLines := h
+      end
+      // adjust direction for overlap
+      if (dy - h + 1 < sy) & (sy < dy) then
+        // start at bottom
+        n := h - bufLines
+        inc(src, SourceWth * n)
+        inc(dst, DestWth * n)
+        repeat
+          CopyBlock0(bufLines, w, val(int32, ord(sB.address)) + src, cast(AnyPtr, @buffer.bytes[0]), SourceWth, true)
+          CopyBlock0(bufLines, w, val(int32, ord(dB.address)) + dst, cast(AnyPtr, @buffer.bytes[0]), DestWth, false)
+          dec(h, bufLines)
+          if bufLines > h then
+            bufLines := h
+          end
+          dec(src, bufLines * SourceWth)
+          dec(dst, bufLines * DestWth)
+        until h = 0
+
+      else
+        // start at top
+        repeat
+          CopyBlock0(bufLines, w, val(int32, ord(sB.address)) + src, cast(AnyPtr, @buffer.bytes[0]), SourceWth, true)
+          CopyBlock0(bufLines, w, val(int32, ord(dB.address)) + dst, cast(AnyPtr, @buffer.bytes[0]), DestWth, false)
+          inc(src, bufLines * SourceWth)
+          inc(dst, bufLines * DestWth)
+          dec(h, bufLines)
+          if bufLines > h then
+            bufLines := h
+          end
+        until h = 0
+      end
+    end
+  end
+end CopyBlock
+
+procedure CopyPattern0(ofs: int32; src, dst: AnyPtr; w, col, mode: int32)
+  var
+    ch: char
+    m, i: int32
+    s: set
+begin
+  if mode = Display.invert then
+    repeat
+      // loop over w pixels
+      ch := cast(CharPtr, src)^
+      i := ofs // start bit
+      m := 8 // stop bit
+      if m > ofs + w then
+        m := ofs + w
+      end
+      repeat
+        // loop over bits
+        if ((asr(val(int32, val(int16, ord(ch))), usig(i)) mod 2) # 0) then
+          // pixel on
+          cast(CharPtr, @s)^ := cast(CharPtr, dst)^
+          cast(CharPtr, dst)^ := chr(val(int32, ord(bset(usig(col)) / s)))
+        end
+
+        inc(dst)
+        inc(i)
+      until i = m
+
+      inc(src)
+      dec(w, m - ofs)
+      ofs := 0
+    until w = 0
+
+  else
+    // paint, replace
+    repeat
+      // loop over w pixels
+      ch := cast(CharPtr, src)^
+      i := ofs // start bit
+      m := 8 // stop bit
+      if m > ofs + w then
+        m := ofs + w
+      end
+      repeat
+        // loop over bits
+        if ((asr(val(int32, val(int16, ord(ch))), usig(i)) mod 2) # 0) then
+          // pixel on
+          // paint & replace
+          cast(CharPtr, dst)^ := chr(col)
+        elsif mode = Display.replace then
+          // pixel off
+          cast(CharPtr, dst)^ := 0X
+        else
+        end // skip
+
+        inc(dst)
+        inc(i)
+      until i = m
+
+      inc(src)
+      dec(w, m - ofs)
+      ofs := 0
+    until w = 0
+  end
+end CopyPattern0
+
+procedure CopyPattern1(B: Bitmap; src: AnyPtr; x, y, w, col, mode: int32)
+  var
+    ch: char
+    m, i: int32
+begin
+  if (y < 0) or (y > B.height - 1) then
+    return
+  end
+  repeat
+    // loop over w pixels
+    ch := cast(CharPtr, src)^
+    i := 0 // start bit
+    m := 8 // stop bit
+    if m > w then
+      m := w
+    end
+    repeat
+      // loop over bits
+      if ((asr(val(int32, val(int16, ord(ch))), usig(i)) mod 2) # 0) then
+        // pixel on
+        Dot(B, val(int16, col), ptroff(AnyPtr{0}, val(int16, x)), val(int16, y), val(int16, mode))
+      elsif mode = Display.replace then
+        // pixel off
+        Dot(B, Display.BG, ptroff(AnyPtr{0}, val(int16, x)), val(int16, y), Display.replace)
+      else
+      end // skip
+
+      inc(x)
+      inc(i)
+    until i = m
+
+    inc(src)
+    dec(w, m)
+  until w = 0
+end CopyPattern1
+
+procedure CopyPattern*(B: Bitmap; col: int16; pat: AnyPtr; X, Y, mode: int16)
+  var
+    x, y, x2, y2, w, w0, h: int32
+    src, dst: AnyPtr
+    ch: char
+begin
+  ch := cast(CharPtr, pat)^
+  w := val(int32, ord(ch))
+  ch := cast(CharPtr, ptroff(pat, 1))^
+  h := val(int32, ord(ch))
+  if (w > 0) & (h > 0) then
+    x := X // (x,y) bottom left & (x2,y2) top right
+    y := Y
+    x2 := x + w - 1
+    y2 := y + h - 1
+    src := pat
+    inc(src, 2) // first line of pattern
+    w0 := asr(w + 7, 3) // bytes in pattern line
+    if (x >= 0) & (y >= 0) & (x2 < B.width) & (y2 < B.height) then
+      // fully visible - common case
+      dst := B.address
+      inc(dst, y * B.wth + x)
+      repeat
+        // loop over h lines
+        CopyPattern0(0, src, dst, w, col, mode)
+        dec(h)
+        inc(dst, B.wth)
+        inc(src, w0)
+      until h = 0
+
+    elsif (x2 >= 0) & (y2 >= 0) & (x < B.width) & (y < B.height) then
+      // partially visible
+      repeat
+        // loop over h lines
+        CopyPattern1(B, src, x, y, w, col, mode)
+        inc(y)
+        inc(src, w0)
+        dec(h)
+      until h = 0
+
+    else
+    end // invisible
+  end
+end CopyPattern
+
+procedure ReplConst*(B: Bitmap; col, X, Y, W, H, mode: int16)
+  var
+    addr, addr0: AnyPtr
+    pat, w: int32
+    s: set
+begin
+  addr := B.address
+  inc(addr, B.wth * Y)
+  inc(addr, X)
+  pat := col + sigc(shl(val(int32, col), 8)) + sigc(shl(val(int32, col), 16)) + sigc(shl(val(int32, col), 24))
+  if mode = Display.invert then
+    while H > 0 do
+      w := W
+      addr0 := addr
+      while w # 0 do
+        cast(CharPtr, @s)^ := cast(CharPtr, addr0)^
+        cast(CharPtr, addr0)^ := chr(val(int32, ord(s / bset(usig(col)))))
+        dec(w)
+        inc(addr0)
+      end
+
+      inc(addr, B.wth)
+      dec(H)
+    end
+
+  else
+    while H > 0 do
+      w := W
+      addr0 := addr
+      while w # 0 do
+        cast(CharPtr, addr0)^ := chr(col)
+        dec(w)
+        inc(addr0)
+      end
+      inc(addr, B.wth)
+      dec(H)
+    end
+  end
+end ReplConst
+
+procedure FillPattern0(ofs: int32; src, dst: AnyPtr; w, pw, col, mode: int32)
+  var
+    ch: char
+    m, i: int32
+    src0: AnyPtr
+    left: int32
+    s: set
+begin
+  left := pw - ofs // pixels left to do in pattern
+  src0 := src // start position
+  inc(src, asr(ofs, 3))
+  ofs := band(ofs, 7)
+  if mode = Display.invert then
+    repeat
+      // loop over w pixels
+      ch := cast(CharPtr, src)^
+      i := ofs // start bit
+      m := 8 // stop bit
+      if m > ofs + left then
+        m := ofs + left // max left times
+      end
+      if m > ofs + w then
+        m := ofs + w // max w times
+      end
+      repeat
+        // loop over bits
+        if ((asr(val(int32, val(int16, ord(ch))), usig(i)) mod 2) # 0) then
+          // pixel on
+          cast(CharPtr, @s)^ := cast(CharPtr, dst)^
+          cast(CharPtr, dst)^ := chr(val(int32, ord(bset(usig(col)) / s)))
+        end
+
+        inc(dst)
+        inc(i)
+      until i = m
+
+      inc(src)
+      dec(left, m - ofs)
+      dec(w, m - ofs)
+      ofs := 0
+      if left = 0 then
+        src := src0 // wrap to start of pattern
+        left := pw
+      end
+    until w = 0
+
+  elsif mode = Display.paint then
+    repeat
+      // loop over w pixels
+      ch := cast(CharPtr, src)^
+      i := ofs // start bit
+      m := 8 // stop bit
+      if m > ofs + left then
+        m := ofs + left // max left times
+      end
+      if m > ofs + w then
+        m := ofs + w // max w times
+      end
+      repeat
+        // loop over bits
+        if ((asr(val(int32, val(int16, ord(ch))), usig(i)) mod 2) # 0) then
+          // pixel on
+          cast(CharPtr, dst)^ := chr(col)
+        end
+
+        inc(dst)
+        inc(i)
+      until i = m
+
+      inc(src)
+      dec(left, m - ofs)
+      dec(w, m - ofs)
+      ofs := 0
+      if left = 0 then
+        src := src0 // wrap to start of pattern
+        left := pw
+      end
+    until w = 0
+
+  else
+    // replace
+    repeat
+      // loop over w pixels
+      ch := cast(CharPtr, src)^
+      i := ofs // start bit
+      m := 8 // stop bit
+      if m > ofs + left then
+        m := ofs + left // max left times
+      end
+      if m > ofs + w then
+        m := ofs + w // max w times
+      end
+      repeat
+        // loop over bits
+        if ((asr(val(int32, val(int16, ord(ch))), usig(i)) mod 2) # 0) then
+          // pixel on
+          cast(CharPtr, dst)^ := chr(col)
+        else
+          // pixel off
+          cast(CharPtr, dst)^ := 0X
+        end
+
+        inc(dst)
+        inc(i)
+      until i = m
+
+      inc(src)
+      dec(left, m - ofs)
+      dec(w, m - ofs)
+      ofs := 0
+      if left = 0 then
+        src := src0 // wrap to start of pattern
+        left := pw
+      end
+    until w = 0
+  end
+end FillPattern0
+
+procedure ReplPattern*(B: Bitmap; col: int16; pat: AnyPtr; X, Y, W, H, mode: int16)
+  var
+    px, pw, ph, x, y, x2, y2, w, w0, h: int32
+    src0, src, dst: AnyPtr
+    ch: char
+begin
+  x := X
+  y := Y
+  w := W
+  h := H
+  x2 := x + w - 1 // (x,y) bottom left & (x2,y2) top right
+  y2 := y + h - 1
+  if (w > 0) & (h > 0) then
+    ch := cast(CharPtr, pat)^
+    pw := val(int32, ord(ch))
+    ch := cast(CharPtr, ptroff(pat, 1))^
+    ph := val(int32, ord(ch))
+    if (pw > 0) & (ph > 0) then
+      inc(pat, 2) // adr of bitmap
+      w0 := asr(pw + 7, 3) // bytes in pattern line
+      src0 := pat
+      inc(src0, (ph - 1) * w0) // last line of pattern
+      src := pat // start line of pattern
+      px := obmod(x, pw) // start pixel offset
+      dst := B.address
+      inc(dst, y * B.wth + x)
+      repeat
+        // loop over h lines
+        FillPattern0(px, src, dst, w, pw, col, mode)
+        dec(h)
+        inc(dst, B.wth)
+        if src = src0 then
+          src := pat
+        else
+          inc(src, w0)
+        end
+      until h = 0
+    end
+  end
+end ReplPattern
+
+procedure DisplayBlock*(B: Bitmap; SX, SY, W, H, DX, DY, mode: int16)
+begin
+  Display.DisplayBlock(cast(AnyPtr, B), SX, SY, W, H, DX, DY, mode)
+end DisplayBlock
+
+procedure GetPix*(addr: pointer to AnyPtr; buf: pointer to byte; depth: int16)
+  var
+    s1, s2, s3: int8
+begin
+  if depth = 8 then
+    buf^ := cast(BytePtr, addr^)^
+    inc(addr^)
+  elsif depth = 4 then
+    s1 := cast(Int8Ptr, addr^)^
+    inc(addr^)
+    s2 := cast(Int8Ptr, addr^)^
+    inc(addr^)
+    buf^ := val(byte, s2 * 16 + band(s1, 15))
+  else
+    // depth = 1
+    s1 := 0
+    s2 := 0
+    while s1 < 8 do
+      s3 := cast(Int8Ptr, addr^)^
+      inc(addr^)
+      inc(s1)
+      s2 := s2 * 2 + band(s3, 1)
+    end
+    buf^ := val(byte, s2)
+  end
+end GetPix
+
+procedure PutPix*(addr: pointer to AnyPtr; border: int32; buf: byte; depth: int16)
+  var
+    s1: int8
+begin
+  if (depth = 8) & (val(int32, ord(addr^)) < border) then
+    cast(BytePtr, addr^)^ := buf
+    inc(addr^)
+  elsif depth = 4 then
+    if val(int32, ord(addr^)) < border then
+      cast(Int8Ptr, addr^)^ := band(cast(int8, buf), 15)
+      inc(addr^)
+    end
+    if val(int32, ord(addr^)) < border then
+      cast(Int8Ptr, addr^)^ := band(asr(cast(int8, buf), 4), 15)
+      inc(addr^)
+    end
+  else
+    // depth = 1
+    s1 := 0
+    while s1 < 8 do
+      if val(int32, ord(addr^)) < border then
+        if ((cast(int8, buf) mod 2) # 0) then
+          cast(Int8Ptr, addr^)^ := 15
+        else
+          cast(Int8Ptr, addr^)^ := 0
+        end
+      end
+
+      inc(s1)
+      inc(addr^)
+      buf := val(byte, asr(cast(int8, buf), 1))
+    end
+  end
+end PutPix
+
+procedure Copy*(sB, dB: Bitmap; SX, SY, SW, SH, DX, DY, DW, DH, mode: int16)
+  var
+    hx, hy, DW2, SW2: int32
+    src, dst: AnyPtr
+    i: int32
+    dy: int16
+    ch: char
+begin
+  if (SX >= 0) & (SY >= 0) & (SX + SW <= sB.width) & (SY + SH <= sB.height) & (DX >= 0) & (DY >= 0) & (DX + DW <= dB.width) & (DY + DH <= dB.height) & (SW > 0) & (SH > 0) & (DW > 0) & (DH > 0) then
+
+    dy := DY + DH
+    DW2 := 2 * DW
+    SW2 := 2 * SW
+    hy := 2 * SH - DH
+    while DY < dy do
+      hx := 2 * SW - DW
+      src := sB.address
+      inc(src, SY * sB.wth)
+      inc(src, SX)
+      dst := dB.address
+      inc(dst, DY * dB.wth)
+      inc(dst, DX)
+      for i := 1 to DW do
+        ch := cast(CharPtr, src)^
+        cast(CharPtr, dst)^ := ch
+        while hx > 0 do
+          inc(src)
+          dec(hx, DW2)
+        end
+        inc(dst)
+        inc(hx, SW2)
+      end
+
+      while hy > 0 do
+        inc(SY)
+        hy := hy - 2 * DH
+      end
+      inc(DY)
+      hy := hy + 2 * SH
+    end
+
+  else
+    halt(99)
+  end
+end Copy
+
+procedure PutLine*(B: Bitmap; data: pointer to array of int16; data_len: int32; X, Y, W: int16)
+  var
+    dst, src: AnyPtr
+    i: int32
+    ch: char
+begin
+  if (X >= 0) & (X + W <= B.width) & (Y >= 0) & (Y < B.height) & (W <= val(int16, data_len)) then
+    src := cast(AnyPtr, @data[0])
+    dst := B.address
+    inc(dst, Y * B.wth)
+    inc(dst, X)
+    i := W
+    while i > 0 do
+      ch := cast(CharPtr, src)^
+      cast(CharPtr, dst)^ := ch
+      inc(src, 2)
+      inc(dst)
+      dec(i)
+    end
+
+  else
+    halt(99)
+  end
+end PutLine
+
+procedure GetLine*(B: Bitmap; data: pointer to array of int16; data_len: int32; X, Y, W: int16)
+  var
+    dst, src: AnyPtr
+    i: int32
+    ch: char
+begin
+  if (X >= 0) & (X + W <= B.width) & (Y >= 0) & (Y < B.height) & (W <= val(int16, data_len)) then
+    dst := cast(AnyPtr, @data[0])
+    src := B.address
+    inc(src, Y * B.wth)
+    inc(src, X)
+    i := W
+    while i > 0 do
+      ch := cast(CharPtr, src)^
+      cast(Int16Ptr, dst)^ := val(int16, ord(ch))
+      inc(src)
+      inc(dst, 2)
+      dec(i)
+    end
+
+  else
+    halt(99)
+  end
+end GetLine
+
+begin
+  Modules.Register("Bitmaps", nil)
+  newgc(buffer)
+end Bitmaps.

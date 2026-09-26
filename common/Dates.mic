@@ -1,0 +1,310 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Dates [level=5]
+
+import Oberon, Texts, Modules
+// portable
+// PS
+
+const
+  minute* = 60i1
+  hour* = 60i1 * minute
+  day* = 24i1 * hour
+  week* = 7i1 * day
+  zeroY = 1900
+  firstY* = 1901
+
+var
+  TimeDiff*: int32 // local difference to universal time in minutes
+  A: array 13 of int16
+  T: array 365 of int8
+
+// Returns TRUE if year is a leap year
+procedure IsLeapYear*(year: int16): boolean
+begin
+  return (band(year, 3) = 0) & (~(obmod(year, 100) = 0) or (obmod(year, 400) = 0))
+end IsLeapYear
+
+procedure LastDay(year, month: int16): int16
+begin
+  if (month < 8) & ((month mod 2) # 0) or (month > 7) & ~((month mod 2) # 0) then
+    return 31
+  elsif month = 2 then
+    if IsLeapYear(year) then
+      return 29
+    else
+      return 28
+    end
+  else
+    return 30
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end LastDay
+
+// Returns the number of days since 1.1.[firstY]
+procedure NumberOfDays*(date: int32): int32
+  var
+    num: int32
+    y, m: int16
+begin
+  y := val(int16, asr(date, 9)) + zeroY - firstY
+  m := band(val(int16, asr(date, 5)), 15)
+  num := val(int32, y) * 365 + asr(y, 2) + A[obmod(m - 1, 12)] + band(date, 31) - 1
+  if IsLeapYear(firstY + y) & (m > 2) then
+    inc(num)
+  end
+  return num
+end NumberOfDays
+
+// Returns the date 1.1.[firstY] + days
+procedure NumberOfDaysToDate*(days: int32): int32
+  var
+    M, m, y, d: int32
+begin
+  if obmod(days + 307, 1461) = 0 then
+    d := 2
+  else
+    d := 1
+  end
+  days := days - obdiv(days + 307, 1461)
+  y := firstY + obdiv(days, 365)
+  if firstY > y then
+    y := zeroY
+    m := 1
+    d := 1
+  else
+    M := obmod(days, 365)
+    m := T[M]
+    d := M - A[m - 1] + d
+  end
+
+  return sigc(shl(val(int32, sigc(shl(val(int32, y - zeroY), 4)) + m), 5)) + d
+end NumberOfDaysToDate
+
+// Converts year, month and day into an Oberon date
+procedure ToDate*(year, month, day: int16): int32
+  var
+    d: int16
+begin
+  month := 1 + obmod(month - 1, 12)
+  d := LastDay(year, month)
+  day := 1 + obmod(day - 1, d)
+  return sigc(shl(val(int32, sigc(shl(val(int32, year - zeroY), 4)) + month), 5)) + day
+end ToDate
+
+// Converts hour, min and sec into an Oberon time
+procedure ToTime*(hour, min_, sec: int16): int32
+begin
+  return (obmod(val(int32, hour), 24) * 64 + obmod(min_, 60)) * 64 + obmod(sec, 60)
+end ToTime
+
+// Extracts year, month and day of an Oberon date
+procedure ToYMD*(date: int32; year, month, day: pointer to int16)
+begin
+  year^ := val(int16, asr(date, 9)) + zeroY
+  month^ := val(int16, band(asr(date, 5), 15))
+  day^ := val(int16, band(date, 31))
+end ToYMD
+
+// Extracts hour, min and sec of an Oberon time
+procedure ToHMS*(time: int32; hour, min_, sec: pointer to int16)
+begin
+  hour^ := val(int16, asr(time, 12))
+  min_^ := val(int16, band(asr(time, 6), 63))
+  sec^ := val(int16, band(time, 63))
+end ToHMS
+
+// Returns weekday from date, where 0 is monday
+procedure DayOfWeek*(date: int32): int16
+  var
+    num: int32
+begin
+  num := NumberOfDays(date)
+  return val(int16, obmod(num + 1, 7))
+end DayOfWeek
+
+// Returns number of days in a month
+procedure DaysOfMonth*(date: int32): int16
+  // returns last day in month
+  var
+    year, month: int32
+begin
+  month := band(asr(date, 5), 15)
+  year := asr(date, 9) + zeroY
+  return LastDay(val(int16, year), val(int16, month))
+end DaysOfMonth
+
+// Following three procedures are used to add/subtract a certain amount of days/month/years.
+procedure AddYear*(date: int32; years: int16): int32
+  var
+    y, m, d: int16
+begin
+  ToYMD(date, @y, @m, @d)
+  if firstY <= y + years then
+    if IsLeapYear(y) & (m = 2) & (d = 29) & ~IsLeapYear(y + years) then
+      d := 28
+    end
+    date := ToDate(y + years, m, d)
+  end
+
+  return date
+end AddYear
+
+procedure AddMonth*(date: int32; months: int16): int32
+  var
+    y, m, d: int16
+begin
+  ToYMD(date, @y, @m, @d)
+  inc(m, months - 1)
+  y := y + obdiv(m, 12)
+  if firstY <= y then
+    m := obmod(m, 12) + 1
+    if m = 2 then
+      if (d > 29) & IsLeapYear(y) then
+        d := 29
+      elsif (d > 28) & ~IsLeapYear(y) then
+        d := 28
+      end
+
+    elsif (d > 30) & ((m < 8) & ~((m mod 2) # 0) or (m > 7) & ((m mod 2) # 0)) then
+      d := 30
+    end
+
+    date := ToDate(y, m, d)
+  end
+
+  return date
+end AddMonth
+
+procedure AddDay*(date: int32; days: int16): int32
+  var
+    num: int32
+begin
+  num := NumberOfDays(date)
+  num := num + days
+  return NumberOfDaysToDate(num)
+end AddDay
+
+// Following three procedures are used to add/subtract a certain amount of time.
+procedure AddHour*(time: int32; hour: int16): int32
+  var
+    s, m, h: int16
+begin
+  ToHMS(time, @h, @m, @s)
+  return ToTime(obmod(h + hour, 24), m, s)
+end AddHour
+
+procedure AddMinute*(time: int32; min_: int16): int32
+  var
+    s, m, h: int16
+begin
+  ToHMS(time, @h, @m, @s)
+  inc(m, min_)
+  if (m < 0) or (m >= 60) then
+    h := obmod(h + obdiv(m, 60), 24)
+    m := obmod(m, 60)
+  end
+  return ToTime(h, m, s)
+end AddMinute
+
+procedure AddSecond*(time: int32; sec: int16): int32
+  var
+    s, m, h: int16
+begin
+  ToHMS(time, @h, @m, @s)
+  inc(s, sec)
+  if (s < 0) or (s >= 60) then
+    inc(m, obdiv(s, 60))
+    s := obmod(s, 60)
+    if (m < 0) or (m >= 60) then
+      h := obmod(h + obdiv(m, 60), 24)
+      m := obmod(m, 60)
+    end
+  end
+
+  return ToTime(h, m, s)
+end AddSecond
+
+// Following procedure adds/subtracts a certain amount seconds to time/date.
+procedure AddTime*(time, date: pointer to int32; sec: int32)
+  var
+    h, m, s: int32
+    ss, mm, hh: int16
+begin
+  ToHMS(time^, @hh, @mm, @ss)
+  s := sec + ss
+  h := hh
+  m := mm
+  if (s < 0) or (s >= 60) then
+    m := obdiv(s, 60) + mm
+    s := obmod(s, 60)
+    if (m < 0) or (m >= 60) then
+      h := obdiv(m, 60) + hh
+      m := obmod(m, 60)
+      if (h < 0) or (h >= 24) then
+        date^ := AddDay(date^, val(int16, obdiv(h, 24)))
+        h := obmod(h, 24)
+      end
+    end
+  end
+
+  time^ := ToTime(val(int16, h), val(int16, m), val(int16, s))
+end AddTime
+
+procedure Init()
+
+  var
+    diff: array 8 of char
+    S: Texts.Scanner
+    i, j: int32
+begin
+  A[0] := 0
+  A[1] := 31
+  A[2] := 59
+  A[3] := 90
+  A[4] := 120
+  A[5] := 151
+  A[6] := 181
+  A[7] := 212
+  A[8] := 243
+  A[9] := 273
+  A[10] := 304
+  A[11] := 334
+  A[12] := 365
+  i := 0
+  j := 0
+  while i < 12 do
+    while j < A[i + 1] do
+      T[j] := val(int8, val(int16, i + 1))
+      inc(j)
+    end
+    inc(i)
+  end
+  Oberon.OpenScanner(@S, "System.TimeDiff")
+  TimeDiff := 0
+  if S.class = Texts.String then
+    copy(@diff, @S.s, 8)
+    i := 0
+    j := 1
+    if diff[i] = "+" then
+      inc(i)
+    elsif diff[i] = "-" then
+      inc(i)
+      j := -1
+    end
+
+    while (diff[i] >= "0") & (diff[i] <= "9") do
+      TimeDiff := 10 * TimeDiff + val(int32, ord(diff[i])) - val(int32, ord("0"))
+      inc(i)
+    end
+
+    TimeDiff := obdiv(TimeDiff, 100) * 60 + obmod(TimeDiff, 100)
+    TimeDiff := j * TimeDiff
+  end
+end Init
+
+begin
+  Modules.Register("Dates", nil)
+  Init()
+end Dates.

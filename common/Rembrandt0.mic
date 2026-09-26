@@ -1,0 +1,825 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Rembrandt0 [level=5]
+
+import Oberon, Display, Strings, Gadgets, Texts, Pictures, Objects, D3 := Display3, Out, Files, Math, Modules
+// portable
+
+(** Dieses Modul enthält div. Prozeduren für den Rembrandt-Editor und Farboperationen, die auch in weiteren
+Modulen gebraucht werden können. Einige Prozeduren und Variablen sind aus dem Backdrops-Modul übernommen
+worden, da dieses Modul nun auch auf Rembrandt basiert *)
+
+(*
+jt 7.11.95 - Fixed InitCross
+*)
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+
+  ColFrame* = pointer to ColFrameDesc
+  ColFrameDesc* = object (Gadgets.FrameDesc)
+    col*: int16 // für Version 1.6
+  end
+
+  Color* = pointer to ColorDesc
+  ColorDesc* = object (Gadgets.ObjDesc)
+    col*: int16
+  end
+
+  FloydType = pointer to record
+
+    // Aktuelle Farbe f?r Rembrandt-Editor
+    // Anzahl Farben f?r Backdrops / Maximale Anzahl Farben auf Bildschirm verf?gbar
+    // Farbpalette f?r Backdrops
+
+    // floyd
+
+    errr, errg, errb, clamp: array 1024 of int32
+    hash: array 16 of array 16 of array 16 of char
+  end
+
+const
+  max_ = 256
+
+var
+  Z: int32
+  color*: Color
+  noc*, maxnoc*: int16
+  coltable*: array 256 (* max_ *) of record
+    r*, g*, b*: int16
+  end
+
+  r, g, b, rpal, gpal, bpal: array 256 of int16
+  floyd: FloydType
+
+// Zufallszahl *
+procedure Uniform*(): real
+  const
+    a = 16807i2
+    m = 2147483647i4
+    q = m div a
+    r = m mod a
+  var
+    g: int32
+begin
+  g := a * obmod(Z, q) - r * obdiv(Z, q)
+  if g > 0 then
+    Z := g
+  else
+    Z := g + m
+  end
+  return val(real, Z) * (1.0 / val(real, m))
+end Uniform
+
+procedure InitSeed*(seed: int32)
+begin
+  Z := seed
+end InitSeed
+
+// Dither *
+
+procedure InitFloyd()
+  var
+    i, j, k, col: int16
+    r, g, b: int32
+
+  procedure CApprox(r, g, b: int32; col: pointer to int16; nr, ng, nb: pointer to int32)
+    var
+      d, t, min_: int32
+      i: int16
+  begin
+    min_ := 2147483647
+    i := 0
+    while i < sigc(shl(val(int32, 1), usig(val(int32, Pictures.colorD)))) do
+      t := r - rpal[i]
+      d := t * t
+      t := g - gpal[i]
+      inc(d, t * t)
+      t := b - bpal[i]
+      inc(d, t * t)
+      if abs(d) < min_ then
+        min_ := abs(d)
+        col^ := i
+        nr^ := rpal[i]
+        ng^ := gpal[i]
+        nb^ := bpal[i]
+      end
+      inc(i)
+    end
+  end CApprox
+begin
+  newgc(floyd)
+  i := 0
+  while i < sigc(shl(val(int32, 1), usig(val(int32, Pictures.colorD)))) do
+    Display.GetColor(i, @rpal[i], @gpal[i], @bpal[i])
+    inc(i)
+  end
+
+  i := -512
+  while i < 512 do
+    if i < 0 then
+      floyd.clamp[i + 512] := 0
+    elsif i > 255 then
+      floyd.clamp[i + 512] := 255
+    else
+      floyd.clamp[i + 512] := i
+    end
+
+    inc(i)
+  end
+
+  i := 0
+  while i < 16 do
+    j := 0
+    while j < 16 do
+      k := 0
+      while k < 16 do
+        CApprox(i * 16, j * 16, k * 16, @col, @r, @g, @b)
+        floyd.hash[i][j][k] := chr(col)
+        inc(k)
+      end
+
+      inc(j)
+    end
+
+    inc(i)
+  end
+end InitFloyd
+
+procedure Floyd*(S, D: Pictures.Picture)
+  var
+    i, i2_, j, dcol, col: int16
+    rcol, gcol, bcol, restim, gestim, bestim, err, er0, er1, er4, eg0, eg1, eg4, eb0, eb1, eb4: int32
+begin
+  if floyd = nil then
+    InitFloyd()
+  end
+  i := 0
+  while i < 1024 do
+    floyd.errr[i] := 0
+    floyd.errg[i] := 0
+    floyd.errb[i] := 0
+    inc(i)
+  end
+
+  i := 0
+  while i < sigc(shl(val(int32, 1), usig(val(int32, S.depth)))) do
+    Pictures.GetColor(S, i, @r[i], @g[i], @b[i])
+    inc(i)
+  end
+
+  j := 0
+  while j < S.height do
+    i := 0
+    er0 := 0
+    er1 := 0
+    er4 := 0
+    eg0 := 0
+    eg1 := 0
+    eg4 := 0
+    eb0 := 0
+    eb1 := 0
+    eb4 := 0
+    i2_ := 0
+    while i < S.width do
+      inc(i2_)
+      col := Pictures.Get(S, i, j)
+      rcol := floyd.clamp[r[col] + floyd.errr[i2_] + er4 + 512]
+      gcol := floyd.clamp[g[col] + floyd.errg[i2_] + eg4 + 512]
+      bcol := floyd.clamp[b[col] + floyd.errb[i2_] + eb4 + 512]
+      floyd.errr[i2_] := 0
+      floyd.errg[i2_] := 0
+      floyd.errb[i2_] := 0
+
+      dcol := val(int16, ord(floyd.hash[asr(rcol, 4)][asr(gcol, 4)][asr(bcol, 4)]))
+      restim := rpal[dcol]
+      gestim := gpal[dcol]
+      bestim := bpal[dcol]
+
+      err := rcol - restim
+      floyd.errr[i] := asr(err * 3, 4) + er0 // 3
+      er0 := asr(err * 5, 4) + er1 // 5
+      er1 := asr(err, 4)
+      er4 := asr(err * 7, 4) // 7
+
+      err := gcol - gestim
+      floyd.errg[i] := asr(err * 3, 4) + eg0
+      eg0 := asr(err * 5, 4) + eg1
+      eg1 := asr(err, 4)
+      eg4 := asr(err * 7, 4)
+
+      err := bcol - bestim
+      floyd.errb[i] := asr(err * 3, 4) + eb0
+      eb0 := asr(err * 5, 4) + eb1
+      eb1 := asr(err, 4)
+      eb4 := asr(err * 7, 4)
+
+      Pictures.Dot(D, dcol, i, j, Display.replace)
+      inc(i)
+    end
+
+    inc(j)
+  end
+end Floyd
+
+procedure RGBtoHSV(R, G, B: real; H, S, V: pointer to real)
+  // Wandelt RGB-Werte in HSV-Werte um
+  const
+    undef = 361
+
+  var
+    maxVal, minVal, diff, Rdist, Gdist, Bdist: real
+
+  procedure maxOf(R, G, B: real): real
+    var
+      max_: real
+  begin
+    if R > G then
+      max_ := R
+    else
+      max_ := G
+    end
+    if B > max_ then
+      return B
+    else
+      return max_
+    end
+    return 0.0 // TODO o2m: Micron requires a result on all control paths
+  end maxOf
+
+  procedure minOf(R, G, B: real): real
+    var
+      min_: real
+  begin
+    if R < G then
+      min_ := R
+    else
+      min_ := G
+    end
+    if B < min_ then
+      return B
+    else
+      return min_
+    end
+    return 0.0 // TODO o2m: Micron requires a result on all control paths
+  end minOf
+begin
+  maxVal := maxOf(R, G, B)
+  minVal := minOf(R, G, B)
+  diff := maxVal - minVal
+  V^ := maxVal
+  if maxVal # val(real, 0) then
+    S^ := diff / maxVal
+  else
+    S^ := val(real, 0)
+  end
+  if S^ = val(real, 0) then
+    H^ := val(real, undef)
+  else
+    Rdist := (maxVal - R) / diff
+    Gdist := (maxVal - G) / diff
+    Bdist := (maxVal - B) / diff
+    if R = maxVal then
+      H^ := Bdist - Gdist
+    elsif G = maxVal then
+      H^ := val(real, 2) + Rdist - Bdist
+    elsif B = maxVal then
+      H^ := val(real, 4) + Gdist - Rdist
+    end
+
+    H^ := H^ * val(real, 60)
+    if H^ < val(real, 0) then
+      H^ := H^ + val(real, 360)
+    end
+  end
+end RGBtoHSV
+
+procedure HSVtoRGB(H, S, V: real; R, G, B: pointer to real)
+  // Wandelt HSV-Wrte in RGB-Wrte um
+  var
+    f, p, q, t: real
+    i: int32
+begin
+  if S = val(real, 0) then
+    R^ := V
+    G^ := V
+    B^ := V
+  else
+    if H = val(real, 360) then
+      H := val(real, 0)
+    end
+    H := H / val(real, 60)
+    i := val(int32, floor(H))
+    f := H - val(real, i)
+    p := V * (val(real, 1) - S)
+    q := V * (val(real, 1) - S * f)
+    t := V * (val(real, 1) - S * (val(real, 1) - f))
+    case i of
+      0:
+      R^ := V
+      G^ := t
+      B^ := p
+    | 1:
+      R^ := q
+      G^ := V
+      B^ := p
+    | 2:
+      R^ := p
+      G^ := V
+      B^ := t
+    | 3:
+      R^ := p
+      G^ := q
+      B^ := V
+    | 4:
+      R^ := t
+      G^ := p
+      B^ := V
+    | 5:
+      R^ := V
+      G^ := p
+      B^ := q
+    end
+  end
+end HSVtoRGB
+
+// Verändert die Farben eines Pictures mit den gegebenen Parameter
+procedure Reduce*(S, D: Pictures.Picture; ds, dv: real)
+  var
+    rr, gr, br, hr, sr, vr: real
+    i, r, g, b, maxc, h: int16
+    P: Pictures.Picture
+begin
+  if S # nil then
+    newgc(P)
+    Pictures.Create(P, S.width, S.height, S.depth)
+    Pictures.CopyBlock(S, P, 0, 0, S.width, S.height, 0, 0, Display.replace)
+    maxc := val(int16, sigc(shl(val(int32, 2), usig(val(int32, S.depth - 1)))))
+    for i := 0 to maxc - 1 do
+      Pictures.GetColor(S, i, @r, @g, @b)
+      if dv < val(real, 1) then
+        rr := val(real, r) * 1.0
+        gr := val(real, g) * 1.0
+        br := val(real, b) * 1.0
+        RGBtoHSV(rr, gr, br, @hr, @sr, @vr)
+        sr := sr * dv
+        if sr > val(real, 255) then
+          sr := val(real, 255)
+        elsif sr < val(real, 0) then
+          sr := val(real, 0)
+        end
+
+        HSVtoRGB(hr, sr, vr, @rr, @gr, @br)
+        r := val(int16, val(int16, floor(rr)))
+        g := val(int16, val(int16, floor(gr)))
+        b := val(int16, val(int16, floor(br)))
+      end
+
+      if ds > val(real, 1) then
+        // heller
+        h := val(int16, val(int16, floor(val(real, 256) / (val(real, r) / val(real, 128) + val(real, 1)) * (ds - val(real, 1))) + 1))
+        r := r + h
+        h := val(int16, val(int16, floor(val(real, 256) / (val(real, g) / val(real, 128) + val(real, 1)) * (ds - val(real, 1))) + 1))
+        g := g + h
+        h := val(int16, val(int16, floor(val(real, 256) / (val(real, b) / val(real, 128) + val(real, 1)) * (ds - val(real, 1))) + 1))
+        b := b + h
+      elsif ds < val(real, 1) then
+        // dunkler
+        h := val(int16, val(int16, floor((val(real, 256) - val(real, r) / val(real, 2)) / val(real, 256) * val(real, r) * (val(real, 1) - ds)) + 1))
+        r := r - h
+        h := val(int16, val(int16, floor((val(real, 256) - val(real, g) / val(real, 2)) / val(real, 256) * val(real, g) * (val(real, 1) - ds)) + 1))
+        g := g - h
+        h := val(int16, val(int16, floor((val(real, 256) - val(real, b) / val(real, 2)) / val(real, 256) * val(real, b) * (val(real, 1) - ds)) + 1))
+        b := b - h
+      else
+      end
+
+      if r > 255 then
+        r := 255
+      elsif r < 0 then
+        r := 0
+      end
+      if g > 255 then
+        g := 255
+      elsif g < 0 then
+        g := 0
+      end
+      if b > 255 then
+        b := 255
+      elsif b < 0 then
+        b := 0
+      end
+      Pictures.SetColor(P, i, r, g, b)
+    end
+
+    Floyd(P, D)
+    i := 0
+    while i < sigc(shl(val(int32, 2), usig(val(int32, S.depth - 1)))) do
+      Display.GetColor(i, @r, @g, @b)
+      Pictures.SetColor(D, i, r, g, b)
+      inc(i)
+    end
+  end
+end Reduce
+
+// Colorgadgets für Farbanzeige im Rembrandt-Panel *
+procedure HandleColor*(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    red, green, blue: int16
+begin
+  case obj of
+  | Color:
+    case M of
+    | Objects.PAttrMsg:
+      if M.id = Objects.get then
+        if M.name = "Gen" then
+          M.class := Objects.String
+          copy(@M.s, "Rembrandt0.NewColorObj", 64)
+          M.res := 0
+        elsif M.name = "col" then
+          M.class := Objects.Int
+          M.i := obj.col
+          M.res := 0
+        elsif M.name = "red" then
+          Display.GetColor(obj.col, @red, @green, @blue)
+          M.class := Objects.Int
+          M.i := red
+          M.res := 0
+        elsif M.name = "green" then
+          Display.GetColor(obj.col, @red, @green, @blue)
+          M.class := Objects.Int
+          M.i := green
+          M.res := 0
+        elsif M.name = "blue" then
+          Display.GetColor(obj.col, @red, @green, @blue)
+          M.class := Objects.Int
+          M.i := blue
+          M.res := 0
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if M.name = "col" then
+          obj.col := val(int16, M.i)
+          M.res := 0
+        elsif M.name = "red" then
+          if M.class = Objects.String then
+            Strings.StrToInt(@M.s, @M.i)
+          end
+          Display.GetColor(obj.col, @red, @green, @blue)
+          Display.SetColor(obj.col, val(int32, val(int16, M.i)), green, blue)
+          M.res := 0
+        elsif M.name = "green" then
+          if M.class = Objects.String then
+            Strings.StrToInt(@M.s, @M.i)
+          end
+          Display.GetColor(obj.col, @red, @green, @blue)
+          Display.SetColor(obj.col, red, val(int32, val(int16, M.i)), blue)
+          M.res := 0
+        elsif M.name = "blue" then
+          if M.class = Objects.String then
+            Strings.StrToInt(@M.s, @M.i)
+          end
+          Display.GetColor(obj.col, @red, @green, @blue)
+          Display.SetColor(obj.col, red, green, val(int32, val(int16, M.i)))
+          M.res := 0
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.enum then
+        M.Enum("col")
+        M.Enum("red")
+        M.Enum("green")
+        M.Enum("blue")
+        Gadgets.objecthandle(obj, M)
+      end
+
+    | Objects.PCopyMsg:
+      M(Objects.PCopyMsg).obj := obj // this object must not be copied
+    else
+      Gadgets.objecthandle(obj, M)
+    end
+  end
+end HandleColor
+
+procedure NewColorObj*()
+begin
+  Objects.NewObj := color
+end NewColorObj
+
+procedure HandleColFrame*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    x, y: int16
+    Q: D3.Mask
+    F1: ColFrame
+begin
+  case F of
+  | ColFrame:
+    case M of
+    | Display.PDisplayMsg:
+      if (M.device = Display.screen) & ((M.F = nil) or (M.F = F)) then
+        // message addressed to box
+        x := M.x + F.X
+        y := M.y + F.Y
+        Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+        D3.ReplConst(Q, color.col, x, y, F.W, F.H, Display.replace)
+      else
+        Gadgets.framehandle(F, M)
+      end
+
+    | Gadgets.PUpdateMsg:
+      if M.obj = F.obj then
+        x := M.x + F.X
+        y := M.y + F.Y
+        Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+        D3.ReplConst(Q, color.col, x, y, F.W, F.H, Display.replace)
+      else
+        Gadgets.framehandle(F, M)
+      end
+
+    | Objects.PAttrMsg:
+      if M.id = Objects.get then
+        if M.name = "Gen" then
+          M.class := Objects.String
+          copy(@M.s, "Rembrandt0.NewColFrame", 64)
+          M.res := 0
+        elsif M.name = "Color" then
+          M.class := Objects.Int
+          M.i := F.col
+          M.res := 0
+        else
+          Gadgets.framehandle(F, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if M.name = "Color" then
+          if M.class = Objects.Int then
+            F.col := val(int16, M.i)
+            M.res := 0
+          end
+
+        else
+          Gadgets.framehandle(F, M)
+        end
+
+      elsif M.id = Objects.enum then
+        M.Enum("Color")
+        M.Enum("Cmd")
+        Gadgets.framehandle(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink // non-first arrival
+      else
+        // first arrival
+        newgc(F1)
+        F.stamp := M.stamp
+        F.dlink := F1
+        Gadgets.CopyFrame(M, F, F1)
+        M.obj := F1
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end HandleColFrame
+
+procedure NewColFrame*()
+  var
+    F: ColFrame
+begin
+  newgc(F)
+  F.W := 50
+  F.H := 50
+  F.col := D3.black
+  F.handle := HandleColFrame
+  Objects.NewObj := F
+end NewColFrame
+
+// Verschiedene Operationen auf Picture mit Clipping falls negative Koordinaten *
+procedure CopyBlock*(S, D: Pictures.Picture; x, y, w, h, dx, dy, mode: int16)
+begin
+  if dx < 0 then
+    w := w + dx
+    x := x - dx
+    dx := 0
+  end
+  if dy < 0 then
+    h := h + dy
+    y := y - dy
+    dy := 0
+  end
+  if (w > 0) & (h > 0) then
+    Pictures.CopyBlock(S, D, x, y, w, h, dx, dy, mode)
+  end
+end CopyBlock
+
+procedure ReplConst*(P: Pictures.Picture; col, x, y, w, h: int16)
+begin
+  if x < 0 then
+    w := w + x
+    x := 0
+  end
+  if y < 0 then
+    h := h + y
+    y := 0
+  end
+  if (w > 0) & (h > 0) then
+    Pictures.ReplConst(P, col, x, y, w, h, Display.replace)
+  end
+end ReplConst
+
+// Speicherblock für Picture allozieren oder Fehlermeldung ausgeben *
+procedure AllocatePictureMem*(P: pointer to Pictures.Picture; w, h, d: int16)
+begin
+  Pictures.Create(P^, w, h, d)
+  if P^.depth = 0 then
+    Out.String("Not enough free memory")
+    Out.Ln()
+    P^ := nil
+  end
+end AllocatePictureMem
+
+// Best Match für gesuchten Farbwert in der aktuellen Farbpalette *
+procedure NearestColor*(r, g, b: int32): int16
+  var
+    d, t, min_: int32
+    col, i: int16
+begin
+  min_ := 2147483647
+  i := 0
+  while i # noc do
+    t := r - coltable[i].r
+    d := t * t
+    t := g - coltable[i].g
+    inc(d, t * t)
+    t := b - coltable[i].b
+    inc(d, t * t)
+    if abs(d) < min_ then
+      min_ := abs(d)
+      col := i
+    end
+    inc(i)
+  end
+
+  return col
+end NearestColor
+
+procedure Gamma(val_: int16; gamma: real): int16
+  var
+    gval: real
+begin
+  if val_ = 0 then
+    gval := val(real, 0)
+  else
+    gval := Math.exp(Math.ln(val(real, val_) / 256.0) * gamma)
+  end
+  return val(int16, val(int16, floor(val(real, 256) * gval)))
+end Gamma
+
+// Farbpalette ändern *
+procedure Darken*()
+  var
+    i, r, g, b: int16
+    gamma: real
+begin
+  gamma := 1.25
+  for i := 0 to maxnoc - 1 do
+    Display.GetColor(i, @r, @g, @b)
+    Display.SetColor(i, Gamma(r, gamma), Gamma(g, gamma), Gamma(b, gamma))
+  end
+end Darken
+
+procedure Lighten*()
+  var
+    i, r, g, b: int16
+    gamma: real
+begin
+  gamma := 0.8
+  for i := 0 to maxnoc - 1 do
+    Display.GetColor(i, @r, @g, @b)
+    Display.SetColor(i, Gamma(r, gamma), Gamma(g, gamma), Gamma(b, gamma))
+  end
+end Lighten
+
+procedure SetColor*()
+  var
+    S: Texts.Scanner
+begin
+  Texts.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Texts.Scan(@S)
+  if S.class = Texts.Int then
+    color.col := val(int16, S.i)
+  end
+  Gadgets.Update(color)
+end SetColor
+
+procedure ChangeColor*()
+  var
+    S: Texts.Scanner
+    r, g, b: int16
+begin
+  Texts.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Texts.Scan(@S)
+  if S.class = Texts.Int then
+    r := val(int16, S.i)
+  else
+    r := 0
+  end
+  Texts.Scan(@S)
+  if S.class = Texts.Int then
+    g := val(int16, S.i)
+  else
+    g := 0
+  end
+  Texts.Scan(@S)
+  if S.class = Texts.Int then
+    b := val(int16, S.i)
+  else
+    b := 0
+  end
+  Display.SetColor(color.col, r, g, b)
+  coltable[color.col].r := r
+  coltable[color.col].g := g
+  coltable[color.col].b := b
+end ChangeColor
+
+// Standardpalette wird neu geladen *
+procedure ResetAll*()
+  var
+    F: Files.File
+    R: Files.Rider
+    r, g, b: char
+    i: int16
+begin
+  F := Files.Old("Default.Pal")
+  Files.Set(@R, F, 0)
+  for i := 0 to maxnoc - 1 do
+    Files.Read(@R, cast(BytePtr, @r))
+    Files.Read(@R, cast(BytePtr, @g))
+    Files.Read(@R, cast(BytePtr, @b))
+    coltable[i].r := val(int16, ord(r))
+    coltable[i].g := val(int16, ord(g))
+    coltable[i].b := val(int16, ord(b))
+    Display.SetColor(i, val(int32, ord(r)), val(int32, ord(g)), val(int32, ord(b)))
+  end
+
+  Gadgets.Update(color)
+end ResetAll
+
+// Einzelne Farbe auf Standardwert zurückgesetzt *
+procedure ResetOne*()
+  var
+    F: Files.File
+    R: Files.Rider
+    r, g, b: char
+    i: int16
+begin
+  F := Files.Old("Default.Pal")
+  Files.Set(@R, F, 0)
+  for i := 0 to maxnoc - 1 do
+    Files.Read(@R, cast(BytePtr, @r))
+    Files.Read(@R, cast(BytePtr, @g))
+    Files.Read(@R, cast(BytePtr, @b))
+    if i = color.col then
+      coltable[i].r := val(int16, ord(r))
+      coltable[i].g := val(int16, ord(g))
+      coltable[i].b := val(int16, ord(b))
+      Display.SetColor(i, val(int32, ord(r)), val(int32, ord(g)), val(int32, ord(b)))
+    end
+  end
+
+  Gadgets.Update(color)
+end ResetOne
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewColorObj" end return NewColorObj end
+  if i = 1 then if name # nil then name^ := "NewColFrame" end return NewColFrame end
+  if i = 2 then if name # nil then name^ := "Darken" end return Darken end
+  if i = 3 then if name # nil then name^ := "Lighten" end return Lighten end
+  if i = 4 then if name # nil then name^ := "SetColor" end return SetColor end
+  if i = 5 then if name # nil then name^ := "ChangeColor" end return ChangeColor end
+  if i = 6 then if name # nil then name^ := "ResetAll" end return ResetAll end
+  if i = 7 then if name # nil then name^ := "ResetOne" end return ResetOne end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Rembrandt0", cmd_)
+  Z := 1
+  floyd := nil
+  newgc(color)
+  color.handle := HandleColor
+  color.col := 3
+  Objects.NewObj := color
+  maxnoc := 256
+  noc := maxnoc
+end Rembrandt0.

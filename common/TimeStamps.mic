@@ -1,0 +1,339 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module TimeStamps [level=5]
+
+import Files, Strings, Display, Display3, Printer, Printer3, Fonts, Objects, Oberon, Gadgets, Modules
+// portable
+// ejz
+
+type
+  Frame* = pointer to FrameDesc
+  FrameDesc* = object (Gadgets.FrameDesc)
+    font: Fonts.Font
+    cap_: array 64 of char
+    col, w: int16 // width of gadgets based on display metrics
+  end
+
+  RevFrame* = pointer to RevFrameDesc
+  RevFrameDesc* = object (FrameDesc)
+    revision: int32
+  end
+
+procedure Restore(F: Frame; Q: Display3.Mask; x, y, w, h: int16)
+  var
+    dx: int16
+begin
+  dx := asr(w - F.w, 1)
+  Display3.String(Q, F.col, x + dx, y - F.font.minY, F.font, @F.cap_, Display.paint)
+  Display3.ReplConst(Q, F.col, x + dx, y, F.w, 1, Display.replace)
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(Q, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end Restore
+
+procedure P(x: int32): int16
+begin
+  return val(int16, obdiv(x * Display.Unit + (Printer.Unit - 1), Printer.Unit))
+end P
+
+procedure DR(x: int32): real
+begin
+  return val(real, x * Printer.Unit) / val(real, Display.Unit)
+end DR
+
+procedure Print(F: Frame; Q: Display3.Mask; x, y: int16)
+  var
+    w, h, dsr: int16
+begin
+  Printer3.StringSize(@F.cap_, F.font, @w, @h, @dsr) // get dsr in printer metrics / ps - 30.5.96
+  Printer3.String(Q, F.col, x + asr(P(F.W) - P(F.w), 1), y + dsr, F.font, @F.cap_, Display.paint)
+  Printer3.ReplConst(Q, F.col, x, y, P(F.W), 1, Display.replace)
+end Print
+
+procedure Copy*(M: pointer to Objects.CopyMsg; from, to_: Frame)
+begin
+  to_.font := from.font
+  copy(@to_.cap_, @from.cap_, 64)
+  to_.col := from.col
+  to_.w := from.w
+  Gadgets.CopyFrame(M, from, to_)
+end Copy
+
+procedure Caption(F: Frame; w, h: pointer to int16; newtime: boolean)
+
+  var
+    date, time: int32
+    wr, hr: real
+    tmp: array 64 of char
+    pw, ph, dsr: int16
+begin
+  if newtime then
+    case F of
+    | RevFrame:
+      inc(F.revision)
+      Strings.IntToStr(F.revision, @F.cap_, 64)
+
+    else
+      Oberon.GetClock(@time, @date)
+      Strings.DateToStr(date, @F.cap_)
+      Strings.TimeToStr(time, @tmp)
+      Strings.Append(@F.cap_, 64, "  ")
+      Strings.Append(@F.cap_, 64, @tmp)
+    end
+  end
+
+  // ps - 30.5.96
+  Display3.StringSize(@F.cap_, F.font, w, h, @dsr) // get width based on display metrics
+  Printer3.StringSize(@F.cap_, F.font, @pw, @ph, @dsr) // get size based on printer  metrics
+  wr := DR(pw)
+  hr := DR(ph)
+  if val(real, w^) < wr then
+    w^ := val(int16, val(int16, -floor(-wr)))
+  end
+  F.w := w^
+  if val(real, h^) < hr then
+    h^ := val(int16, val(int16, -floor(-hr)))
+  end
+end Caption
+
+procedure Modify(F: Frame; w, h: int16)
+  var
+    M: Display.ModifyMsg
+begin
+  M.F := F
+  M.res := -1
+  M.id := Display.extend
+  M.mode := Display.display
+  M.x := 0
+  M.y := 0
+  M.X := F.X
+  M.dX := 0
+  M.Y := F.Y
+  M.dY := 0
+  M.W := w
+  M.dW := w - F.W
+  M.H := h
+  M.dH := h - F.H
+  Display.Broadcast(@M)
+end Modify
+
+procedure Attributes(F: Frame; M: pointer to Objects.AttrMsg)
+  var
+    w, h: int16
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "TimeStamps.New", 64)
+      M.res := 0
+    elsif M.name = "Color" then
+      M.class := Objects.Int
+      M.i := F.col
+      M.res := 0
+    elsif M.name = "Font" then
+      M.class := Objects.String
+      copy(@M.s, @F.font.name, 64)
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := -F.font.minY
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if (M.class = Objects.Int) & (M.name = "Color") then
+      F.col := val(int16, M.i)
+      M.res := 0
+    elsif (M.class = Objects.String) & (M.name = "Font") then
+      F.font := Fonts.This(@M.s)
+      Caption(F, @w, @h, false)
+      Modify(F, w, h)
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    Gadgets.framehandle(F, M)
+    M.Enum("Color")
+    M.Enum("Font")
+    M.res := 0
+  end
+end Attributes
+
+procedure Handle*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+
+  var
+    M1: Display.PFrameMsg
+    F1: Frame
+    Q: Display3.Mask
+    x, y, w, h: int16
+begin
+  case F of
+  | Frame:
+    case M of
+    | Display.PFrameMsg:
+      if (M.F = nil) or (M.F = F) then
+        x := M.x + F.X
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        M1 := M
+        case M1 of
+        | Display.PDisplayMsg:
+          if M1.device = Display.screen then
+            if (M1.id = Display.full) or (M1.F = nil) then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+              Restore(F, Q, x, y, w, h)
+            elsif M1.id = Display.area then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+              Display3.AdjustMask(Q, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+              Restore(F, Q, x, y, w, h)
+            end
+
+          elsif M1.device = Display.printer then
+            Gadgets.MakePrinterMask(F, M1.x, M1.y, M1.dlink, @Q)
+            Print(F, Q, M1.x, M1.y)
+          end
+
+        else
+          Gadgets.framehandle(F, M1)
+        end
+      end
+
+    | Objects.PAttrMsg:
+      Attributes(F, M(Objects.PAttrMsg))
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Caption(F, @w, @h, true)
+        Modify(F, w, h)
+      end
+
+      Gadgets.framehandle(F, M)
+      if M.id = Objects.store then
+        Files.WriteInt(@M.R, F.col)
+        Files.WriteString(@M.R, @F.font.name, 32)
+        Files.WriteString(@M.R, @F.cap_, 64)
+      elsif M.id = Objects.load then
+        Files.ReadInt(@M.R, @F.col)
+        newgc(F.font)
+        Files.ReadString(@M.R, @F.font.name, 32)
+        F.font := Fonts.This(@F.font.name)
+        Files.ReadString(@M.R, @F.cap_, 64)
+        Caption(F, @w, @h, false)
+        Modify(F, w, h)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F1)
+        F.stamp := M.stamp
+        F.dlink := F1
+        Copy(M, F, F1)
+        M.obj := F1
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end Handle
+
+procedure Init*(F: Frame)
+begin
+  F.state := F.state + {Gadgets.transparent}
+  F.font := Fonts.Default
+  F.col := Display.FG
+  Caption(F, @F.W, @F.H, true)
+  F.handle := Handle
+end Init
+
+procedure New*()
+  var
+    F: Frame
+begin
+  newgc(F)
+  Init(F)
+  Objects.NewObj := F
+end New
+
+procedure CopyRev*(M: pointer to Objects.CopyMsg; from, to_: RevFrame)
+begin
+  to_.revision := from.revision
+  Copy(M, from, to_)
+end CopyRev
+
+procedure RevHandle*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    F1: RevFrame
+begin
+  case F of
+  | RevFrame:
+    case M of
+    | Objects.PAttrMsg:
+      if (M.id = Objects.get) & (M.name = "Gen") then
+        M.class := Objects.String
+        copy(@M.s, "TimeStamps.NewRev", 64)
+        M.res := 0
+      else
+        Handle(F, M)
+      end
+
+    | Objects.PFileMsg:
+      Handle(F, M)
+      if M.id = Objects.store then
+        Files.WriteLInt(@M.R, F.revision)
+      elsif M.id = Objects.load then
+        Files.ReadLInt(@M.R, @F.revision)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F1)
+        F.stamp := M.stamp
+        F.dlink := F1
+        CopyRev(M, F, F1)
+        M.obj := F1
+      end
+
+    else
+      Handle(F, M)
+    end
+  end
+end RevHandle
+
+procedure InitRev*(F: RevFrame)
+begin
+  F.revision := -1
+  Init(F)
+  F.handle := RevHandle
+end InitRev
+
+procedure NewRev*()
+  var
+    F: RevFrame
+begin
+  newgc(F)
+  InitRev(F)
+  Objects.NewObj := F
+end NewRev
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "New" end return New end
+  if i = 1 then if name # nil then name^ := "NewRev" end return NewRev end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("TimeStamps", cmd_)
+end TimeStamps.

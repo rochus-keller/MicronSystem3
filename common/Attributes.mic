@@ -1,0 +1,1242 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Attributes [level=5]
+
+import Objects, Oberon, Texts, Files, Reals, Fonts, Strings, Modules
+
+// portable
+// jm 14.3.95
+
+(** Module Attributes manages the attribute lists of the gadgets, provides an improved scanner with macro substitution facilities for executing commands, and supplies type conversion routines.
+*)
+(*
+jm 10.2.93 - Added DeleteAttr
+jm 9.3.93 - real support
+19.4.94 - Removed aliasing from the Scanner
+27.5.94 - added len support for scanner
+16.2.95 - @ scan support
+21.6.95 - fixed Attributes.Read*
+28.6.95 - bug fix in InsertAttr
+20.2.96 - added conversion attribute setting and getting routines
+14.3.96 - fix in get sym
+14.5.97 - added escape char "_" in Read
+*)
+
+// Scanner symbol classes.
+
+const
+  Inval* = Texts.Inval // Invalid symbol.
+  Name* = Texts.Name // Name.
+  String* = Texts.String // Literal string.
+  Int* = Texts.Int // Integer i.
+  Real* = Texts.Real // Real number x.
+  LongReal* = Texts.LongReal // Long real number y.
+  Char* = Texts.Char // Special character c.
+  Obj* = Texts.Object // Object o.
+
+  // Attr classes older values: used for saving now
+  Sboolean = 1
+  Sstring = 2
+  Sint = 3
+  Sreal = 4
+  Schar = 6
+
+  MaxLen = 128
+  TAB = 9X
+  CR = 0DX
+  LF = 0AX
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters  
+  
+  Reader* = pointer to ReaderDesc // Macro substituting reader.
+  ReaderDesc* = record
+    substitute*: boolean // Is substitution on or off?
+    text*: Texts.Text // Current text read.
+    eot*: boolean // End of text reached?
+    lib*: Objects.Library // Library of last character/object read.
+    R: Texts.Reader
+    next: Reader
+  end
+
+  // Upcall for macro substitution. Ch is the character to be substituted, res is the substitution text and beg is the starting position inside of the text.
+  MacroHandler* = procedure(ch: char; T: pointer to Reader; res: pointer to Texts.Text; beg: pointer to int32)
+
+  Macro = pointer to MacroDesc
+  MacroDesc = record
+    ch: char
+    handle: MacroHandler
+    next: Macro
+  end
+
+  Scanner* = record
+    // Macro substituting scanner
+    R*: Reader // Scanner operates with this reader.
+    eot*: boolean // End of text reached?
+    nextCh*: char // Character located immediately after scanned token.
+    class*: int16 // Scanner classes. Scanned tokens are returned in the record fields below.
+    i*: int32
+    x*: real
+    y*: longreal
+    c*: char
+    len_*: int8
+    s*: array 128 (* MaxLen *) of char
+    o*: Objects.Object
+  end
+
+  // Data structures for storing attribute lists.
+  Attr* = pointer to AttrDesc
+  AttrDesc* = object
+    next*: Attr
+    name*: Objects.Name
+  end
+
+  BoolAttr* = pointer to BoolDesc
+  BoolDesc* = object (AttrDesc)
+    b*: boolean
+  end
+
+  CharAttr* = pointer to CharDesc
+  CharDesc* = object (AttrDesc)
+    c*: char
+  end
+
+  IntAttr* = pointer to IntDesc
+  IntDesc* = object (AttrDesc)
+    i*: int32
+  end
+
+  RealAttr* = pointer to RealDesc
+  RealDesc* = object (AttrDesc)
+    r*: longreal
+  end
+
+  StringAttr* = pointer to StringDesc
+  StringDesc* = object (AttrDesc)
+    s*: array 64 of char
+  end
+
+var
+  W: Texts.Writer
+  macros: Macro
+  uparrowdone: boolean
+
+// --- Conversion handling ---
+
+// Convert a string to a text.
+procedure StrToTxt*(const s: pointer to array of char; T: pointer to Texts.Text)
+  var
+    newtext: Texts.Text
+    i: int16
+begin
+  i := 0
+  while s[i] # 0X do
+    Texts.Write(@W, s[i])
+    inc(i)
+  end
+  newgc(newtext)
+  Texts.Open(newtext, "")
+  Texts.Append(newtext, W.buf)
+  T^ := newtext
+end StrToTxt
+
+// Convert a text to a string. The string might be terminated early if the text is too long to fit.
+procedure TxtToStr*(T: Texts.Text; s: pointer to array of char; s_len: int32)
+  var
+    R: Texts.Reader
+    i: int16
+    ch: char
+begin
+  i := 0
+  if T # nil then
+    Texts.OpenReader(@R, T, 0)
+    while ~R.eot & (i < val(int16, s_len) - 1) do
+      Texts.Read(@R, @ch)
+      s[i] := ch
+      inc(i)
+    end
+  end
+
+  s[i] := 0X
+end TxtToStr
+
+// --- Scanning routines ---
+
+procedure OpenR(R: pointer to Reader; text: Texts.Text; pos: int32)
+  var
+    nR: Reader
+begin
+  newgc(nR)
+  nR.next := R^
+  R^ := nR
+  R^.substitute := true
+  Texts.OpenReader(@R^.R, text, pos)
+  R^.text := text
+  R^.eot := R^.R.eot
+end OpenR
+
+// Read character ch from the Reader. Registered character macros are automatically substituted by making upcalls to the installed macro handlers.
+procedure Read*(R: pointer to Reader; ch: pointer to char)
+  var
+    m: Macro
+    nT: Texts.Text
+    beg: int32
+begin
+  if R^.eot then
+    ch^ := 0X
+    return
+  end
+  Texts.Read(@R^.R, ch)
+  R^.eot := R^.R.eot
+  R^.lib := R^.R.lib
+  if ~R^.eot then
+    if ch^ = "_" then
+      // escape char
+      if R^.substitute then
+        beg := Texts.Pos(@R^.R)
+        Texts.Read(@R^.R, ch)
+        if ~R^.R.eot then
+          m := macros
+          while (m # nil) & (m.ch # ch^) do
+            m := m.next
+          end
+          if m # nil then
+            // return macro char and do not execute macro
+            R^.lib := R^.R.lib
+            R^.eot := false
+          else
+            // no escape
+            Texts.OpenReader(@R^.R, R^.text, beg - 1)
+            Texts.Read(@R^.R, ch)
+          end
+
+        else
+          // no escape
+          Texts.OpenReader(@R^.R, R^.text, beg - 1)
+          Texts.Read(@R^.R, ch)
+        end
+      end
+
+    else
+      m := macros
+      while m # nil do
+        if R^.substitute & (m.ch = ch^) & (m.handle # nil) then
+          m.handle(ch^, R, @nT, @beg)
+          if nT # nil then
+            if nT.len_ > 0 then
+              OpenR(R, nT, beg)
+              Read(R, ch)
+            else
+              Read(R, ch)
+            end
+
+          else
+          end // return macro character itself
+        end
+
+        m := m.next
+      end
+    end
+
+  else
+    if R^.next # nil then
+      R^ := R^.next
+      Read(R, ch)
+    end
+  end
+end Read
+
+// Open reader R at position pos in text.
+procedure OpenReader*(R: pointer to Reader; text: Texts.Text; pos: int32)
+  var
+    m: Macro
+    nT: Texts.Text
+    beg: int32
+begin
+  newgc(R^)
+  R^.substitute := true
+  Texts.OpenReader(@R^.R, text, pos)
+  R^.text := text
+  R^.eot := R^.R.eot
+
+  // Reset all macros
+  m := macros
+  while m # nil do
+    m.handle(0X, R, @nT, @beg)
+    m := m.next
+  end
+end OpenReader
+
+// Return current position of Reader R in text R.text. Note that R.text may change as macro characters are being substituted.
+procedure Pos*(R: pointer to Reader): int32
+begin
+  return Texts.Pos(@R^.R)
+end Pos
+
+procedure IsAscii(ch: char): boolean
+begin
+  return (41H <= val(int32, band(ord(ch), 0DFH))) & (val(int32, band(ord(ch), 0DFH)) <= 5AH) or ("0" <= ch) & (ch <= "9") or (ch = "_") or (ch = ":") or (ch = "/") or (ch = ".") or (ch = "@") or (ch >= 80X) & (ch <= 96X)
+
+  // german characters
+end IsAscii
+
+// Open Scanner S at position pos in text T.
+procedure OpenScanner*(S: pointer to Scanner; T: Texts.Text; pos: int32)
+begin
+  S.R := nil
+  OpenReader(@S.R, T, pos)
+  Read(@S.R, @S.nextCh)
+end OpenScanner
+
+// Read the next symbol or object in the text. White space is ignored.
+procedure Scan*(S: pointer to Scanner)
+  const
+    maxD = 32
+  var
+    ch, E: char
+    neg, negE, hex, old: boolean
+    i, j, h: int8
+    e: int16
+    k: int32
+    y: longreal
+    d: array 32 (* maxD *) of char
+    k1, k2, k3: int32
+begin
+  ch := S.nextCh
+  i := 0
+  loop
+    if (S.R.lib # nil) & ~(S.R.lib is Fonts.Font) then
+      exit
+    elsif ch = CR then
+    elsif (ch # " ") & (ch # TAB) & (ch # LF) then
+      exit
+    end
+
+    Read(@S.R, @ch)
+    if S.R.eot then
+      exit
+    end
+  end
+
+  S.eot := S.R.eot
+  if S.eot then
+    S.class := Inval
+    return
+  end
+  if ~S.eot & ~(S.R.R.lib is Fonts.Font) then
+    S.R.R.lib.GetObj(S.R.R.lib, val(int16, ord(ch)), @S.o)
+    S.class := Obj
+    Read(@S.R, @ch)
+  elsif (41H <= val(int32, band(ord(ch), 0DFH))) & (val(int32, band(ord(ch), 0DFH)) <= 5AH) or (ch = "/") or (ch = ".") or (ch >= 80X) & (ch <= 96X) then
+    // OR (ch = ":")
+    // german characters
+    // name
+    old := S.R.substitute
+    repeat
+      S.s[i] := ch
+      inc(i)
+      Read(@S.R, @ch)
+    until ~IsAscii(ch) or (i = MaxLen - 1i2)
+
+    S.s[i] := 0X
+    if (i = 1) & ((val(int32, band(ord(S.s[0]), 0DFH)) < 41H) or (val(int32, band(ord(S.s[0]), 0DFH)) > 5AH)) then
+      S.c := S.s[0]
+      S.class := Char
+    else
+      S.len_ := i
+      S.class := Name
+    end
+
+  elsif ch = 22X then
+    // literal string
+    old := S.R.substitute
+    S.R.substitute := false
+    Read(@S.R, @ch)
+    while ~S.R.eot & (ch # 22X) & (ch >= " ") & (i < MaxLen - 1i2) do
+      S.s[i] := ch
+      inc(i)
+      Read(@S.R, @ch)
+    end
+
+    S.s[i] := 0X
+    S.len_ := i
+    Read(@S.R, @ch)
+    S.R.substitute := old
+    S.class := String
+  elsif ch = "'" then
+    // literal string with macro substition
+    // old := S.R.substitute; S.R.substitute := FALSE;
+    Read(@S.R, @ch)
+    while (ch # "'") & (ch >= " ") & (i < MaxLen - 1i2) do
+      S.s[i] := ch
+      inc(i)
+      Read(@S.R, @ch)
+    end
+
+    S.s[i] := 0X // S.R.substitute := old;
+    S.len_ := i
+    Read(@S.R, @ch)
+    S.class := String
+  else
+    if ch = "-" then
+      neg := true
+      Read(@S.R, @ch)
+    else
+      neg := false
+    end
+    if ("0" <= ch) & (ch <= "9") then
+      // number
+      hex := false
+      j := 0
+      loop
+        d[i] := ch
+        inc(i)
+        Read(@S.R, @ch)
+        if (ch < "0") or (i >= maxD) then
+          exit
+        end
+        if "9" < ch then
+          if ("A" <= ch) & (ch <= "F") then
+            hex := true
+            ch := chr(val(int16, ord(ch)) - 7)
+          elsif ("a" <= ch) & (ch <= "f") then
+            hex := true
+            ch := chr(val(int16, ord(ch)) - 39)
+          else
+            exit
+          end
+        end
+      end
+
+      if ch = "H" then
+        // hex number
+        Read(@S.R, @ch)
+        S.class := Int
+        if i - j > 8 then
+          j := i - 8
+        end
+        k := val(int32, val(int16, ord(d[j])) - 48)
+        inc(j)
+        if (i - j = 7) & (k >= 8) then
+          dec(k, 16)
+        end
+        while j < i do
+          k := k * 16 + val(int32, val(int16, ord(d[j])) - 48)
+          inc(j)
+        end
+        if neg then
+          S.i := -k
+        else
+          S.i := k
+        end
+      elsif ch = "." then
+        // read real
+        Read(@S.R, @ch)
+        h := i
+        while ("0" <= ch) & (ch <= "9") & (i <= maxD) do
+          d[i] := ch
+          inc(i)
+          Read(@S.R, @ch)
+        end
+        // -------- floating-point handling BM -----------------------------------
+        while band(i, 7) # 0 do
+          d[i] := "0"
+          inc(i)
+        end
+        j := 0 // store digits 0..7, 8..15, 16..23, 24..31 in k, k1, k2, k3
+        k := 0
+        k1 := 0
+        k2 := 0
+        k3 := 0
+        while j < 8 do
+          k := k * 10 + val(int32, ord(d[j])) - val(int32, ord("0"))
+          inc(j)
+        end
+        if 8 < i then
+          while j < 16 do
+            k1 := k1 * 10 + val(int32, ord(d[j])) - val(int32, ord("0"))
+            inc(j)
+          end
+        end
+
+        if 16 < i then
+          while j < 24 do
+            k2 := k2 * 10 + val(int32, ord(d[j])) - val(int32, ord("0"))
+            inc(j)
+          end
+        end
+
+        if 24 < i then
+          while j < 32 do
+            k3 := k3 * 10 + val(int32, ord(d[j])) - val(int32, ord("0"))
+            inc(j)
+          end
+        end
+
+        e := 0
+        E := ch
+        if (E = "D") or (E = "E") then
+          Read(@S.R, @ch)
+          if ch = "-" then
+            negE := true
+            Read(@S.R, @ch)
+          else
+            negE := false
+            if ch = "+" then
+              Read(@S.R, @ch)
+            end
+          end
+
+          while ("0" <= ch) & (ch <= "9") do
+            e := e * 10 + val(int16, ord(ch)) - val(int16, ord("0"))
+            Read(@S.R, @ch)
+          end
+          if negE then
+            e := -e
+          end
+        end
+
+        y := val(longreal, k3) * Reals.Ten(-32) + val(longreal, k2) * Reals.Ten(-24)
+        y := y + val(longreal, k1) * Reals.Ten(-16)
+        if abs(e + h) < 308 then
+          y := (y + val(longreal, k) * Reals.Ten(-8)) / Reals.Ten(-e - h)
+        else
+          y := (y + val(longreal, k) * Reals.Ten(-8)) * Reals.Ten(h)
+          if (e <= 308i2 - 32i2) or (e <= 308) & (y < 1.7976931348623157E308 / Reals.Ten(e)) then
+            y := y * Reals.Ten(e)
+          else
+            y := 1.7976931348623157E308
+          end
+        end
+
+        if E = "D" then
+          S.class := LongReal
+          if y = 1.7976931348623157E308 then
+            S.y := Reals.RealL(-1, -1)
+          elsif neg then
+            S.y := -y
+          else
+            S.y := y
+          end
+
+          if Reals.ExpoL(S.y) = 0 then
+            S.y := val(longreal, 0)
+          end
+        else
+          S.class := Real
+          if val(longreal, 3.40282347E38) < y then
+            S.x := Reals.Real(-1)
+          elsif neg then
+            S.x := val(real, -y)
+          else
+            S.x := val(real, y)
+          end
+
+          if Reals.Expo(S.x) = 0 then
+            S.x := val(real, 0)
+          end
+          if hex then
+            S.class := Inval
+          end
+        end
+
+      else
+        // decimal integer
+        S.class := Int
+        k := 0
+        repeat
+          k := k * 10 + val(int32, val(int16, ord(d[j])) - 48)
+          inc(j)
+        until j = i
+        if neg then
+          S.i := -k
+        else
+          S.i := k
+        end
+        if hex then
+          S.class := Inval
+        else
+          S.class := Int
+        end
+      end
+
+    else
+      S.class := Char
+      if neg then
+        S.c := "-"
+      else
+        S.c := ch
+        Read(@S.R, @ch)
+      end
+    end
+  end
+
+  S.nextCh := ch
+end Scan
+
+// Register a macro handler for a character. This handler is called when character ch is read using the reader/scanner, and must return a text with the substitution.
+procedure AddMacro*(ch: char; handler: MacroHandler)
+  var
+    M: Macro
+begin
+  newgc(M)
+  M.ch := ch
+  M.handle := handler
+  M.next := macros
+  macros := M
+end AddMacro
+
+procedure StandardMacros(ch: char; T: pointer to Reader; res: pointer to Texts.Text; beg: pointer to int32)
+  var
+    text: Texts.Text
+    bg, end_, time: int32
+begin
+  if ch = 0X then
+    // Reset
+    uparrowdone := false
+  elsif ch = "^" then
+    // getselection
+    if ~uparrowdone then
+      Oberon.GetSelection(@text, @bg, @end_, @time)
+      if time > 0 then
+        res^ := text
+        beg^ := bg
+      else
+        res^ := nil
+      end
+
+      uparrowdone := true
+    else
+      res^ := nil
+      beg^ := 0
+    end
+  end
+end StandardMacros
+
+// Attribute management
+
+// Store the atttribute list A.
+procedure StoreAttributes*(R: pointer to Files.Rider; A: Attr)
+begin
+  Files.Write(R, val(byte, ord("C"))) // magic number
+  while A # nil do
+    Files.WriteString(R, @A.name, 32)
+    case A of
+    | BoolAttr:
+      Files.Write(R, val(byte, Sboolean))
+      if A(BoolAttr).b then
+        Files.Write(R, val(byte, ord(1X)))
+      else
+        Files.Write(R, val(byte, ord(0X)))
+      end
+    | CharAttr:
+      Files.Write(R, val(byte, Schar))
+      Files.Write(R, val(byte, ord(A(CharAttr).c)))
+    | IntAttr:
+      Files.Write(R, val(byte, Sint))
+      Files.WriteLInt(R, A(IntAttr).i)
+    | RealAttr:
+      Files.Write(R, val(byte, Sreal))
+      Files.WriteLReal(R, A(RealAttr).r)
+    | StringAttr:
+      Files.Write(R, val(byte, Sstring))
+      Files.WriteString(R, @A(StringAttr).s, 64)
+    else
+      halt(42)
+    end
+
+    A := A.next
+  end
+
+  Files.Write(R, val(byte, ord(0X)))
+end StoreAttributes
+
+// Load attribute list resulting in a list A.
+procedure LoadAttributes*(R: pointer to Files.Rider; A: pointer to Attr)
+  var
+    ch: char
+    name: Objects.Name
+    b: BoolAttr
+    c: CharAttr
+    i: IntAttr
+    r: RealAttr
+    s: StringAttr
+    a, a0: Attr
+begin
+  A^ := nil
+  Files.Read(R, cast(BytePtr, @ch))
+  if ch = "C" then
+    // new format
+    Files.ReadString(R, @name, 32)
+    while name # "" do
+      Files.Read(R, cast(BytePtr, @ch))
+      if ord(ch) = Sboolean then
+        Files.Read(R, cast(BytePtr, @ch))
+        newgc(b)
+        copy(@b.name, @name, 32)
+        b.b := ch = 1X
+        a := b
+      elsif ord(ch) = Schar then
+        newgc(c)
+        copy(@c.name, @name, 32)
+        Files.Read(R, cast(BytePtr, @c.c))
+        a := c
+      elsif ord(ch) = Sint then
+        newgc(i)
+        copy(@i.name, @name, 32)
+        Files.ReadLInt(R, @i.i)
+        a := i
+      elsif ord(ch) = Sreal then
+        newgc(r)
+        copy(@r.name, @name, 32)
+        Files.ReadLReal(R, @r.r)
+        a := r
+      elsif ord(ch) = Sstring then
+        newgc(s)
+        copy(@s.name, @name, 32)
+        Files.ReadString(R, @s.s, 64)
+        a := s
+      else
+        halt(42)
+      end
+
+      if A^ = nil then
+        A^ := a
+        a0 := A^
+      else
+        a0.next := a
+        a0 := a
+      end
+      Files.ReadString(R, @name, 32)
+    end
+
+  elsif ch = "B" then
+    // just string format
+    Files.ReadString(R, @name, 32)
+    while name # "" do
+      newgc(s)
+      copy(@s.name, @name, 32)
+      Files.ReadString(R, @s.s, 64)
+      a := s
+      if A^ = nil then
+        A^ := a
+        a0 := A^
+      else
+        a0.next := a
+        a0 := a
+      end
+      Files.ReadString(R, @name, 32)
+    end
+
+  else
+    halt(42)
+  end
+end LoadAttributes
+
+// Copy an attribute list.
+procedure CopyAttributes*(in_: Attr; out: pointer to Attr)
+  var
+    A: Attr
+    b: BoolAttr
+    c: CharAttr
+    i: IntAttr
+    r: RealAttr
+    s: StringAttr
+    a, a0: Attr
+begin
+  A := in_
+  out^ := nil
+  while A # nil do
+    case A of
+    | BoolAttr:
+      newgc(b)
+      b^ := A(BoolAttr)^
+      a := b
+    | CharAttr:
+      newgc(c)
+      c^ := A(CharAttr)^
+      a := c
+    | IntAttr:
+      newgc(i)
+      i^ := A(IntAttr)^
+      a := i
+    | RealAttr:
+      newgc(r)
+      r^ := A(RealAttr)^
+      a := r
+    | StringAttr:
+      newgc(s)
+      s^ := A(StringAttr)^
+      a := s
+    else
+      halt(42)
+    end
+
+    if out^ = nil then
+      out^ := a
+      a0 := out^
+    else
+      a0.next := a
+      a0 := a
+    end
+    A := A.next
+  end
+end CopyAttributes
+
+// Insert an attribute in a list. An existing attribute with the same name is discarded.
+procedure InsertAttr*(list: pointer to Attr; const name: pointer to array of char; val_: Attr)
+  var
+    l, p0: Attr
+begin
+  if val_ # nil then
+    copy(@val_.name, name, 32)
+    val_.next := nil
+    if list^ = nil then
+      list^ := val_
+    else
+      p0 := nil
+      l := list^
+      while (l # nil) & (l.name # name^) do
+        p0 := l
+        l := l.next
+      end
+      if l = nil then
+        // at end of list
+        p0.next := val_
+      else
+        if p0 = nil then
+          // in beginning of list
+          val_.next := list^.next
+          list^ := val_
+        else
+          // in middle of list
+          p0.next := val_
+          val_.next := l.next
+        end
+      end
+    end
+  end
+end InsertAttr
+
+// Search for an attribute name in list.
+procedure FindAttr*(const name: pointer to array of char; list: Attr): Attr
+begin
+  while list # nil do
+    if name^ = list.name then
+      return list
+    end
+    list := list.next
+  end
+
+  return nil
+end FindAttr
+
+// Delete an attribute.
+procedure DeleteAttr*(list: pointer to Attr; const name: pointer to array of char)
+  var
+    a, p: Attr
+begin
+  a := list^
+  p := nil
+  while (a # nil) & (name^ # a.name) do
+    p := a
+    a := a.next
+  end
+  if a # nil then
+    // found
+    if p = nil then
+      // first
+      list^ := a.next
+    else
+      p.next := a.next
+    end
+  end
+end DeleteAttr
+
+// Write the attribute attr of object obj to the writer W. Format conversion to strings are automatic.
+procedure WriteAttr*(obj: Objects.Object; const attr: pointer to array of char; W: pointer to Texts.Writer)
+  var
+    A: Objects.AttrMsg
+    s: array 64 of char
+begin
+  if obj # nil then
+    A.id := Objects.get
+    copy(@A.name, attr, 32)
+    A.class := 0
+    A.res := -1
+    obj.handle(obj, @A)
+    if A.class # 0 then
+      if A.class = Objects.Bool then
+        Strings.BoolToStr(A.b, @s, 64)
+        Texts.WriteString(W, @s)
+      elsif A.class = Objects.Char then
+        Texts.Write(W, A.c)
+      elsif A.class = Objects.Int then
+        Strings.IntToStr(A.i, @s, 64)
+        Texts.WriteString(W, @s)
+      elsif A.class = Objects.Real then
+        Strings.RealToStr(val(longreal, A.x), @s, 64)
+        Texts.WriteString(W, @s)
+      elsif A.class = Objects.LongReal then
+        Strings.RealToStr(A.y, @s, 64)
+        Texts.WriteString(W, @s)
+      elsif A.class = Objects.String then
+        Texts.WriteString(W, @A.s)
+      end
+    end
+  end
+end WriteAttr
+
+(** GetXXX(obj: Objects.Object; name: ARRAY OF CHAR; VAR x: T);
+Retrieve object attribute name and convert it to type T.
+The following conversions are done by GetType:
+Type T Attribute classes converted
+
+Bool BOOLEAN Bool, String, Char
+Int LONGINT Int, String, Real, LongReal
+Real REAL Real, String, LongReal, Int
+LongReal LONGREAL LongReal, String, Real, Int
+String ARRAY OF CHAR String, Int, Bool, Real, LongReal, Bool
+*)
+
+procedure GetBool*(obj: Objects.Object; const name: pointer to array of char; b: pointer to boolean)
+  var
+    A: Objects.AttrMsg
+begin
+  b^ := false
+  if obj # nil then
+    A.id := Objects.get
+    A.res := -1
+    copy(@A.name, name, 32)
+    obj.handle(obj, @A)
+    if A.res = 0 then
+      case A.class of
+        7 (* Objects.Bool *):
+        b^ := A.b
+      | 2 (* Objects.String *):
+        Strings.StrToBool(@A.s, b)
+      | 6 (* Objects.Char *):
+        A.s[0] := A.c
+        A.s[1] := 0X
+        Strings.StrToBool(@A.s, b)
+      else
+      end
+    end
+  end
+end GetBool
+
+procedure GetInt*(obj: Objects.Object; const name: pointer to array of char; i: pointer to int32)
+  var
+    A: Objects.AttrMsg
+begin
+  i^ := 0
+  if obj # nil then
+    A.id := Objects.get
+    A.res := -1
+    copy(@A.name, name, 32)
+    obj.handle(obj, @A)
+    if A.res = 0 then
+      case A.class of
+        3 (* Objects.Int *):
+        i^ := A.i
+      | 2 (* Objects.String *):
+        Strings.StrToInt(@A.s, i)
+      | 4 (* Objects.Real *):
+        i^ := val(int32, floor(A.x))
+      | 5 (* Objects.LongReal *):
+        i^ := val(int32, floor(A.y))
+      else
+      end
+    end
+  end
+end GetInt
+
+procedure GetReal*(obj: Objects.Object; const name: pointer to array of char; x: pointer to real)
+  var
+    A: Objects.AttrMsg
+begin
+  x^ := 0.0
+  if obj # nil then
+    A.id := Objects.get
+    A.res := -1
+    copy(@A.name, name, 32)
+    obj.handle(obj, @A)
+    if A.res = 0 then
+      case A.class of
+        4 (* Objects.Real *):
+        x^ := A.x
+      | 2 (* Objects.String *):
+        Strings.StrToReal(@A.s, @A.y)
+        x^ := val(real, A.y)
+      | 5 (* Objects.LongReal *):
+        x^ := val(real, A.y)
+      | 3 (* Objects.Int *):
+        x^ := val(real, A.i)
+      else
+      end
+    end
+  end
+end GetReal
+
+procedure GetLongReal*(obj: Objects.Object; const name: pointer to array of char; y: pointer to longreal)
+  var
+    A: Objects.AttrMsg
+begin
+  y^ := val(longreal, 0.0)
+  if obj # nil then
+    A.id := Objects.get
+    A.res := -1
+    copy(@A.name, name, 32)
+    obj.handle(obj, @A)
+    if A.res = 0 then
+      case A.class of
+        5 (* Objects.LongReal *):
+        y^ := A.y
+      | 2 (* Objects.String *):
+        Strings.StrToReal(@A.s, y)
+      | 4 (* Objects.Real *):
+        y^ := val(longreal, A.x)
+      | 3 (* Objects.Int *):
+        y^ := val(longreal, A.i)
+      else
+      end
+    end
+  end
+end GetLongReal
+
+procedure GetString*(obj: Objects.Object; const name: pointer to array of char; s: pointer to array of char; s_len: int32)
+  var
+    A: Objects.AttrMsg
+begin
+  copy(s, "", s_len)
+  if obj # nil then
+    A.id := Objects.get
+    A.res := -1
+    copy(@A.name, name, 32)
+    obj.handle(obj, @A)
+    if A.res = 0 then
+      case A.class of
+        2 (* Objects.String *):
+        copy(s, @A.s, s_len)
+      | 3 (* Objects.Int *):
+        Strings.IntToStr(A.i, s, s_len)
+      | 7 (* Objects.Bool *):
+        Strings.BoolToStr(A.b, s, s_len)
+      | 4 (* Objects.Real *):
+        Strings.RealToStr(val(longreal, A.x), s, s_len)
+      | 5 (* Objects.LongReal *):
+        Strings.RealToStr(A.y, s, s_len)
+      | 6 (* Objects.Char *):
+        s[0] := A.c
+        s[1] := 0X
+      else
+      end
+    end
+  end
+end GetString
+
+(** SetXXX(obj: Objects.Object; name: ARRAY OF CHAR; x: T);
+Set object attribute name and convert it to the the attribute class understood by obj.
+The following conversions are done by SetType:
+Type T Attribute classes converted
+
+Bool BOOLEAN Bool, String, Char
+Int LONGINT Int, String, Real, LongReal
+Real REAL Real, String, LongReal, Int
+LongReal LONGREAL LongReal, String, Real, Int
+String ARRAY OF CHAR String, Int, Bool, Real, LongReal, Bool
+*)
+
+procedure SetBool*(obj: Objects.Object; const name: pointer to array of char; b: boolean)
+  var
+    A: Objects.AttrMsg
+begin
+  if obj # nil then
+    A.id := Objects.set_
+    A.res := -1
+    A.class := Objects.Bool
+    copy(@A.name, name, 32)
+    A.b := b
+    obj.handle(obj, @A)
+    if A.res # 0 then
+      A.id := Objects.get
+      obj.handle(obj, @A)
+      case A.class of
+        2 (* Objects.String *):
+        Strings.BoolToStr(b, @A.s, 64)
+      | 6 (* Objects.Char *):
+        Strings.BoolToStr(b, @A.s, 64)
+        A.c := A.s[0]
+      else
+        return
+      end
+
+      A.id := Objects.set_
+      obj.handle(obj, @A)
+    end
+  end
+end SetBool
+
+procedure SetInt*(obj: Objects.Object; const name: pointer to array of char; i: int32)
+  var
+    A: Objects.AttrMsg
+begin
+  if obj # nil then
+    A.id := Objects.set_
+    A.res := -1
+    A.class := Objects.Int
+    copy(@A.name, name, 32)
+    A.i := i
+    obj.handle(obj, @A)
+    if A.res # 0 then
+      A.id := Objects.get
+      obj.handle(obj, @A)
+      case A.class of
+        2 (* Objects.String *):
+        Strings.IntToStr(i, @A.s, 64)
+      | 4 (* Objects.Real *):
+        A.x := val(real, i)
+      | 5 (* Objects.LongReal *):
+        A.y := val(longreal, i)
+      else
+        return
+      end
+
+      A.id := Objects.set_
+      obj.handle(obj, @A)
+    end
+  end
+end SetInt
+
+procedure SetReal*(obj: Objects.Object; const name: pointer to array of char; x: real)
+  var
+    A: Objects.AttrMsg
+begin
+  if obj # nil then
+    A.id := Objects.set_
+    A.res := -1
+    A.class := Objects.Real
+    copy(@A.name, name, 32)
+    A.x := x
+    obj.handle(obj, @A)
+    if A.res # 0 then
+      A.id := Objects.get
+      obj.handle(obj, @A)
+      case A.class of
+        2 (* Objects.String *):
+        Strings.RealToStr(val(longreal, x), @A.s, 64)
+      | 3 (* Objects.Int *):
+        A.i := val(int32, floor(x))
+      | 5 (* Objects.LongReal *):
+        A.y := val(longreal, x)
+      else
+        return
+      end
+
+      A.id := Objects.set_
+      obj.handle(obj, @A)
+    end
+  end
+end SetReal
+
+procedure SetLongReal*(obj: Objects.Object; const name: pointer to array of char; y: longreal)
+  var
+    A: Objects.AttrMsg
+begin
+  if obj # nil then
+    A.id := Objects.set_
+    A.res := -1
+    A.class := Objects.LongReal
+    copy(@A.name, name, 32)
+    A.y := y
+    obj.handle(obj, @A)
+    if A.res # 0 then
+      A.id := Objects.get
+      obj.handle(obj, @A)
+      case A.class of
+        2 (* Objects.String *):
+        Strings.RealToStr(y, @A.s, 64)
+      | 3 (* Objects.Int *):
+        A.i := val(int32, floor(y))
+      | 4 (* Objects.Real *):
+        A.x := val(real, y)
+      else
+        return
+      end
+
+      A.id := Objects.set_
+      obj.handle(obj, @A)
+    end
+  end
+end SetLongReal
+
+procedure SetString*(obj: Objects.Object; const name, s: pointer to array of char)
+  var
+    A: Objects.AttrMsg
+begin
+  if obj # nil then
+    A.id := Objects.set_
+    A.res := -1
+    A.class := Objects.String
+    copy(@A.name, name, 32)
+    copy(@A.s, s, 64)
+    obj.handle(obj, @A)
+    if A.res # 0 then
+      A.id := Objects.get
+      obj.handle(obj, @A)
+      case A.class of
+        3 (* Objects.Int *):
+        Strings.StrToInt(s, @A.i)
+      | 7 (* Objects.Bool *):
+        Strings.StrToBool(s, @A.b)
+      | 4 (* Objects.Real *):
+        Strings.StrToReal(s, @A.y)
+        A.x := val(real, A.y)
+      | 5 (* Objects.LongReal *):
+        Strings.StrToReal(s, @A.y)
+      | 6 (* Objects.Char *):
+        A.c := A.s[0]
+      else
+        return
+      end
+
+      A.id := Objects.set_
+      obj.handle(obj, @A)
+    end
+  end
+end SetString
+
+// Write all parameters of command.
+procedure Echo*()
+  var
+    r: Texts.Reader
+    ch: char
+begin
+  Texts.OpenReader(@r, Oberon.Par.text, Oberon.Par.pos)
+  Texts.Read(@r, @ch)
+  if ch = " " then
+    Texts.Read(@r, @ch)
+  end
+  while ~r.eot & (ch # "~") do
+    Texts.Write(@W, ch)
+    Texts.Read(@r, @ch)
+  end
+
+  Texts.WriteLn(@W)
+  Texts.Append(Oberon.Log, W.buf)
+end Echo
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Echo" end return Echo end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Attributes", cmd_)
+  Texts.OpenWriter(@W)
+  AddMacro("^", StandardMacros)
+end Attributes.

@@ -1,0 +1,606 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module ColorTools [level=5]
+
+import Objects, Gadgets, Effects, Display, Display3, Oberon, Files, Input, Texts, Views, Printer, Printer3, Modules
+// portable
+// jm 19.1.95
+
+// ColorPicker implementation
+(*
+jm 1.3.93 - fixed selection
+- increased size of command string
+25.7.94 - added ChangeColor command
+*)
+
+const
+  VersionNo = 2
+  ModName = "ColorTools"
+
+type
+  ColorPicker* = pointer to ColorPickerDesc
+  ColorPickerDesc* = object (Gadgets.FrameDesc)
+    cmd*: array 64 of char // Cmd attribute
+    colors*: array 256 of int16 // colors to be displayed
+    col*: int16 // last color to be picked
+  end
+
+var
+  W: Texts.Writer
+
+// --- Version check ---
+
+procedure WriteVersion(R: pointer to Files.Rider)
+begin
+  Files.WriteNum(R, VersionNo)
+end WriteVersion
+
+// ----------- Color Picker ----------
+
+procedure Parse(s: pointer to array of char; n: pointer to int16; values: pointer to array of int16)
+  var
+    i: int16
+    val_: int32
+    neg: boolean
+begin
+  n^ := 0
+  i := 0
+  loop
+    while (s[i] # 0X) & (s[i] <= " ") do
+      inc(i)
+    end
+    if s[i] = 0X then
+      exit
+    end
+    if s[i] = "-" then
+      inc(i)
+      neg := true
+    else
+      neg := false
+    end
+    if (s[i] >= "0") & (s[i] <= "9") then
+      val_ := 0
+      while (s[i] >= "0") & (s[i] <= "9") do
+        val_ := val_ * 10 + val(int32, ord(s[i])) - val(int32, ord("0"))
+        inc(i)
+      end
+      if neg then
+        val_ := -val_
+      end
+      if val_ < -127 then
+        val_ := -127
+      elsif val_ > 255 then
+        val_ := 255
+      end
+
+      values[n^] := abs(val(int16, val_))
+      inc(n^)
+    else
+      exit
+    end
+  end
+end Parse
+
+procedure Unparse(n: int16; values: pointer to array of int16; s: pointer to array of char)
+  var
+    i, j: int16
+
+  procedure Out(i: int32; j: pointer to int16; s: pointer to array of char)
+    var
+      k: int16
+      x0: int32
+      a: array 10 of char
+  begin
+    k := 0
+    if i < 0 then
+      x0 := -i
+    else
+      x0 := i
+    end
+
+    repeat
+      a[k] := chr(obmod(x0, 10) + 48)
+      x0 := obdiv(x0, 10)
+      inc(k)
+    until x0 = 0
+
+    if i < 0 then
+      s[j^] := "-"
+      inc(j^)
+    end
+    repeat
+      dec(k)
+      s[j^] := a[k]
+      inc(j^)
+    until k = 0
+    s[j^] := " "
+    inc(j^)
+  end Out
+begin
+  j := 0
+  i := 0
+  while i < n do
+    Out(values[i], @j, s)
+    inc(i)
+  end
+  s[j] := 0X
+end Unparse
+
+procedure ColorPickerAttr(F: ColorPicker; M: pointer to Objects.AttrMsg)
+  var
+    n: int16
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "ColorTools.NewColorPicker", 64)
+      M.res := 0
+    elsif M.name = "Cmd" then
+      M.class := Objects.String
+      copy(@M.s, @F.cmd, 64)
+      M.res := 0
+    elsif M.name = "Col" then
+      M.class := Objects.Int
+      M.i := F.col
+      M.res := 0
+    elsif M.name = "Colors" then
+      M.class := Objects.String
+      Unparse(16, @F.colors, @M.s)
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Cmd" then
+      if M.class = Objects.String then
+        copy(@F.cmd, @M.s, 64)
+        M.res := 0
+      end
+    elsif M.name = "Col" then
+      if M.class = Objects.Int then
+        F.col := val(int16, M.i)
+        M.res := 0
+      end
+    elsif M.name = "Colors" then
+      if M.class = Objects.String then
+        Parse(@M.s, @n, @F.colors)
+        while n < 256 do
+          F.colors[n] := n
+          inc(n)
+        end
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Colors")
+    M.Enum("Col")
+    M.Enum("Cmd")
+    Gadgets.framehandle(F, M)
+  end
+end ColorPickerAttr
+
+procedure Grid(F: ColorPicker; R: Display3.Mask; b, x, y: int16)
+  var
+    i, j, c, max_: int16
+begin
+  if Display.Depth(0) >= 8 then
+    max_ := 16
+  else
+    max_ := 4
+  end
+  c := 0
+  j := max_ - 1
+  while j >= 0 do
+    i := 0
+    while i < max_ do
+      Display3.ReplConst(R, F.colors[c], x + i * b, y + j * b, b, b, Display.replace)
+      inc(i)
+      inc(c)
+    end
+    dec(j)
+  end
+end Grid
+
+procedure ClipAgainst(x, y, w, h: pointer to int16; x1, y1, w1, h1: int16)
+  var
+    r, t, r1, t1: int16
+begin
+  r := x^ + w^ - 1
+  r1 := x1 + w1 - 1
+  t := y^ + h^ - 1
+  t1 := y1 + h1 - 1
+  if x^ < x1 then
+    x^ := x1
+  end
+  if y^ < y1 then
+    y^ := y1
+  end
+  if r > r1 then
+    r := r1
+  end
+  if t > t1 then
+    t := t1
+  end
+  w^ := r - x^ + 1
+  h^ := t - y^ + 1
+end ClipAgainst
+
+procedure PickColor(F: ColorPicker; x, y, w, h: int16; M: pointer to Oberon.InputMsg)
+  var
+    bw, bw4: int16
+    keys, keysum: set
+    X, Y, i, j, li, lj, ofs, px, py, b, max_: int16
+    block: Views.Block
+
+  procedure Cell(X, Y: int16; i, j: pointer to int16; b: pointer to int16; bw: pointer to int16; ofs: pointer to int16; x: pointer to int16; y: pointer to int16)
+  begin
+    if Effects.Inside(X, Y, x^ + 2, y^ + 2 + ofs^, bw^, bw^) then
+      i^ := obdiv(X - x^ - 2, b^)
+      j^ := obdiv(Y - (y^ + 2 + ofs^), b^)
+    else
+      i^ := -1
+      j^ := -1
+    end
+  end Cell
+
+  procedure Highlight(colno, i, j: int16; F: pointer to ColorPicker; b: pointer to int16; block: pointer to Views.Block; ofs: pointer to int16; x: pointer to int16; y: pointer to int16)
+  begin
+    if i >= 0 then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      Display3.Rect(block.mask, F^.colors[colno], Display.solid, x^ + 2 + i * b^, y^ + 2 + ofs^ + j * b^, b^, b^, 1, Display.replace)
+    end
+  end Highlight
+
+  procedure CalcPlace(px, py: pointer to int16; bw4: pointer to int16; h: pointer to int16; x: pointer to int16; y: pointer to int16)
+    var
+      cx: int16 // clipping area
+      cy, cw, ch: int16
+      f: Objects.Object
+  begin
+    cx := 0
+    cy := 0
+    cw := Display.Width
+    ch := Display.Height
+    f := Gadgets.context
+    while f # nil do
+      case f of
+      | Gadgets.View:
+        ClipAgainst(@cx, @cy, @cw, @ch, f.absX, f.absY, f.W, f.H)
+
+      end
+
+      f := f.dlink
+    end
+
+    px^ := x^
+    py^ := y^ + h^ - (bw4^ - 1)
+    if px^ < cx then
+      px^ := cx
+    end
+    if px^ + bw4^ >= cx + cw then
+      px^ := cx + cw - 1 - bw4^
+    end
+    if py^ < cy then
+      py^ := cy
+    end
+    if py^ + bw4^ >= cy + ch then
+      py^ := cy + ch - 1 - bw4^
+    end
+  end CalcPlace
+begin
+  if Display.Depth(0) >= 8 then
+    bw := 112
+    max_ := 16
+  else
+    bw := 80
+    max_ := 4
+  end
+  bw4 := bw + 4
+  b := obdiv(bw, max_)
+  CalcPlace(@px, @py, @bw4, @h, @x, @y)
+  ofs := 0
+  x := px
+  y := py
+  Oberon.RemoveMarks(x, y + ofs, bw4, bw4)
+  Views.GetBlock(x, y + ofs, bw4, bw4, M.dlink, @block)
+
+  Display3.ReplConst(block.mask, Display3.black, x, y + ofs, bw4, bw4, Display.replace)
+  Grid(F, block.mask, b, x + 2, y + 2 + ofs)
+  Input.Mouse(@keys, @X, @Y)
+  keysum := keys
+  Cell(X, Y, @li, @lj, @b, @bw, @ofs, @x, @y)
+  Highlight(15, li, lj, @F, @b, @block, @ofs, @x, @y)
+  while keys # {} do
+    Input.Mouse(@keys, @X, @Y)
+    Cell(X, Y, @i, @j, @b, @bw, @ofs, @x, @y)
+    if (i # li) or (j # lj) then
+      Highlight(li + (max_ - 1 - lj) * max_, li, lj, @F, @b, @block, @ofs, @x, @y)
+      li := i
+      lj := j
+      Highlight(15, li, lj, @F, @b, @block, @ofs, @x, @y)
+    end
+
+    keysum := keysum + keys
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, X, Y)
+  end
+
+  Highlight(li + (max_ - 1 - lj) * max_, li, lj, @F, @b, @block, @ofs, @x, @y)
+  Oberon.RemoveMarks(x, y + ofs, bw4, bw4)
+  Views.RestoreBlock(block)
+  if (keysum = {1}) & (i >= 0) then
+    F.col := F.colors[li + (max_ - 1 - lj) * max_]
+    if F.cmd[0] # 0X then
+      Gadgets.Execute(@F.cmd, F, M.dlink, nil, nil)
+    end
+  end
+end PickColor
+
+procedure RestoreColorPicker(R: Display3.Mask; F: ColorPicker; x, y, w, h: int16)
+  var
+    b, max_: int16
+begin
+  if Display.Depth(0) >= 8 then
+    max_ := 16
+  else
+    max_ := 4
+  end
+  b := obdiv(w - 4, max_)
+  Display3.ReplConst(R, Display3.black, x, y, w, h, Display.replace)
+  Grid(F, R, b, x + 2, y + 2)
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, 0, 0, x, y, w, h, Display.paint)
+  end
+end RestoreColorPicker
+
+procedure PrintColorPicker(F: ColorPicker; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask
+    x, y, w, h, b, i, j, c, max_: int16
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  Printer3.ReplConst(R, Display3.black, x, y, w, h, Display.replace)
+  if Display.Depth(0) >= 8 then
+    max_ := 16
+  else
+    max_ := 4
+  end
+  b := obdiv(F.W - 4, max_)
+  x := M.x + P(2)
+  y := M.y + P(2)
+  c := 0
+  j := max_ - 1
+  while j >= 0 do
+    i := 0
+    while i < max_ do
+      Printer3.ReplConst(R, F.colors[c], x + P(i * b), y + P(j * b), P(b), P(b), Display.replace)
+      inc(i)
+      inc(c)
+    end
+    dec(j)
+  end
+end PrintColorPicker
+
+procedure CopyColorPicker*(M: pointer to Objects.CopyMsg; from, to_: ColorPicker)
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  to_.col := from.col
+  copy(@to_.cmd, @from.cmd, 64)
+  to_.colors := from.colors
+end CopyColorPicker
+
+procedure ColorPickerHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h, u, v: int16
+    F0: ColorPicker
+    R: Display3.Mask
+    ver: int32
+begin
+  case F of
+  | ColorPicker:
+    case M of
+    | Objects.PAttrMsg:
+      ColorPickerAttr(F, M)
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        WriteVersion(@M.R)
+        Files.WriteString(@M.R, @F.cmd, 64)
+        x := 0
+        while x < 256 do
+          Files.WriteInt(@M.R, F.colors[x])
+          inc(x)
+        end
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if ver = 1 then
+          Files.ReadString(@M.R, @F.cmd, 64)
+          Gadgets.framehandle(F, M)
+        elsif ver = VersionNo then
+          Files.ReadString(@M.R, @F.cmd, 64)
+          x := 0
+          while x < 256 do
+            Files.ReadInt(@M.R, @F.colors[x])
+            if F.colors[x] < 0 then
+              F.colors[x] := x
+            end
+            inc(x)
+          end
+
+          Gadgets.framehandle(F, M)
+        else
+          Texts.WriteString(@W, "Version ")
+          Texts.WriteInt(@W, VersionNo, 3)
+          Texts.WriteString(@W, " of ")
+          Texts.WriteString(@W, ModName)
+          Texts.WriteString(@W, " cannot read version ")
+          Texts.WriteInt(@W, ver, 3)
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+          halt(99)
+        end
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyColorPicker(M, F, F0)
+        M.obj := F0
+      end
+
+    | Display.PFrameMsg:
+      x := M.x + F.X // calculate actual coordinates
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      u := M.x // store volatile info
+      v := M.y
+      M1 := M
+      case M1 of
+      | Display.PDisplayMsg:
+        if M1.device = Display.screen then
+          if (M1.F = nil) or (M1.id = Display.full) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            RestoreColorPicker(R, F, x, y, w, h)
+          elsif (M1.id = Display.area) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            Display3.AdjustMask(R, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+            RestoreColorPicker(R, F, x, y, w, h)
+          end
+
+        elsif M1.device = Display.printer then
+          PrintColorPicker(F, M1)
+        end
+
+      | Oberon.PInputMsg:
+        if ~(Gadgets.selected in F.state) then
+          if (M1.id = Oberon.track) & (M1.keys = {1}) & Gadgets.InActiveArea(F, M1) then
+            PickColor(F, x, y, w, h, M1)
+            M1.res := 0
+          else
+            Gadgets.framehandle(F, M1)
+          end
+        end
+
+      else
+        Gadgets.framehandle(F, M1)
+      end
+
+      M.x := u // restore volatile info
+      M.y := v
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end ColorPickerHandler
+
+procedure InitColorPicker*(F: ColorPicker)
+  var
+    i: int16
+begin
+  F.W := 32i1 + 4i1
+  F.H := 32i1 + 4i1
+  F.col := 15
+  F.state := {Gadgets.lockedsize}
+  F.handle := ColorPickerHandler
+  copy(@F.cmd, "ColorTools.ChangeColor #Col ~", 64)
+  i := 0
+  while i < 256 do
+    F.colors[i] := i
+    inc(i)
+  end
+end InitColorPicker
+
+procedure NewColorPicker*()
+  var
+    F: ColorPicker
+begin
+  newgc(F)
+  InitColorPicker(F)
+  Objects.NewObj := F
+end NewColorPicker
+
+(** Used in the form:
+
+ColorTools.ChangeColor <colno>
+
+Change the color of the selected text or the selected gadgets.
+*)
+procedure ChangeColor*()
+  var
+    col: int16
+    S: Texts.Scanner
+    MOS: Display.SelectMsg
+    MTS: Oberon.SelectMsg
+    MA: Objects.AttrMsg
+    MU: Gadgets.UpdateMsg
+    obj: Objects.Object
+begin
+  Texts.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Texts.Scan(@S)
+  col := val(int16, S.i)
+  MOS.id := Display.get
+  MOS.time := -1
+  MOS.F := nil
+  MOS.obj := nil
+  MTS.id := Oberon.get
+  MTS.time := -1
+  MTS.F := nil
+  MTS.sel := nil
+  MTS.text := nil
+  Display.Broadcast(@MOS)
+  Display.Broadcast(@MTS)
+  if (MTS.time # -1) & ((MOS.time - MTS.time < 0) or (MOS.time = -1)) then
+    Texts.ChangeLooks(MTS.text, MTS.beg, MTS.end_, {1}, nil, val(int8, col), 0)
+  elsif (MOS.time # -1) & ((MTS.time - MOS.time < 0) or (MTS.time = -1)) & (MOS.obj # nil) then
+    obj := MOS.obj
+    while obj # nil do
+      MA.id := Objects.set_
+      copy(@MA.name, "Color", 32)
+      MA.class := Objects.Int
+      MA.i := col
+      MA.res := -1
+      obj.handle(obj, @MA)
+      obj := obj.slink
+    end
+
+    MU.obj := MOS.obj
+    MU.F := nil
+    Display.Broadcast(@MU)
+  end
+end ChangeColor
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewColorPicker" end return NewColorPicker end
+  if i = 1 then if name # nil then name^ := "ChangeColor" end return ChangeColor end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("ColorTools", cmd_)
+  Texts.OpenWriter(@W)
+end ColorTools.

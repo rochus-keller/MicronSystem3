@@ -1,0 +1,607 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module ColorWells [level=5]
+
+import Files, Objects, Display, Input, Printer, Oberon, Display3, Printer3, Effects, Gadgets, Views, Modules
+// eos   *
+
+(**
+Color wells are gadgets for visualizing a current color value. Unlike color pickers, they support a model object
+and have drag_and_drop capabilities.
+**)
+
+(*
+17.7.96 - Initial version
+23.7.96 - increased border width (suggested by ps)
+23.1.97 - eliminated Display.PrintMsg
+16.2.98 - made load more tolerant by allowing version numbers > 1
+27.3.98 - included color picker functionality when ML is pressed (procedure TrackColor)
+27.3.98 - added "TargetAttr" for selecting which attribute to change when drag-and-dropping (suggested by pm)
+6.5.98 - made MM+ML behaviour the same as ML alone to allow editing within document title bars
+*)
+
+const
+  ML = 2 // mouse buttons
+  MM = 1
+  MR = 0
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  ColorWell* = pointer to ColorWellDesc
+  ColorWellDesc* = object (Gadgets.FrameDesc)
+    col*: int16 // current value *
+  end
+
+var
+  DragColor: Oberon.Marker
+  FGPattern, BGPattern: AnyPtr
+
+// --- Drag Marker ---
+
+procedure DrawMarker(x, y: int16)
+begin
+  dec(x, 3)
+  dec(y)
+  Effects.OpenCursor(x, y, 16, 17)
+  Display.CopyPattern(Display3.white, BGPattern, x, y, Display.paint)
+  Display.CopyPattern(Display3.black, FGPattern, x, y, Display.paint)
+end DrawMarker
+
+procedure FadeMarker(x, y: int16)
+begin
+  Effects.CloseCursor()
+end FadeMarker
+
+procedure InitMarker()
+  var
+    p: array 17 of set
+begin
+  p[0] := {}
+  p[1] := {1,2,5,6}
+  p[2] := {3,4}
+  p[3] := {3,4,9,10}
+  p[4] := {3,4,8,11}
+  p[5] := {3,4,7,12}
+  p[6] := {3,4,6,13}
+  p[7] := {3..5,14}
+  p[8] := {3,4,9,14}
+  p[9] := {3..5,8,10,13}
+  p[10] := {4..6,9,12}
+  p[11] := {6,7,9,11,13}
+  p[12] := {8..10,12}
+  p[13] := {9,12}
+  p[14] := {9,12}
+  p[15] := {10,11}
+  p[16] := {}
+  FGPattern := Display.NewPattern(16, 17, @p)
+  p[0] := {1..6}
+  p[1] := {0..7}
+  p[2] := {2..5}
+  p[3] := {2..5,8..11}
+  p[4] := {2..5,7..12}
+  p[5] := {2..13}
+  p[6] := {2..7,12..14}
+  p[7] := {2..6,13..15}
+  p[8] := {2..5,8..10,13..15}
+  p[9] := {2..14}
+  p[10] := {3..13}
+  p[11] := {5..14}
+  p[12] := {7..13}
+  p[13] := {8..13}
+  p[14] := {8..13}
+  p[15] := {9..12}
+  p[16] := {10,11}
+  BGPattern := Display.NewPattern(16, 17, @p)
+  DragColor.Draw := DrawMarker
+  DragColor.Fade := FadeMarker
+end InitMarker
+
+// --- Color Wells ---
+
+procedure TrackColor(well: ColorWell; fx, fy: int16; msg: pointer to Oberon.InputMsg)
+
+  const
+    highlightCol = 0
+    borderCol = 15
+    border = 3
+    size_ = 6i1
+    ww = 16i1 * size_
+    hh = 16i1 * size_
+
+  var
+    cx, cy, cw, ch: int16
+    ctxt: Objects.Object
+    view: Gadgets.View
+    col, xx, yy, y, c, x, mx, my: int16
+    block: Views.Block
+    keysum, keys: set
+    am: Objects.AttrMsg
+
+  procedure frameCol(no, drawCol: int16; block: pointer to Views.Block; xx: pointer to int16; yy: pointer to int16)
+    var
+      xc, yc: int16
+  begin
+    if no >= 0 then
+      xc := xx^ + band(no, 15) * size_
+      yc := yy^ + hh - (1 + asr(no, 4)) * size_
+      Display3.Rect(block.mask, drawCol, Display.solid, xc, yc, size_, size_, 1, Display.replace)
+    end
+  end frameCol
+begin
+  // get clip rectangle
+  cx := Display.ColLeft
+  cy := Display.Bottom
+  cw := Display.Width
+  ch := Display.Height
+  ctxt := msg.dlink
+  while ctxt # nil do
+    case ctxt of
+    | Gadgets.View:
+      view := ctxt(Gadgets.View)
+      if cx < view.absX then
+        dec(cw, view.absX - cx)
+        cx := view.absX
+      end
+      if cx + cw > view.absX + view.W then
+        cw := view.absX + view.W - cx
+      end
+      if cy < view.absY then
+        dec(ch, view.absY - cy)
+        cy := view.absY
+      end
+      if cy + ch > view.absY + view.H then
+        ch := view.absY + view.H - cy
+      end
+    end
+
+    ctxt := ctxt.dlink
+  end
+
+  // calculate origin for color grid
+  col := well.col
+  xx := msg.X - size_ div 2i1 - band(col, 15) * size_
+  yy := msg.Y - size_ div 2i1 - (15 - asr(col, 4)) * size_
+  if xx - border < cx then
+    xx := cx + border
+  elsif xx + ww + border > cx + cw then
+    xx := cx + cw - ww - border
+  end
+
+  if yy - border < cy then
+    yy := cy + border
+  elsif yy + hh + border > cy + ch then
+    yy := cy + ch - hh - border
+  end
+
+  // save area and draw color grid on top of it
+  Oberon.RemoveMarks(xx - border, yy - border, ww + 2i1 * border, hh + 2i1 * border)
+  Views.GetBlock(xx - border, yy - border, ww + 2i1 * border, hh + 2i1 * border, msg.dlink, @block)
+  y := yy + hh
+  c := 0
+  Display3.ReplConst(block.mask, borderCol, xx - border, y, ww + 2i1 * border, border, Display.replace)
+  Display3.ReplConst(block.mask, borderCol, xx - border, yy, border, hh, Display.replace)
+  Display3.ReplConst(block.mask, borderCol, xx + ww, yy, border, hh, Display.replace)
+  Display3.ReplConst(block.mask, borderCol, xx - border, yy - border, ww + 2i1 * border, border, Display.replace)
+  while y > yy do
+    dec(y, size_)
+    x := xx
+    while x < xx + ww do
+      Display3.ReplConst(block.mask, c, x, y, size_, size_, Display.replace)
+      inc(x, size_)
+      inc(c)
+    end
+  end
+
+  // track and highlight color under mouse
+  frameCol(col, highlightCol, @block, @xx, @yy)
+  mx := msg.X
+  my := msg.Y
+  keysum := msg.keys
+  Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, mx, my)
+  repeat
+    Input.Mouse(@keys, @x, @y)
+    keysum := keysum + keys
+    if (keys # {}) & ((x # mx) or (y # my)) then
+      if Effects.Inside(x, y, xx, yy, ww, hh) then
+        c := obdiv(yy + hh - 1 - y, size_) * 16 + obdiv(x - xx, size_)
+      else
+        c := -1
+      end
+
+      if c # col then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        frameCol(col, col, @block, @xx, @yy)
+        frameCol(c, highlightCol, @block, @xx, @yy)
+        col := c
+      end
+
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, x, y)
+      mx := x
+      my := y
+    end
+  until keys = {}
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+  frameCol(col, col, @block, @xx, @yy)
+
+  if (keysum # {ML,MM,MR}) & (col >= 0) then
+    well.col := col // set before restoring block
+  end
+
+  Views.RestoreBlock(block)
+  if (keysum # {ML,MM,MR}) & (col >= 0) then
+    // now make sure that model is updated
+    am.id := Objects.set_
+    copy(@am.name, "Color", 32)
+    am.class := Objects.Int
+    am.i := col
+    am.res := -1
+    well.handle(well, @am)
+    Gadgets.Update(well)
+  end
+
+  Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, x, y)
+end TrackColor
+
+procedure TrackMiddle(well: ColorWell; fx, fy: int16; msg: pointer to Oberon.InputMsg)
+
+  var
+    marker: Oberon.Marker
+    mask: Display3.Mask
+    keysum, keys: set
+    x, y, u, v: int16
+    frame: Display.Frame
+    am: Objects.AttrMsg
+begin
+  marker := Effects.Arrow
+  Oberon.FadeCursor(@Oberon.Mouse)
+  Gadgets.MakeMask(well, fx, fy, msg.dlink, @mask)
+  Display3.Rect3D(mask, Display3.bottomC, Display3.topC, fx, fy, well.W, well.H, 1, Display.replace)
+  keysum := msg.keys
+  Input.Mouse(@keys, @x, @y)
+  Oberon.DrawCursor(@Oberon.Mouse, @marker, x, y)
+  while (keys # {}) & (keysum # {ML,MM}) do
+    if keys - keysum # {} then
+      // new key pressed
+      keysum := keysum + keys
+      if keysum = {ML,MM,MR} then
+        marker := Effects.Arrow
+      else
+        marker := DragColor
+      end
+
+      Oberon.FadeCursor(@Oberon.Mouse)
+      Display3.Rect3D(mask, Display3.topC, Display3.bottomC, fx, fy, well.W, well.H, 1, Display.replace)
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @marker, x, y)
+    Input.Mouse(@keys, @x, @y)
+  end
+
+  if keysum = {ML,MM} then
+    Display3.Rect3D(mask, Display3.topC, Display3.bottomC, fx, fy, well.W, well.H, 1, Display.replace)
+    TrackColor(well, fx, fy, msg)
+  elsif keysum = {MM} then
+    Oberon.FadeCursor(@Oberon.Mouse)
+    Gadgets.ExecuteAttr(well, "Cmd", msg.dlink, nil, nil)
+    Display3.Rect3D(mask, Display3.topC, Display3.bottomC, fx, fy, well.W, well.H, 1, Display.replace)
+  elsif keysum = {MM,MR} then
+    Gadgets.ThisFrame(x, y, @frame, @u, @v)
+    if frame # nil then
+      am.id := Objects.get
+      copy(@am.name, "TargetAttr", 32)
+      am.res := -1
+      well.handle(well, @am)
+      if (am.res >= 0) & (am.class = Objects.String) & (am.s # "") then
+        copy(@am.name, @am.s, 32)
+      else
+        copy(@am.name, "Color", 32)
+      end
+
+      am.id := Objects.set_
+      am.class := Objects.Int
+      am.i := well.col
+      am.res := -1
+      frame.handle(frame, @am)
+      if am.res >= 0 then
+        Gadgets.Update(frame)
+      end
+    end
+  end
+
+  Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, x, y)
+end TrackMiddle
+
+procedure Restore(well: ColorWell; fx, fy: int16; mask: Display3.Mask)
+  var
+    w, h: int16
+begin
+  w := well.W
+  h := well.H
+  Oberon.RemoveMarks(fx, fy, w, h)
+  Display3.Rect3D(mask, Display3.topC, Display3.bottomC, fx, fy, w, h, 1, Display.replace)
+  Display3.Rect3D(mask, Display3.groupC, Display3.groupC, fx + 1, fy + 1, w - 2, h - 2, 1, Display.replace)
+  Display3.FilledRect3D(mask, Display3.bottomC, Display3.topC, well.col, fx + 2, fy + 2, w - 4, h - 4, 1, Display.replace)
+  if Gadgets.selected in well.state then
+    Display3.FillPattern(mask, Display3.white, Display3.selectpat, fx, fy, fx, fy, w, h, Display.paint)
+  end
+end Restore
+
+procedure DisplayWell(well: ColorWell; fx, fy: int16; msg: pointer to Display.DisplayMsg)
+
+  var
+    mask: Display3.Mask
+    x, y, w, h, one, two: int16
+
+  procedure P(x: int32): int16
+  begin
+    return val(int16, obdiv(x * val(int32, 10000), Printer.Unit))
+  end P
+begin
+  if msg.device = Display.screen then
+    if (msg.id = Display.full) or (msg.F = nil) then
+      Gadgets.MakeMask(well, fx, fy, msg.dlink, @mask)
+      Restore(well, fx, fy, mask)
+    elsif msg.id = Display.area then
+      Gadgets.MakeMask(well, fx, fy, msg.dlink, @mask)
+      Display3.AdjustMask(mask, fx + msg.u, fy + well.H - 1 + msg.v, msg.w, msg.h)
+      Restore(well, fx, fy, mask)
+    end
+
+  elsif msg.device = Display.printer then
+    Gadgets.MakePrinterMask(well, msg.x, msg.y, msg.dlink, @mask)
+    x := msg.x
+    y := msg.y
+    w := P(well.W)
+    h := P(well.H)
+    one := P(1)
+    two := P(2)
+    Printer3.Rect3D(mask, Display3.topC, Display3.bottomC, x, y, w, h, one, Display.replace)
+    Printer3.FilledRect3D(mask, Display3.bottomC, Display3.topC, well.col, x + one, y + one, w - two, h - two, one, Display.replace)
+  end
+end DisplayWell
+
+procedure Field(frame: Gadgets.Frame; name: pointer to array of char; name_len: int32)
+  var
+    am: Objects.AttrMsg
+begin
+  am.id := Objects.get
+  copy(@am.name, "Field", 32)
+  am.res := -1
+  frame.handle(frame, @am)
+  if (am.res >= 0) & (am.class = Objects.String) & (am.s # "") then
+    copy(name, @am.s, name_len)
+  else
+    copy(name, "Value", name_len)
+  end
+end Field
+
+procedure SetModel(well: ColorWell)
+  var
+    am: Objects.AttrMsg
+begin
+  if well.obj # nil then
+    am.id := Objects.set_
+    Field(well, @am.name, 32)
+    am.class := Objects.Int
+    am.i := well.col
+    am.res := -1
+    well.obj.handle(well.obj, @am)
+  end
+end SetModel
+
+procedure UpdateModel(well: ColorWell)
+  var
+    am: Objects.AttrMsg
+begin
+  if well.obj # nil then
+    am.id := Objects.get
+    Field(well, @am.name, 32)
+    am.class := Objects.Inval
+    am.res := -1
+    well.obj.handle(well.obj, @am)
+    if (am.res >= 0) & (am.class = Objects.Int) then
+      well.col := val(int16, am.i)
+    end
+  end
+end UpdateModel
+
+procedure HandleAttr(well: ColorWell; msg: pointer to Objects.AttrMsg)
+begin
+  if msg.id = Objects.get then
+    if msg.name = "Gen" then
+      msg.class := Objects.String
+      copy(@msg.s, "ColorWells.NewColorWell", 64)
+      msg.res := 0
+    elsif (msg.name = "Color") or (msg.name = "Value") then
+      msg.class := Objects.Int
+      msg.i := well.col
+      msg.res := 0
+    elsif (msg.name = "Cmd") or (msg.name = "Field") or (msg.name = "TargetAttr") then
+      Gadgets.framehandle(well, msg)
+      if msg.res < 0 then
+        msg.class := Objects.String
+        copy(@msg.s, "", 64)
+        msg.res := 0
+      end
+
+    else
+      Gadgets.framehandle(well, msg)
+    end
+
+  elsif (msg.id = Objects.set_) & ((msg.name = "Color") or (msg.name = "Value")) & (msg.class = Objects.Int) then
+    well.col := val(int16, msg.i)
+    msg.res := 0
+    if well.obj # nil then
+      SetModel(well)
+      Gadgets.Update(well.obj)
+    end
+
+  elsif msg.id = Objects.enum then
+    msg.Enum("Color")
+    msg.Enum("Cmd")
+    msg.Enum("Field")
+    msg.Enum("TargetAttr")
+    Gadgets.framehandle(well, msg)
+  else
+    Gadgets.framehandle(well, msg)
+  end
+end HandleAttr
+
+procedure Copy*(msg: pointer to Objects.CopyMsg; from, to_: ColorWell)
+begin
+  Gadgets.CopyFrame(msg, from, to_)
+  to_.col := from.col
+end Copy
+
+procedure Handle*(obj: Objects.Object; msg: pointer to Objects.ObjMsg)
+  var
+    msg1: Display.PFrameMsg
+    well, copy_: ColorWell
+    fx, fy: int16
+    mask: Display3.Mask
+    am: Objects.AttrMsg
+    ver: int32
+begin
+  well := obj(ColorWell)
+  case msg of
+  | Display.PFrameMsg:
+    if (msg.F = nil) or (msg.F = well) then
+      fx := msg.x + well.X
+      fy := msg.y + well.Y
+      msg1 := msg
+      case msg1 of
+      | Oberon.PInputMsg:
+        if (msg1.id = Oberon.track) & ~(Gadgets.selected in well.state) & Gadgets.InActiveArea(well, msg1) then
+          if msg1.keys = {ML} then
+            TrackColor(well, fx, fy, msg1)
+            msg1.res := 0
+          elsif msg1.keys = {MM} then
+            TrackMiddle(well, fx, fy, msg1)
+            msg1.res := 0
+          else
+            Gadgets.framehandle(well, msg1)
+          end
+
+        else
+          Gadgets.framehandle(well, msg1)
+        end
+
+      | Display.PDisplayMsg:
+        DisplayWell(well, fx, fy, msg1(Display.PDisplayMsg))
+
+      | Gadgets.PUpdateMsg:
+        if well.obj # nil then
+          well.obj.handle(well.obj, msg1)
+        end
+
+        if msg1.obj = well.obj then
+          if msg1.stamp # well.stamp then
+            well.stamp := msg1.stamp
+            UpdateModel(well)
+          end
+
+          Gadgets.MakeMask(well, fx, fy, msg1.dlink, @mask)
+          Restore(well, fx, fy, mask)
+        else
+          Gadgets.framehandle(well, msg1)
+        end
+
+      | Display.PControlMsg:
+        if well.obj # nil then
+          well.obj.handle(well.obj, msg1)
+        end
+
+        if (msg1.id = Display.restore) & (msg1.stamp # well.stamp) then
+          well.stamp := msg1.stamp
+          UpdateModel(well)
+        end
+
+      | Display.PConsumeMsg:
+        if msg1.id = Display.drop then
+          am.id := Objects.get
+          copy(@am.name, "Color", 32)
+          am.class := Objects.Inval
+          am.res := -1
+          msg1.obj.handle(msg1.obj, @am)
+          if (am.res >= 0) & (am.class = Objects.Int) then
+            well.col := val(int16, am.i)
+            if well.obj # nil then
+              SetModel(well)
+              Gadgets.Update(well.obj)
+            else
+              Gadgets.Update(well)
+            end
+
+            msg1.res := 0
+          end
+        end
+
+      else
+        Gadgets.framehandle(well, msg1)
+      end
+
+    else
+      Gadgets.framehandle(well, msg)
+    end
+
+  | Objects.PAttrMsg:
+    HandleAttr(well, msg(Objects.PAttrMsg))
+
+  | Objects.PCopyMsg:
+    if msg.stamp # well.stamp then
+      newgc(copy_)
+      well.dlink := copy_
+      well.stamp := msg.stamp
+      Copy(msg, well, copy_)
+    end
+
+    msg.obj := well.dlink
+
+  | Objects.PFileMsg:
+    Gadgets.framehandle(well, msg)
+    if msg.id = Objects.store then
+      Files.WriteNum(@msg.R, 1)
+      Files.WriteInt(@msg.R, well.col)
+    elsif msg.id = Objects.load then
+      Files.ReadNum(@msg.R, @ver)
+      if ver >= 1 then
+        Files.ReadInt(@msg.R, @well.col)
+      end
+    end
+
+  else
+    Gadgets.framehandle(well, msg)
+  end
+end Handle
+
+procedure InitColorWell*(well: ColorWell; col: int16)
+begin
+  well.handle := Handle
+  well.W := 20
+  well.H := 20
+  well.col := col
+end InitColorWell
+
+procedure NewColorWell*()
+  var
+    well: ColorWell
+begin
+  newgc(well)
+  InitColorWell(well, Display3.white)
+  Objects.NewObj := well
+end NewColorWell
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewColorWell" end return NewColorWell end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("ColorWells", cmd_)
+  InitMarker()
+end ColorWells.

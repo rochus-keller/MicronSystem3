@@ -1,0 +1,734 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module ListModels [level=5]
+
+import Files, Objects, Gadgets, Strings, ListRiders, Modules
+
+// portable
+// ps,
+// List and Tree are models designed for the access mechanism defined in module Riders.
+
+const
+  VersionNo = 1
+  NoKey = (-2147483647-1)
+
+  // states
+  sorted = 0
+  unique = 1
+  linear = 2
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  Node = pointer to NodeDesc
+  NodeDesc = record
+    prev: Node // prev, next: doubly linked list / dsc: node's desc. or parent for tails
+    next, dsc: Node
+    key, stamp, state, pos: int32
+    d: ListRiders.Data
+    s: array 64 of char // Data value
+  end
+
+  List* = pointer to ListDesc
+  ListDesc* = object (Gadgets.ObjDesc)
+    tail: Node // tail of list (sentinel)
+    key: int32 // next free unique-key
+    state0: set // diff. settings
+  end
+
+  Rider* = pointer to RiderDesc
+  RiderDesc* = object (ListRiders.RiderDesc)
+    node: Node // current node
+  end
+
+var
+  method: ListRiders.Method
+
+// Key generator
+procedure GetKey(obj: List): int32
+  var
+    key: int32
+begin
+  key := obj.key
+  inc(obj.key)
+  return key
+end GetKey
+
+// ========== Node handling ==========
+// Allocate new node
+procedure NewNode(val_: ListRiders.Data; key: int32): Node
+  var
+    n: Node
+begin
+  newgc(n)
+  if val_ = nil then
+    copy(@n.s, "", 64)
+  else
+    case val_ of
+    | ListRiders.String:
+      copy(@n.s, @val_(ListRiders.String).s, 64)
+    | ListRiders.Int:
+      Strings.IntToStr(val_(ListRiders.Int).i, @n.s, 64)
+    | ListRiders.Bool:
+      Strings.BoolToStr(val_(ListRiders.Bool).b, @n.s, 64)
+    | ListRiders.Char:
+      n.s[0] := val_(ListRiders.Char).c
+      n.s[1] := 0X
+    end
+  end
+
+  n.d := val_
+  n.key := key
+  n.stamp := NoKey
+  n.next := n
+  n.prev := n
+  n.dsc := nil
+  return n
+end NewNode
+
+// Set n as the current item of R
+procedure SetNode(R: Rider; n: Node)
+begin
+  R.node := n
+  R.d := n.d
+  R.dsc := (n.dsc # nil) & (n.key # NoKey)
+  R.eol := n.key = NoKey
+end SetNode
+
+procedure DuplicateNode(list: List; n: Node): Node
+  var
+    new_, ndsc: Node
+begin
+  new_ := NewNode(n.d, GetKey(list))
+  if n.dsc # nil then
+    ndsc := NewNode(nil, NoKey)
+    ndsc.pos := -1
+    ndsc.dsc := new_
+    new_.dsc := ndsc
+    n := n.dsc.next
+    while n.key # NoKey do
+      ndsc.next := DuplicateNode(list, n)
+      ndsc.next.prev := ndsc
+      ndsc := ndsc.next
+      ndsc.pos := n.pos
+      n := n.next
+    end
+
+    ndsc.next := new_.dsc
+    new_.dsc.prev := ndsc
+  end
+
+  return new_
+end DuplicateNode
+
+procedure IsUnique(n: Node; const val_: pointer to array of char; acceptSelf: boolean): boolean
+  var
+    cur: Node
+begin
+  cur := n
+  repeat
+    cur := cur.next
+  until (cur = n) or (cur.s = val_^) & (cur.key # NoKey)
+  return (cur = n) & (acceptSelf or (n.s # val_^))
+end IsUnique
+
+// ========== Rider handling ==========
+// Get the current item's key
+procedure Key(R: ListRiders.Rider): int32
+begin
+  return R(Rider).node.key
+end Key
+
+// Position rider R on the item having the given key
+procedure Seek(R: ListRiders.Rider; key: int32)
+
+  procedure Traverse(tail: Node; key: int32): Node
+    var
+      n, found: Node
+  begin
+    n := tail.next
+    while (n # tail) & (n.key # key) do
+      if n.dsc # nil then
+        found := Traverse(n.dsc, key)
+        if found.key = key then
+          return found
+        end
+      end
+
+      n := n.next
+    end
+
+    return n
+  end Traverse
+begin
+  case R of
+  | Rider:
+    SetNode(R, Traverse(R.base(List).tail, key))
+  end
+end Seek
+
+// Get current position of the rider
+procedure Pos(R: ListRiders.Rider): int32
+begin
+  return R(Rider).node.pos
+end Pos
+
+// Position rider R on the item having the given pos
+procedure Set(R: ListRiders.Rider; pos: int32)
+  var
+    n: Node
+begin
+  case R of
+  | Rider:
+    n := R.node
+    if n.pos < pos then
+      repeat
+        n := n.next
+      until (n.pos = pos) or (n.key = NoKey)
+    elsif n.pos > pos then
+      repeat
+        n := n.prev
+      until (n.pos = pos) or (n.key = NoKey)
+    end
+
+    SetNode(R, n)
+  end
+end Set
+
+// Insert data at the current position of R
+procedure Write(R: ListRiders.Rider; d: ListRiders.Data)
+  var
+    n, n0: Node
+    base: List
+    sort: boolean
+begin
+  if R # nil then
+    case R of
+    | Rider:
+      base := R.base(List)
+      n0 := NewNode(d, GetKey(base))
+      sort := sorted in base.state0
+      if sort then
+        if linear in base.state0 then
+          n := R.base(List).tail
+        else
+          // Tree
+          n := R.node
+          while (n.key # NoKey) & (n.s > n0.s) do
+            n := n.prev
+          end
+        end
+
+        repeat
+          n := n.next
+        until (n.key = NoKey) or (n.s > n0.s)
+      else
+        n := R.node
+      end
+
+      if ~(unique in base.state0) or IsUnique(n, @n0.s, false) then
+        n0.pos := n.prev.pos
+        n0.next := n
+        n0.prev := n.prev
+        n.prev.next := n0
+        n.prev := n0
+        repeat
+          inc(n0.pos)
+          n0 := n0.next
+        until n0.key = NoKey
+      end
+    end
+  end
+end Write
+
+// Link the item at the position of linkR to the current position of R
+procedure WriteLink(R, linkR: ListRiders.Rider)
+  var
+    n, n0: Node
+    base: List
+begin
+  if (linkR # nil) & ~linkR.eol & ((R = nil) or (R.base = linkR.base)) then
+    base := linkR(Rider).base(List)
+    if R = nil then
+      // insert at top level
+      n := base.tail
+    else
+      case R of
+      | Rider:
+        if linear in base.state0 then
+          // linear list
+          if sorted in base.state0 then
+            n := base.tail
+          else
+            n := R.node
+          end
+        else
+          // tree -> insert in dsc-list
+          n := R.node.dsc
+          if n = nil then
+            n := NewNode(nil, NoKey)
+            n.pos := -1
+            n.dsc := R.node
+            R.node.dsc := n
+          end
+        end
+      end
+    end
+
+    if ~(unique in base.state0) or IsUnique(n, @linkR(Rider).node.s, false) then
+      n0 := DuplicateNode(base, linkR(Rider).node)
+      if sorted in base.state0 then
+        repeat
+          n := n.next
+        until (n.key = NoKey) or (n.s > n0.s)
+      end
+      n0.pos := n.prev.pos
+      n0.next := n
+      n0.prev := n.prev
+      n.prev.next := n0
+      n.prev := n0
+      repeat
+        inc(n0.pos)
+        n0 := n0.next
+      until n0.key = NoKey
+    end
+  end
+end WriteLink
+
+// Delete link from R to linkR
+procedure DeleteLink(R, linkR: ListRiders.Rider)
+  var
+    d, n: Node
+begin
+  case linkR of
+  | Rider:
+    d := linkR.node
+    d.prev.next := d.next
+    d.next.prev := d.prev
+    n := d.next
+    d.next := d
+    d.prev := d
+    if (n.next = n) & (n.dsc # nil) then
+      n := n.dsc // empty sub-list
+      n.dsc := nil
+    else
+      d := n
+      while d.key # NoKey do
+        dec(d.pos)
+        d := d.next
+      end
+    end
+
+    SetNode(linkR, n)
+  end
+end DeleteLink
+
+// Get stamp value of the node at the current position of R
+procedure GetStamp(R: ListRiders.Rider): int32
+begin
+  return R(Rider).node.stamp
+end GetStamp
+
+// Set stamp value of the item at the current position of R
+procedure SetStamp(R: ListRiders.Rider; stamp: int32)
+begin
+  R(Rider).node.stamp := stamp
+end SetStamp
+
+// Get the state of the current item
+procedure State(R: ListRiders.Rider): int32
+begin
+  return R(Rider).node.state
+end State
+
+// Set the state of the current item
+procedure SetState(R: ListRiders.Rider; s: int32)
+begin
+  R(Rider).node.state := s
+end SetState
+
+procedure Desc(R, old: ListRiders.Rider): ListRiders.Rider
+  var
+    new_: Rider
+    base: List
+    node: Node
+begin
+  case R of
+  | Rider:
+    if (old = nil) or ~(old is Rider) then
+      newgc(new_)
+    else
+      new_ := old(Rider)
+    end
+    new_.do_ := R.do_
+    new_.base := R.base
+    base := R.base(List)
+    if linear in base.state0 then
+      node := base.tail
+    else
+      // Tree
+      if ~R.eol then
+        node := R.node.dsc
+        if node = nil then
+          node := NewNode(nil, NoKey)
+          node.pos := -1
+          node.dsc := R.node
+          R.node.dsc := node
+        end
+
+        node := node.next
+      else
+        node := R.node
+      end
+    end
+
+    SetNode(new_, node)
+  end
+
+  return new_
+end Desc
+
+procedure ConnectRider(R: Rider; base: List)
+begin
+  R.do_ := method
+  R.base := base
+  SetNode(R, base.tail.next)
+end ConnectRider
+
+// =================== list model ===================
+procedure Sort(tail: pointer to Node)
+  // sorts entries in one level
+  var
+    n, m, next, ntail: Node
+    pos: int32
+begin
+  if tail^.next # tail^ then
+    ntail := NewNode(nil, NoKey)
+    ntail.pos := -1
+    n := tail^.next
+    while n # tail^ do
+      next := n.next
+      n.prev.next := next
+      next.prev := n.prev
+      m := ntail
+      repeat
+        m := m.next
+      until (m = ntail) or (m.s > n.s)
+      n.next := m
+      n.prev := m.prev
+      m.prev.next := n
+      m.prev := n
+      if n.dsc # nil then
+        Sort(@n.dsc)
+        n.dsc.dsc := n
+      end
+      n := next
+    end
+
+    tail^ := ntail
+    n := tail^.next
+    pos := 0
+    while n # tail^ do
+      n.pos := pos
+      inc(pos)
+      n := n.next
+    end
+  end
+end Sort
+
+procedure Unify(tail: Node)
+  // removes entries with same data in one level
+  var
+    n: Node
+    nr: int32
+begin
+  n := tail.prev
+  while n # tail do
+    if ~IsUnique(n, @n.s, true) then
+      n.prev.next := n.next
+      n.next.prev := n.prev
+    elsif n.dsc # nil then
+      Unify(n.dsc)
+    end
+
+    n := n.prev
+  end
+
+  // renumber
+  n := n.next
+  nr := 0
+  while n # tail do
+    n.pos := nr
+    inc(nr)
+    n := n.next
+  end
+end Unify
+
+procedure CopyList*(M: pointer to Objects.CopyMsg; from, to_: List)
+
+  procedure Copy(tail: Node): Node
+    var
+      n, new_, ntail: Node
+  begin
+    ntail := NewNode(nil, NoKey)
+    ntail.pos := -1
+    n := tail.next
+    while n # tail do
+      newgc(new_) // duplicate data
+      new_^ := n^
+      new_.next := ntail
+      new_.prev := ntail.prev
+      ntail.prev.next := new_
+      ntail.prev := new_
+      if n.dsc # nil then
+        new_.dsc := Copy(n.dsc)
+        new_.dsc.dsc := new_
+      end
+      n := n.next
+    end
+
+    return ntail
+  end Copy
+begin
+  to_.handle := from.handle
+  to_.key := from.key
+  to_.state0 := from.state0
+  to_.tail := Copy(from.tail)
+  Gadgets.CopyObject(M, from, to_)
+end CopyList
+
+procedure WriteList(obj: List; M: pointer to Objects.FileMsg)
+
+  procedure WriteNodes(n: Node; M: pointer to Objects.FileMsg)
+  begin
+    n := n.next
+    while n.key # NoKey do
+      Files.WriteLInt(@M.R, n.key)
+      Files.WriteString(@M.R, @n.s, 64)
+      Files.WriteLInt(@M.R, n.state)
+      if n.dsc # nil then
+        Files.Write(@M.R, val(byte, ord(0FFX)))
+        WriteNodes(n.dsc, M)
+      else
+        Files.Write(@M.R, val(byte, ord(0X)))
+      end
+
+      n := n.next
+    end
+
+    Files.WriteLInt(@M.R, NoKey)
+  end WriteNodes
+begin
+  Files.WriteNum(@M.R, VersionNo)
+  Files.WriteSet(@M.R, obj.state0)
+  Files.WriteLInt(@M.R, obj.key)
+  WriteNodes(obj.tail, M)
+  Gadgets.objecthandle(obj, M)
+end WriteList
+
+procedure ReadList(obj: List; M: pointer to Objects.FileMsg)
+  var
+    ver: int32
+
+  procedure ReadNodes(tail: Node; M: pointer to Objects.FileMsg)
+    var
+      n: Node
+      key: int32
+      str: ListRiders.String
+      ch: char
+  begin
+    n := tail
+    Files.ReadLInt(@M.R, @key)
+    while key # NoKey do
+      newgc(n.next)
+      n.next.prev := n
+      n := n.next
+      n.key := key
+      n.pos := n.prev.pos + 1
+      Files.ReadString(@M.R, @n.s, 64)
+      newgc(str)
+      copy(@str.s, @n.s, 64)
+      n.d := str
+      Files.ReadLInt(@M.R, @n.state)
+      Files.Read(@M.R, cast(BytePtr, @ch))
+      if ch = 0FFX then
+        n.dsc := NewNode(nil, NoKey)
+        n.dsc.pos := -1
+        n.dsc.dsc := n
+        ReadNodes(n.dsc, M)
+      end
+
+      Files.ReadLInt(@M.R, @key)
+    end
+
+    n.next := tail
+    tail.prev := n
+  end ReadNodes
+begin
+  Files.ReadNum(@M.R, @ver)
+  if ver >= 1 then
+    Files.ReadSet(@M.R, @obj.state0)
+    Files.ReadLInt(@M.R, @obj.key)
+    ReadNodes(obj.tail, M)
+  end
+
+  Gadgets.objecthandle(obj, M)
+end ReadList
+
+procedure ListAttr(obj: List; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      copy(@M.s, "ListModels.NewList", 64)
+      M.class := Objects.String
+      M.res := 0
+    elsif M.name = "Sorted" then
+      M.class := Objects.Bool
+      M.b := sorted in obj.state0
+      M.res := 0
+    elsif M.name = "Unique" then
+      M.class := Objects.Bool
+      M.b := unique in obj.state0
+      M.res := 0
+    else
+      Gadgets.objecthandle(obj, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Sorted" then
+      if M.class = Objects.Bool then
+        if M.b & ~(sorted in obj.state0) then
+          obj.state0 := obj.state0 + {sorted}
+          Sort(@obj.tail)
+        elsif ~M.b then
+          obj.state0 := obj.state0 - {sorted}
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "Unique" then
+      if M.class = Objects.Bool then
+        if M.b & ~(unique in obj.state0) then
+          obj.state0 := obj.state0 + {unique}
+          Unify(obj.tail)
+        elsif ~M.b then
+          obj.state0 := obj.state0 - {unique}
+        end
+
+        M.res := 0
+      end
+
+    else
+      Gadgets.objecthandle(obj, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Sorted")
+    M.Enum("Unique")
+    Gadgets.objecthandle(obj, M)
+  else
+    Gadgets.objecthandle(obj, M)
+  end
+end ListAttr
+
+// Standard handler for list models
+procedure ListHandler*(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    R: Rider
+    obj0: List
+begin
+  case obj of
+  | List:
+    case M of
+    | Objects.PAttrMsg:
+      ListAttr(obj, M(Objects.PAttrMsg))
+    | Objects.PCopyMsg:
+      if M.stamp = obj.stamp then
+        M.obj := obj.dlink
+      else
+        newgc(obj0)
+        obj.stamp := M.stamp
+        obj.dlink := obj0
+        CopyList(M, obj, obj0)
+        M.obj := obj0
+      end
+
+    | ListRiders.PConnectMsg:
+      newgc(R)
+      ConnectRider(R, obj)
+      M(ListRiders.PConnectMsg).R := R
+    | Objects.PFileMsg:
+      if M.id = Objects.load then
+        ReadList(obj, M)
+      elsif M.id = Objects.store then
+        WriteList(obj, M)
+      end
+
+    else
+      Gadgets.objecthandle(obj, M)
+    end
+  end
+end ListHandler
+
+// Initialize a list model
+procedure InitList*(obj: List; linearList: boolean)
+  var
+    tail: Node
+begin
+  tail := NewNode(nil, NoKey)
+  tail.pos := -1
+  obj.handle := ListHandler
+  obj.key := NoKey + 1i4
+  obj.tail := tail
+  obj.state0 := {}
+  if linearList then
+    obj.state0 := obj.state0 + {linear}
+  end
+end InitList
+
+// Generator for a linear list
+procedure NewList*()
+  var
+    obj: List
+begin
+  newgc(obj)
+  InitList(obj, true)
+  Objects.NewObj := obj
+end NewList
+
+// Generator for a tree
+procedure NewTree*()
+  var
+    obj: List
+begin
+  newgc(obj)
+  InitList(obj, false)
+  Objects.NewObj := obj
+end NewTree
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewList" end return NewList end
+  if i = 1 then if name # nil then name^ := "NewTree" end return NewTree end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("ListModels", cmd_)
+  newgc(method)
+  method.Key := Key
+  method.Seek := Seek
+  method.Pos := Pos
+  method.Set := Set
+  method.State := State
+  method.SetState := SetState
+  method.Write := Write
+  method.WriteLink := WriteLink
+  method.DeleteLink := DeleteLink
+  method.GetStamp := GetStamp
+  method.SetStamp := SetStamp
+  method.Desc := Desc
+end ListModels.

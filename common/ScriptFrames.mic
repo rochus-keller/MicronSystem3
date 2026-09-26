@@ -1,0 +1,3126 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module ScriptFrames [level=5]
+
+import Texts, Fonts, Objects, Oberon, Styles, Input, Display, Modules, Printer
+// portable
+// RS, Wed, 9-Jun-1993
+
+// hyph
+(*
+Tue, 17-May-1994: visualize page breaks
+Mon, 4-Jul-1994: error in format: Read CR -> dx := 0
+Fri, 22-Jul-1994: error in format: Read obj#{Frame, Style} -> wrong dx, H
+Fri, 14-Oct-1994: back scroll
+*)
+(*
+(*--back scroll-- -> (*--back scroll--*)
+--no scroll--*)  -> (*--no scroll--
+(*--end scroll--*) -> --end scroll--*)
+*)
+
+const
+  TAB = 9X // special chars
+  CR = 0DX
+  LeftArrow = 0C4X
+  RightArrow = 0C3X
+  BRK = 0ACX
+  HYPH = 1FX // CTRL-"-"
+  SpcW = 3
+  ML = 2
+  MM = 1
+  MR = 0
+
+  LeftMode = {Styles.left}
+  RightMode = {Styles.right}
+  AdjMode = {Styles.left,Styles.right}
+  CenterMode = {}
+
+  car = 0 // MarkMsg id
+  sel = 1
+  arrow = -1
+
+  OpenCmd = "Script.Open"
+
+type
+  Box = pointer to BoxDesc
+  Line = pointer to LineDesc
+  LineDesc = record
+    len_, W: int32
+    w, h, asr_, dsr, off, w0, nSpc: int16
+
+    style: Styles.Style
+    brk, eot, tabs: boolean
+    next: Line
+    box: Box
+  end
+
+  Location* = record
+    org*, pos*: int32
+    dx*, x*, y*: int16
+    lin: Line
+  end
+
+  Frame* = pointer to FrameDesc
+  FrameDesc* = object (Display.FrameDesc)
+    text*: Texts.Text
+    org*: int32
+    col*, left*, right*, top*, bot*, markH*, mark*: int16
+
+    time*: int32
+    car*, sel*, hide*: boolean
+    carLoc*, selBeg*, selEnd*: Location
+
+    trailer: Line
+  end
+
+  (*mark < 0: arrow mark
+  mark = 0: no mark*)
+
+  Formatter = object (Texts.Reader)
+    len_, W: int32
+    w, asr_, dsr, nSpc: int16
+    hide: boolean
+    fnt, mfnt: Fonts.Font
+    unit: int32
+  end
+  PFormatter = pointer to Formatter
+
+  MarkMsg = object (Display.FrameMsg)
+    id: int16
+  end
+  PMarkMsg = pointer to MarkMsg
+
+  DisplayMsg = object (Display.DisplayMsg)
+    pos: int32
+  end
+  PDisplayMsg = pointer to DisplayMsg
+
+  (* -> CaretMsg
+  FocusMsg* = RECORD(Display.FrameMsg)
+  foc*: Frame
+  END;
+  *)
+  BoxDesc = record
+    next: Box
+    F: Display.Frame
+    off: int32
+    X, dY: int16
+  end
+
+var
+  barW*: int16 // standard sizes
+  left*, right*, top*, bot*: int16
+  Asr, Dsr, markW, eolW: int16
+
+  R1: Texts.Reader // displayer
+  fnt: Fonts.Font // cache
+  mfnt: Fonts.Font
+  unit: int32
+  R: Formatter
+  ch: char
+  dx, a, d: int16
+  dX: int32
+  style: Styles.Style
+
+  W: Texts.Writer // keyboard writer
+  KW, XW: Texts.Writer
+
+  pL: Line // prev line while printing
+  show: procedure(F: Frame; pos: int32)
+
+  FullColor, BackCol, BarCol: int16
+
+  saved: Oberon.CaretMsg
+
+procedure Min(i, j: int32): int32
+begin
+  if i >= j then
+    return j
+  else
+    return i
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+procedure Max(i, j: int16): int16
+begin
+  if j >= i then
+    return j
+  else
+    return i
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Max
+
+// ---display support & misc---
+
+procedure ShowBrk(F: Frame; col, x, y: int16)
+  var
+    obj: Objects.Object
+    L: Line
+    org: int32
+    X, Y: int16
+begin
+  if F.slink # nil then
+    obj := F.slink
+    org := F.org
+    while obj.stamp < org do
+      obj := obj.slink
+    end
+    L := F.trailer.next
+    Y := y + F.Y + F.H - F.top
+    while L # F.trailer do
+      if org = obj.stamp then
+        // display line
+        X := x + F.X + F.left
+        Display.FillPattern(col, Display.grey2, X, Y - 1, X, Y - 1, F.W - F.left - F.right, 1, Display.paint)
+        obj := obj.slink
+      end
+
+      inc(org, L.len_)
+      dec(Y, L.h)
+      L := L.next
+    end
+  end
+end ShowBrk
+
+procedure Mask(F: Frame): Display.Frame
+  var
+    msk: Display.Frame
+begin
+  if F.dsc = nil then
+    newgc(msk)
+    F.dsc := msk
+  else
+    msk := F.dsc
+  end
+  msk.X := F.X + F.left
+  msk.Y := F.Y + F.bot
+  msk.W := F.W - F.left - F.right
+  msk.H := F.H - F.top - F.bot
+  return msk
+end Mask
+
+procedure Marks(F: Frame; id: int16)
+  var
+    M: MarkMsg
+begin
+  M.id := id
+  M.F := F
+  Display.Broadcast(@M)
+end Marks
+
+procedure Mark*(F: Frame; mark: int16)
+begin
+  Marks(F, arrow)
+end Mark
+
+procedure DrawCursor(X, Y: int16)
+begin
+  Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Arrow, X, Y)
+end DrawCursor
+
+procedure TrackMouse(X, Y: pointer to int16; Keys, keysum: pointer to set)
+begin
+  Input.Mouse(Keys, X, Y)
+  DrawCursor(X^, Y^)
+  keysum^ := keysum^ + Keys^
+end TrackMouse
+
+procedure InvertRect(F: Frame; x, y, X, Y, W, H: int16)
+begin
+  inc(X, x + F.X)
+  inc(Y, y + F.Y)
+  Oberon.RemoveMarks(X, Y, W, H)
+  if X + W <= x + F.X + F.W then
+    Display.ReplConst(FullColor, X, Y, W, H, Display.invert)
+  elsif X < x + F.X + F.W then
+    Display.ReplConst(FullColor, X, Y, x + F.X + F.W - X, H, Display.invert)
+  end
+end InvertRect
+
+procedure ReplConst(col, x, y, w, h: int16)
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  Display.ReplConst(col, x, y, w, h, Display.replace)
+end ReplConst
+
+procedure Erase(F: Frame; x, y, Y, H: int16)
+begin
+  // erase content
+  ReplConst(F.col, x + F.X + F.left, y + F.Y + Y, F.W - F.left, H)
+end Erase
+
+procedure RemTick(F: Frame; x, y: int16)
+begin
+  ReplConst(F.col, x + F.X, y + F.Y + F.H - 1 - F.markH, markW, 1)
+end RemTick
+
+procedure ShowTick(F: Frame; x, y: int16)
+begin
+  // update
+  F.markH := val(int16, obdiv(F.org * F.H, F.text.len_ + 1))
+  ReplConst(Display.FG, x + F.X, y + F.Y + F.H - 1 - F.markH, markW, 1)
+end ShowTick
+
+procedure Bar(F: Frame; x, y, Y, H: int16)
+begin
+  inc(x, F.X)
+  inc(y, F.Y + Y)
+  ReplConst(F.col, x, y, F.W, H)
+  if F.left >= barW then
+    ReplConst(BarCol, x + barW - 1, y, 1, H) // bar
+  end
+end Bar
+
+procedure FrameDsr(F: Display.Frame): int16
+  var
+    B: Objects.AttrMsg
+begin
+  B.dlink := nil
+  B.i := 0
+  Objects.Stamp(@B)
+  B.res := -1
+  B.id := Objects.get
+  copy(@B.name, "LineupHY", 32)
+  F.handle(F, @B)
+  return val(int16, B.i)
+end FrameDsr
+
+procedure DrawFrame(F: Frame; G: Display.Frame; x, y, X, Y: int16)
+  var
+    M: Display.DisplayMsg
+    N: Display.ControlMsg
+begin
+  inc(x, F.X + X)
+  inc(y, F.Y + Y)
+  if X >= F.W - F.right then
+    return
+  end
+  N.id := Display.restore // restore
+  N.res := -1
+  N.F := G
+  Objects.Stamp(@N)
+  N.dlink := Mask(F)
+  N.x := x - G.X
+  N.y := y - G.Y
+  G.handle(G, @N)
+  M.device := Display.screen
+  M.id := Display.full
+  M.res := -1
+  M.F := G
+  Objects.Stamp(@M)
+  M.dlink := Mask(F)
+  M.x := x - G.X
+  M.y := y - G.Y
+  G.handle(G, @M)
+end DrawFrame
+
+procedure Move(F: Frame; x, y, Y, H, dY: int16)
+  // move content including frames
+  var
+    w: int16
+begin
+  inc(x, F.X + F.left)
+  inc(y, F.Y + Y)
+  w := F.W - F.left
+  Oberon.RemoveMarks(x, val(int16, Min(y, y + dY)), w, Max(H + dY, H - dY))
+  Display.CopyBlock(x, y, w, H, x, y + dY, 0)
+end Move
+
+procedure FlipCaret(F: Frame; x, y: int16)
+begin
+  if (F.carLoc.y >= 10) & (F.carLoc.x + 12 < F.W) then
+    Display.CopyPattern(FullColor, Display.hook, x + F.X + F.carLoc.x, y + F.Y + F.carLoc.y - 10, Display.invert)
+  end
+end FlipCaret
+
+// ---frames---
+
+procedure Insert(L: Line; X, voff: int16; off: int32; G: Display.Frame; dY: pointer to int16)
+  var
+    b, p: Box
+begin
+  newgc(b)
+  b.X := X
+  b.F := G
+  dY^ := FrameDsr(G) - voff
+  b.dY := dY^
+  b.off := off
+  p := L.box
+  if p = nil then
+    newgc(p)
+    p.next := p
+    p.X := 32767
+    L.box := p
+  end
+  while p.next.X < X do
+    p := p.next
+  end
+  b.next := p.next
+  p.next := b
+end Insert
+
+procedure Append(L: Line; X: int16; b: Box)
+  // append everything up to X
+  var
+    p: Box
+begin
+  if b # nil then
+    p := b
+    while (p.next # b) & (p.next.X + p.next.F.W <= X) do
+      p := p.next // p.next.X + p.next.F.W > X
+    end
+    if p # b then
+      // list ~empty
+      if L.box = nil then
+        L.box := b
+        p.next := b
+      else
+        p.next := L.box.next
+        L.box.next := b.next
+      end
+    end
+  end
+end Append
+
+procedure Broadcast(F: Frame; M: pointer to Display.FrameMsg)
+  var
+    x, y, Y: int16
+    L: Line
+    msk: Display.Frame
+
+  procedure Broadcast0(box: Box; y: int16; M: pointer to Display.FrameMsg; msk: pointer to Display.Frame; x: pointer to int16)
+    var
+      b: Box
+      G: Display.Frame
+  begin
+    b := box.next
+    while b # box do
+      G := b.F
+      M.dlink := msk^
+      M.x := x^ + b.X - G.X
+      M.y := y - b.dY - G.Y
+      G.handle(G, M)
+      b := b.next
+    end
+  end Broadcast0
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  Y := F.H - F.top
+  L := F.trailer.next
+  msk := Mask(F)
+  while (M.res < 0) & (L # F.trailer) & (L # nil) do
+    dec(Y, L.h) // Broadcast while formatting !!!
+    if L.box # nil then
+      Broadcast0(L.box, y + Y + L.dsr, M, @msk, @x)
+    end
+    L := L.next
+  end
+end Broadcast
+
+// ---selection---
+
+procedure Transparent(G: Display.Frame): boolean
+  var
+    M: Objects.AttrMsg
+begin
+  M.b := false
+  M.id := Objects.get
+  copy(@M.name, "Transparent", 32)
+  G.handle(G, @M)
+  return M.b
+end Transparent
+
+procedure InvertArea(F: Frame; L: Line; x, y, X, Y, W: int16)
+  var
+    X0, H0, H1: int16
+    b: Box
+    G: Display.Frame
+begin
+  if L.box # nil then
+    b := L.box.next
+    while b.X < X do
+      b := b.next
+    end
+    while b.X < X + W do
+      // & ~(b.F IS Styles.Frame)
+      if ~Transparent(b.F) then
+        G := b.F
+        X0 := b.X
+        H0 := L.dsr - b.dY
+        H1 := L.h - G.H - H0
+        if X < X0 then
+          InvertRect(F, x, y, X, Y, X0 - X, L.h) // before
+        end
+        if H0 > 0 then
+          InvertRect(F, x, y, X0, Y, G.W, H0) // below
+        end
+        if H1 > 0 then
+          InvertRect(F, x, y, X0, Y + H0 + G.H, G.W, H1) // above
+        end
+        inc(X0, G.W)
+        dec(W, X0 - X)
+        X := X0
+      end
+
+      b := b.next
+    end
+  end
+
+  InvertRect(F, x, y, X, Y, W, L.h)
+end InvertArea
+
+procedure FlipSelection(F: Frame; x, y: int16; beg, end_: pointer to Location)
+  var
+    L: Line
+    Y: int16
+begin
+  L := beg.lin // Y = bottom of line
+  Y := beg.y - L.dsr
+  if L = end_.lin then
+    InvertArea(F, L, x, y, beg.x, Y, end_.x - beg.x)
+  else
+    InvertArea(F, L, x, y, beg.x, Y, F.left + L.off + L.w0 - beg.x)
+    L := L.next
+    dec(Y, L.h)
+    while L # end_.lin do
+      InvertArea(F, L, x, y, F.left + L.off, Y, L.w0)
+      L := L.next
+      dec(Y, L.h)
+    end
+
+    InvertArea(F, L, x, y, F.left + L.off, Y, end_.x - F.left - L.off)
+  end
+end FlipSelection
+
+procedure Deselect(F: Frame; G: Display.Frame)
+  var
+    S: Display.SelectMsg
+begin
+  S.res := -1
+  S.x := 0
+  S.y := 0
+  S.id := Display.reset
+  S.sel := F
+  S.obj := G
+  S.dlink := Mask(F)
+  Objects.Stamp(@S)
+  S.F := G
+  G.handle(G, @S)
+end Deselect
+
+// ---lines---
+
+procedure Lim(F: Frame): int32
+  var
+    pos: int32
+    L: Line
+begin
+  pos := F.org
+  L := F.trailer.next
+  while L # F.trailer do
+    inc(pos, L.len_)
+    L := L.next
+  end
+  return pos
+end Lim
+
+procedure CollectLines(F: Frame; L: pointer to Line; Y: pointer to int16; org: pointer to int32)
+begin
+  while (L^.next # F.trailer) & (Y^ >= F.bot + L^.next.h) do
+    L^ := L^.next
+    inc(org^, L^.len_)
+    dec(Y^, L^.h)
+  end
+end CollectLines
+
+// ---objects---
+
+(* PROCEDURE Objs(T: Texts.Text): Objects.Library;
+BEGIN IF T.obs = NIL THEN NEW(T.obs); Objects.OpenLibrary(T.obs) END; RETURN T.obs
+END Objs; *)
+
+procedure Clone(obj: Objects.Object; id: int16; new_: pointer to Objects.Object)
+  var
+    M: Objects.CopyMsg
+begin
+  M.id := id // copy
+  Objects.Stamp(@M)
+  obj.handle(obj, @M)
+  new_^ := M.obj
+  // IF lib # NIL THEN N.lib := lib; Objects.Stamp(N); new.handle(new, N) END (* bind *)
+end Clone
+
+procedure SaveAndCopy(F: Frame; text: Texts.Text; beg, end_: int32; W: pointer to Texts.Writer)
+
+  var
+    R: Texts.Finder
+    obj, new_: Objects.Object
+begin
+  if end_ > text.len_ then
+    end_ := text.len_
+  end
+  Texts.OpenFinder(@R, text, beg)
+  while R.pos < end_ do
+    if beg < R.pos then
+      Texts.Save(text, beg, R.pos, W.buf)
+    end
+    beg := R.pos
+    Texts.FindObj(@R, @obj)
+    case obj of
+    | Display.Frame:
+      (*lib := Objs(F.text); Clone(obj, Objects.shallow, lib, new); ch := CHR(new.ref);
+      Texts.SetFont(W, lib); Texts.Write(W, ch); INC(beg)*)
+      Clone(obj, Objects.shallow, @new_)
+      Texts.WriteObj(W, new_)
+    end
+  end
+
+  if beg < end_ then
+    Texts.Save(text, beg, end_, W.buf)
+  end
+end SaveAndCopy
+
+procedure StyleAt(F: Frame; pos: int32): Styles.Style
+  var
+    R: Texts.Finder
+    obj: Objects.Object
+    style: Styles.Style
+begin
+  Texts.OpenFinder(@R, F.text, 0)
+  style := Styles.defStyle
+  while ~R.eot & (R.pos <= pos) do
+    Texts.FindObj(@R, @obj)
+    if (obj # nil) & (obj is Styles.Style) then
+      style := obj(Styles.Style)
+    end
+  end
+
+  return style
+end StyleAt
+
+procedure StyleFrame(F: Frame; st: Styles.Style; X: int16): Objects.Object
+  var
+    G: Display.Frame
+begin
+  G := Styles.NewFrame(st)
+  G.W := val(int16, obdiv(st.paraW, Display.Unit))
+  if G.W > F.W - F.right - X then
+    G.W := F.W - F.right - X
+  end
+  G(Styles.Frame).col := F.col
+  if F.hide then
+    G.H := 1
+  end
+  return G
+end StyleFrame
+
+// ---display---
+
+procedure Offsets(L: Line; spc, rest: pointer to int16)
+
+  var
+    width, diff: int16
+    s: Styles.Style
+    mode: set
+begin
+  rest^ := 0
+  spc^ := 0
+  L.w0 := L.w
+  s := L.style
+  if L.brk then
+    inc(L.w0, eolW)
+  else
+    inc(L.w0, SpcW)
+  end
+  L.off := val(int16, obdiv(s.left, Display.Unit))
+  mode := s.opts * AdjMode
+  if mode = LeftMode then
+    return
+  else
+    width := val(int16, obdiv(s.paraW, Display.Unit))
+    diff := width - L.w
+    if mode = AdjMode then
+      if L.brk or (L.nSpc = 0) then
+        return // = left adjust for last line/one word
+      end
+      L.w0 := width + SpcW
+      spc^ := obdiv(diff, L.nSpc)
+      rest^ := obmod(diff, L.nSpc)
+    elsif mode = CenterMode then
+      inc(L.off, asr(diff, 1))
+    elsif mode = RightMode then
+      inc(L.off, diff)
+    end
+  end
+end Offsets
+
+procedure IncPos(spc: int16; rest, X: pointer to int16)
+begin
+  inc(X^, spc)
+  if rest^ > 0 then
+    inc(X^)
+    dec(rest^)
+  end
+end IncPos
+
+procedure GetWidth(lib: Objects.Library; ch: char; obj: pointer to Objects.Object; dx: pointer to int16; dX: pointer to int32)
+begin
+  case lib of
+  | Fonts.Font:
+    if lib # fnt then
+      fnt := lib(Fonts.Font) // cache!!
+      Styles.MetricFnt(fnt, @unit, @mfnt)
+    end
+    mfnt.GetObj(mfnt, val(int16, ord(ch)), obj)
+    dX^ := obj^(Fonts.Char).dx * unit
+    lib.GetObj(lib, val(int16, ord(ch)), obj)
+    dx^ := obj^(Fonts.Char).dx
+  else
+    lib.GetObj(lib, val(int16, ord(ch)), obj)
+    if obj^ is Display.Frame then
+      dx^ := obj^(Display.Frame).W
+      dX^ := dx^ * Printer.Unit
+      return
+    elsif obj^ is Styles.Style then
+      dX^ := obj^(Styles.Style).paraW
+      dx^ := val(int16, obdiv(dX^, Display.Unit))
+      return
+    else
+      dx^ := 2
+      dX^ := 2 * Printer.Unit
+    end
+  end
+end GetWidth
+
+procedure Width(F: Frame; L: Line; beg, end_: int32; x: pointer to int16; X: pointer to int32)
+  var
+    R: Texts.Reader
+    obj: Objects.Object
+    pos: int32
+    dx: int16
+    ch: char
+    spc, rest: int16
+    DX: int32
+begin
+  Offsets(L, @spc, @rest)
+  Texts.OpenReader(@R, F.text, beg)
+  Texts.Read(@R, @ch)
+  pos := beg
+  x^ := 0
+  X^ := 0
+  while pos # end_ do
+    GetWidth(R.lib, ch, @obj, @dx, @DX)
+    case obj of
+    | Fonts.Char:
+      if ch = TAB then
+        Styles.Tab(L.style, R.lib(Fonts.Font), x^, X^, @dx, @DX)
+      elsif ch = " " then
+        IncPos(spc, @rest, x)
+      elsif ch = HYPH then
+        dx := 0 // hyph
+        DX := 0
+      end
+    end
+
+    inc(x^, dx)
+    inc(X^, DX)
+    inc(pos)
+    Texts.Read(@R, @ch)
+  end
+end Width
+
+procedure Height(fnt: Fonts.Font; a, d: pointer to int16)
+begin
+  // rule line height = 1.2*font height
+  a^ := obdiv(6 * fnt.maxY, 5)
+  d^ := obdiv(6 * fnt.height, 5) - a^
+end Height
+
+procedure DisplayLine(F: Frame; pos, dXX: int32; x, y, dX, Y: int16; L: Line)
+  // dX = offset into lineblock
+
+  var
+    X0, Y0, XT, x0, y0, dx, v, off, dY, bY, a, d: int16
+    X, DX: int32
+    spc, rest: int16
+    obj: Objects.Object
+    G: Display.Frame
+    ch: char
+
+  procedure GetObj(lib: Objects.Library; ch: char; obj: pointer to Objects.Object; dx: pointer to int16; DX: pointer to int32; F: pointer to Frame; L: pointer to Line; X: pointer to int32; X0: pointer to int16; off: pointer to int16; rest: pointer to int16; spc: pointer to int16; x0: pointer to int16)
+  begin
+    GetWidth(lib, ch, obj, dx, DX)
+    if lib is Fonts.Font then
+      if ch > " " then
+        return
+      elsif ch = " " then
+        inc(dx^, spc^)
+        if rest^ > 0 then
+          inc(dx^)
+          dec(rest^)
+        end
+        return
+      elsif ch = TAB then
+        Styles.Tab(L^.style, lib(Fonts.Font), X0^ - x0^, X^, dx, DX)
+        return
+      elsif ch = HYPH then
+        dx^ := 0 // hyph
+        DX^ := 0
+      end
+
+    elsif obj^ is Styles.Style then
+      obj^ := StyleFrame(F^, obj^(Styles.Style), X0^ - x0^ + off^)
+      dx^ := obj^(Display.Frame).W
+      DX^ := val(int32, val(int16, dx^)) * Printer.Unit
+    end
+  end GetObj
+begin
+  Offsets(L, @spc, @rest)
+  off := F.left + L.off
+  L.box := nil
+  x0 := x + F.X + off // absolute screen
+  XT := x + F.X + F.W - F.right
+  y0 := y + F.Y + Y - L.asr_
+  v := 0
+  X0 := x0 + dX
+  Y0 := y0
+  X := dXX
+  bY := Y - L.h
+  while pos # L.len_ do
+    Texts.Read(@R1, @ch)
+    inc(pos)
+    if R1.lib # nil then
+      GetObj(R1.lib, ch, @obj, @dx, @DX, @F, @L, @X, @X0, @off, @rest, @spc, @x0)
+      if X0 <= XT then
+        // + dx
+        v := R1.voff
+        if X0 + dx > XT then
+          ch := " " // not draw
+        end
+        if (ch > " ") & (obj is Fonts.Char) & (bY >= F.bot) then
+          if v # 0 then
+            Height(R1.lib(Fonts.Font), @a, @d) // R1.voff#v
+            Y0 := y0 + obdiv((a + d) * v, 100)
+          else
+            Y0 := y0
+          end
+          case obj of
+          | Fonts.Char:
+            Display.CopyPattern(R1.col, obj.pat (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; Oberon: WITH obj: Fonts.Char DO Display.CopyPattern(R1.col, obj.pat, X0+obj.x, Y0+obj.y, Display.paint) END *), X0 + obj.x, Y0 + obj.y, Display.paint)
+          end
+        elsif obj is Display.Frame then
+          G := obj(Display.Frame)
+          if v # 0 then
+            dY := obdiv(G.H * v, 100)
+          else
+            dY := 0
+          end
+          Insert(L, X0 - x0 + off, dY, pos - 1, G, @dY)
+          DrawFrame(F, G, x, y, X0 - x0 + off, Y - L.asr_ - dY) // rel
+        elsif (ch = HYPH) & (obj is Fonts.Char) & (pos = L.len_) then
+          // hyph
+          GetObj(R1.lib, "_", @obj, @dx, @DX, @F, @L, @X, @X0, @off, @rest, @spc, @x0)
+          case obj of
+          | Fonts.Char:
+            Display.CopyPattern(R1.col, obj.pat (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; Oberon: WITH obj: Fonts.Char DO Display.CopyPattern(R1.col, obj.pat, X0+obj.x, Y0+obj.y, Display.paint) END *), X0 + obj.x, Y0 + obj.y, Display.paint)
+          end
+        end
+      end
+
+      inc(X0, dx)
+      inc(X, DX)
+    end
+  end
+
+  // Display.ReplConst(F.col, X0, y0-L.dsr, XT-X0, L.h, 0)
+end DisplayLine
+
+procedure DisplaySec(F: Frame; x, y, Y0: int16; org0: int32; L0, L1: Line)
+  var
+    L: Line
+    Y: int16
+begin
+  L := L0
+  Y := Y0
+  Texts.OpenReader(@R1, F.text, org0)
+  while L # L1 do
+    Erase(F, x, y, Y - L.h, L.h)
+    DisplayLine(F, 0, 0, x, y, 0, Y, L)
+    dec(Y, L.h)
+    L := L.next
+  end
+end DisplaySec
+
+procedure DisplaySec0(F: Frame; x, y: int16; org0, off: int32; Y0: int16; oldL0, L0, L1: Line)
+  var
+    pos: int32
+    u, v, dx, xx: int16
+    dXX: int32
+begin
+  if (L0.asr_ = oldL0.asr_) & (L0.dsr = oldL0.dsr) & ((L0.style.opts * AdjMode = {Styles.left}) or L0.brk & oldL0.brk & (L0.style.opts * AdjMode = AdjMode)) then
+
+    pos := Min(off, L0.len_)
+    Width(F, L0, org0, org0 + pos, @dx, @dXX)
+    Texts.OpenReader(@R1, F.text, org0 + pos)
+    u := x + F.X + F.left // left part
+    v := y + F.Y + Y0 - L0.h
+    ReplConst(F.col, u, v, L0.off, L0.h)
+    xx := L0.off + dx
+    ReplConst(F.col, u + xx, v, F.W - xx - F.left, L0.h)
+    DisplayLine(F, pos, dXX, x, y, dx, Y0, L0) // right part
+    Append(L0, F.left + xx, oldL0.box)
+    // Display.ReplConst(15, u+xx, v, F.W-xx-F.left, L0.h, 2); debug
+    dec(Y0, L0.h)
+    inc(org0, L0.len_)
+    L0 := L0.next
+  end
+
+  DisplaySec(F, x, y, Y0, org0, L0, L1)
+end DisplaySec0
+
+procedure ScrollBack(F: Frame; x, y: int16; oldL: Line; L: pointer to Line; Y: pointer to int16; org: pointer to int32)
+
+  var
+    L0: Line
+    dY, Y1: int16
+begin
+  d := 0
+  L^.next := oldL
+  Y1 := Y^
+  CollectLines(F, L, Y, org)
+  if L^.next = oldL then
+    L0 := L^.next // last line to draw
+  else
+    L0 := oldL
+  end
+  dY := F.H - F.top - Y1
+  Move(F, x, y, Y^ + dY, Y1 - Y^, -dY)
+  DisplaySec(F, x, y, F.H - F.top, F.org, F.trailer.next, L0)
+end ScrollBack
+
+// ---formatting---
+
+procedure Read()
+
+  var
+    obj: Objects.Object
+    G: Display.Frame
+    s: Styles.Style
+    v: int16
+begin
+  Texts.Read(@R, @ch)
+  if ~R.eot then
+    R.lib.GetObj(R.lib, val(int16, ord(ch)), @obj)
+    if R.lib is Fonts.Font then
+      if R.lib # R.fnt then
+        R.fnt := R.lib(Fonts.Font)
+        Styles.MetricFnt(R.fnt, @R.unit, @R.mfnt)
+      end
+      Height(R.fnt, @a, @d)
+      // IF R.voff # 0 THEN v := (a+d)*R.voff DIV 100; INC(a, v); DEC(d, v) END;
+      if ch >= " " then
+        dx := obj(Fonts.Char).dx
+        R.mfnt.GetObj(R.mfnt, val(int16, ord(ch)), @obj)
+        dX := R.unit * obj(Fonts.Char).dx
+      else
+        dx := 0
+        dX := 0
+      end
+
+    elsif obj is Display.Frame then
+      G := obj(Display.Frame)
+      dx := G.W
+      dX := val(int32, dx) * Display.Unit
+      d := FrameDsr(G)
+      a := G.H - d
+    elsif obj is Styles.Style then
+      s := obj(Styles.Style)
+      style := s
+      dX := Styles.pageW
+      dx := val(int16, obdiv(s.paraW, Display.Unit))
+      a := val(int16, obdiv(s.gap, Display.Unit))
+      d := 0
+      if R.hide then
+        a := Max(1, a)
+      else
+        G := Styles.NewFrame(s)
+        inc(a, G.H)
+      end
+    else
+      dx := 2
+      dX := 2 * Printer.Unit
+      Height(Fonts.Default, @a, @d)
+    end
+
+    if R.voff # 0 then
+      v := obdiv((a + d) * R.voff, 100)
+      inc(a, v)
+      dec(d, v)
+    end
+  else
+    dx := 0 // a := Asr; d := Dsr
+    dX := 0
+    a := 0
+    d := 0
+  end
+end Read
+
+procedure InitFormatter(F: Frame; org: int32)
+begin
+  Texts.OpenReader(@R, F.text, org)
+  R.fnt := nil
+  R.hide := F.hide
+  Read()
+  R.w := 0
+  R.len_ := 0
+  R.W := 0
+  R.nSpc := 0
+  R.asr_ := a
+  R.dsr := d
+  style := StyleAt(F, org)
+end InitFormatter
+
+procedure FormatLine(L: pointer to Line)
+
+  var
+    len_, len0: int32
+    w, spc, w0, nspc, dsr0, asr0, asr_, dsr, width, lsp: int16
+    W, Spc, W0, Width: int32
+    brk, tab: boolean
+    s: Styles.Style
+    lsep: char // hyph
+    obj: Objects.Object
+    dx0: int16
+    dX0: int32
+begin
+  newgc(L^)
+  s := style
+  w := 0
+  len_ := 0
+  spc := 0
+  W := 0
+  Spc := 0
+  w0 := R.w
+  W0 := R.W
+  len0 := R.len_
+  brk := false
+  tab := false
+  nspc := R.nSpc
+  asr_ := 0
+  dsr := 0
+  asr0 := R.asr_
+  dsr0 := R.dsr
+  Width := style.paraW
+  width := val(int16, obdiv(Width, Display.Unit))
+  while (w + spc + w0 + dx < width) & (W + Spc + W0 + dX < Width) & ~brk do
+    inc(len0)
+    if (R.lib # nil) & (~(R.lib is Fonts.Font) or (ch > " ")) then
+      inc(w0, dx)
+      inc(W0, dX)
+      if a > asr0 then
+        asr0 := a
+      end
+      if d > dsr0 then
+        dsr0 := d
+      end
+    else
+      inc(w, spc + w0)
+      inc(W, Spc + W0)
+      inc(len_, len0)
+      w0 := 0
+      W0 := 0
+      len0 := 0
+      if asr0 > asr_ then
+        asr_ := asr0
+      end
+      if dsr0 > dsr then
+        dsr := dsr0
+      end
+      dsr0 := d
+      asr0 := a
+      if ch = " " then
+        spc := dx
+        Spc := dX
+        inc(nspc)
+        tab := false
+      elsif ch = HYPH then
+        spc := 0 // hyph
+        Spc := 0
+        tab := true
+      elsif R.eot or (ch = CR) then
+        brk := true
+        L^.brk := true
+        L^.eot := R.eot
+        if a > asr_ then
+          asr_ := a
+        end
+        if d > dsr then
+          dsr := d
+        end
+        asr0 := 0
+        dsr0 := 0
+      elsif ch = TAB then
+        Styles.Tab(s, R.lib(Fonts.Font), w, W, @spc, @Spc)
+        L^.tabs := true
+        tab := true
+      end
+
+      lsep := ch // hyph
+    end
+
+    if ~R.eot then
+      Read()
+    end
+  end
+
+  if s # style then
+    // OR (dx >= Width) OR (dX >= Width)
+    // OR brk (cr has no width)
+    inc(w, spc + w0)
+    inc(W, Spc + W0)
+    inc(len_, len0)
+    L^.brk := true
+    if asr0 > asr_ then
+      asr_ := asr0
+    end
+    if dsr0 > dsr then
+      dsr := dsr0
+    end
+    w0 := 0 // asr0 := Asr; dsr0 := Dsr
+    W0 := 0
+    len0 := 0
+    asr0 := 0
+    dsr0 := 0
+  end
+
+  if len_ > 0 then
+    if lsep = HYPH then
+      GetWidth(R.lib, "_", @obj, @dx0, @dX0) // hyph
+      inc(w, dx0)
+      inc(W, dX0)
+    end
+    L^.w := w
+    L^.W := W
+    L^.len_ := len_
+    L^.asr_ := asr_
+    L^.dsr := dsr
+    L^.nSpc := nspc
+    if (nspc > 0) & ~tab then
+      dec(L^.nSpc)
+    end
+    R.w := w0
+    R.W := W0
+    R.len_ := len0
+    R.asr_ := asr0
+    R.dsr := dsr0
+  elsif len0 > 0 then
+    // one word
+    L^.w := w0
+    L^.W := W0
+    L^.len_ := len0
+    L^.asr_ := asr0
+    L^.dsr := dsr0
+    L^.nSpc := 0
+    R.w := dx
+    R.W := dX
+    R.len_ := 1
+    R.asr_ := a
+    R.dsr := d
+  else
+    // one char
+    L^.w := dx
+    L^.W := dX
+    L^.len_ := 1
+    L^.asr_ := a
+    L^.dsr := d
+    R.w := 0 // R.asr := Asr; R.dsr := Dsr
+    R.W := 0
+    R.len_ := 0
+    R.asr_ := 0
+    R.dsr := 0
+  end
+
+  if (len_ = 0) & ~R.eot then
+    Read()
+  end
+  L^.style := s
+  lsp := val(int16, obdiv(s.lsp, Display.Unit)) // line spacing
+  dsr := val(int16, obdiv(s.dsr, Display.Unit))
+  if (Styles.grid in s.opts) & (lsp > 0) then
+    while dsr < L^.dsr do
+      inc(dsr, lsp)
+    end
+    L^.dsr := dsr
+    L^.h := Max(lsp, L^.asr_ + dsr)
+    inc(L^.h, obmod(-L^.h, lsp))
+  else
+    L^.dsr := Max(L^.dsr, dsr)
+    L^.h := Max(lsp, L^.asr_ + L^.dsr)
+  end
+
+  if L^.h = 0 then
+    L^.h := Asr + Dsr // min height
+    L^.dsr := Dsr
+  end
+  L^.asr_ := L^.h - L^.dsr
+end FormatLine
+
+procedure NewLines(F: Frame; limit: int32; L: pointer to Line; Y: pointer to int16; org: pointer to int32)
+  var
+    L1: Line
+begin
+  InitFormatter(F, org^)
+  FormatLine(@L1)
+  while ~L^.eot & (Y^ >= F.bot + L1.h) & (org^ # limit) do
+    L^.next := L1
+    L^ := L1
+    inc(org^, L^.len_)
+    dec(Y^, L^.h)
+    FormatLine(@L1)
+  end
+
+  L^.next := L1 // !
+end NewLines
+
+procedure BottomLine(F: Frame; x, y, Y: int16; L: pointer to Line; org: int32)
+  var
+    R: Texts.Finder
+    pos: int32
+    obj: Objects.Object
+begin
+  if org < F.text.len_ then
+    Texts.OpenFinder(@R, F.text, org)
+    pos := R.pos
+    Texts.FindObj(@R, @obj)
+    if (pos - org < L^.next.len_) & (obj # nil) & (obj is Display.Frame) then
+      L^ := L^.next // clear to bottom
+      Erase(F, x, y, 0, Y)
+      Oberon.FadeCursor(@Oberon.Mouse)
+      Texts.OpenReader(@R1, F.text, org)
+      DisplayLine(F, 0, 0, x, y, 0, Y, L^)
+    else
+      Erase(F, x, y, F.bot, Y - F.bot)
+    end
+
+  else
+    Erase(F, x, y, F.bot, Y - F.bot)
+  end
+end BottomLine
+
+procedure AppendLines(F: Frame; x, y: int16; org: int32; L: Line; Y: pointer to int16)
+
+  var
+    L0: Line
+    Y0: int16
+    org0: int32
+    botY: int16
+begin
+  botY := F.bot
+  L0 := L
+  org0 := org
+  Y0 := Y^
+  Erase(F, x, y, botY, Y0 - botY) //
+  NewLines(F, F.text.len_ + 1, @L, Y, @org)
+  DisplaySec(F, x, y, Y0, org0, L0.next, L.next)
+  BottomLine(F, x, y, Y^, @L, org)
+  L.next := F.trailer
+end AppendLines
+
+procedure ShowText(F: Frame; x, y: int16; pos: int32)
+
+  var
+    org, oldOrg, org0: int32
+    curY, Y0, dY, botY: int16
+    L, L1, oldL: Line
+begin
+  // pos valid
+  RemTick(F, x, y)
+  botY := F.bot
+  curY := F.H - F.top
+  if pos < F.org then
+    oldOrg := F.org
+    oldL := F.trailer.next
+    org := pos
+    F.org := pos
+    L := F.trailer
+    Y0 := curY // curY org L
+    NewLines(F, oldOrg, @L, @curY, @org)
+    if org = oldOrg then
+      ScrollBack(F, x, y, oldL, @L, @curY, @org)
+    else
+      // totally before
+      DisplaySec(F, x, y, Y0, F.org, F.trailer.next, L.next)
+    end
+
+    BottomLine(F, x, y, curY, @L, org) // Erase(F, x, y, botY, curY - botY)
+    L.next := F.trailer
+  else
+    // pos >=org
+    L := F.trailer
+    org := F.org
+    while (L.next # F.trailer) & (org # pos) do
+      L := L.next // find pos
+      inc(org, L.len_)
+      dec(curY, L.h)
+    end
+    L1 := L.next // curY org L1
+    if (org = pos) & (L.next # F.trailer) then
+      org0 := org // curY org L
+      Y0 := curY
+      CollectLines(F, @L, @curY, @org)
+      if (L.next # F.trailer) & (F.org = org0) then
+        // cut rest
+        if (L.next.box # nil) & (curY > botY) then
+          BottomLine(F, x, y, curY, @L, org)
+          curY := botY
+        end
+        L.next := F.trailer
+        Erase(F, x, y, 0, curY)
+      else
+        F.org := org0
+        F.trailer.next := L1
+        dY := F.H - F.top - Y0
+        if dY # 0 then
+          Move(F, x, y, curY, Y0 - curY, dY)
+          inc(curY, dY)
+        end
+        if (L.next = F.trailer) & (L.box # nil) then
+          // redraw if more lines in frame
+          Texts.OpenReader(@R1, F.text, org - L.len_)
+          DisplayLine(F, 0, 0, x, y, 0, curY + L.h, L)
+        end
+
+        AppendLines(F, x, y, org, L, @curY)
+      end
+
+    else
+      // outside
+      F.org := pos
+      curY := F.H - F.top
+      AppendLines(F, x, y, pos, F.trailer, @curY)
+    end
+  end
+
+  ShowTick(F, x, y)
+  ShowBrk(F, Display.FG, x, y)
+end ShowText
+
+procedure Resize*(F: Frame; x, y, newY: int16)
+begin
+  // F.mark = 0
+  if newY < F.Y then
+    Bar(F, x, y, newY - F.Y, F.Y - newY) // extend
+  end
+  F.H := F.H + F.Y - newY
+  F.Y := newY
+  ShowText(F, x, y, F.org)
+end Resize
+
+// ---locators---
+
+procedure LocateOrg(F: Frame; org, pos: int32; loc: pointer to Location)
+  var
+    L: Line
+    cury: int16
+begin
+  cury := F.H - F.top
+  L := F.trailer.next
+  if pos < org then
+    pos := org
+  end
+  while (L.next # F.trailer) & (pos >= org + L.len_) do
+    inc(org, L.len_)
+    dec(cury, L.h)
+    L := L.next
+  end
+
+  loc.org := org
+  loc.pos := pos
+  loc.lin := L
+  loc.x := F.left
+  loc.y := cury - L.asr_
+end LocateOrg
+
+procedure LocateLine(F: Frame; y: int16; loc: pointer to Location)
+  var
+    L: Line
+    cury: int16
+begin
+  loc.org := F.org
+  cury := F.H - F.top
+  L := F.trailer.next
+  while (L.next # F.trailer) & (cury - L.h > y) & (cury - L.h - L.next.h >= F.bot) do
+    inc(loc.org, L.len_)
+    dec(cury, L.h)
+    L := L.next
+  end
+
+  loc.y := cury - L.asr_
+  loc.lin := L
+end LocateLine
+
+procedure LocateObj(F: Frame; x, y: int16; loc: pointer to Location; obj: pointer to Objects.Object)
+  var
+    R: Texts.Reader
+    pos, lim: int32
+    ox, dx: int16
+    ch: char
+    spc, rest: int16
+    L: Line
+    X, DX: int32
+begin
+  LocateLine(F, y, loc)
+  L := loc.lin
+  Offsets(L, @spc, @rest)
+  pos := loc.org
+  lim := loc.org + L.len_ - 1
+  ox := F.left + L.off
+  X := 0
+  obj^ := nil
+  if pos <= lim then
+    Texts.OpenReader(@R, F.text, pos)
+    dx := 0
+    DX := 0
+    dec(pos)
+    repeat
+      Texts.Read(@R, @ch)
+      inc(ox, dx)
+      inc(X, DX)
+      inc(pos)
+      if R.lib # nil then
+        GetWidth(R.lib, ch, obj, @dx, @DX)
+        if R.lib is Fonts.Font then
+          if ch = TAB then
+            Styles.Tab(L.style, R.lib(Fonts.Font), ox - L.off - F.left, X, @dx, @DX)
+          elsif ch = " " then
+            IncPos(spc, @rest, @dx)
+          elsif ch = HYPH then
+            dx := 0 // hyph
+            DX := 0
+          end
+        end
+
+      else
+        obj^ := nil
+      end
+    until (obj^ = nil) or (pos = lim) or (ox + dx > x)
+  end
+
+  if pos = lim then
+    if (ch = CR) or (obj^ = nil) then
+      dx := eolW
+    elsif (ch = " ") or (ch = TAB) then
+      dx := SpcW
+    end
+  end
+
+  loc.pos := pos
+  loc.dx := dx
+  loc.x := ox
+end LocateObj
+
+procedure LocatePos(F: Frame; pos: int32; loc: pointer to Location)
+  var
+    dX: int32
+    dx: int16
+begin
+  LocateOrg(F, F.org, pos, loc)
+  if pos >= loc.org + loc.lin.len_ then
+    pos := loc.org + loc.lin.len_ - 1
+  elsif pos < F.org then
+    pos := F.org
+  end
+  Width(F, loc.lin, loc.org, pos, @dx, @dX)
+  loc.pos := pos
+  inc(loc.x, dx + loc.lin.off)
+end LocatePos
+
+procedure LocateString(F: Frame; x, y: int16; loc: pointer to Location)
+
+  var
+    pos, end_, X, lim: int32
+    ch: char
+    R: Texts.Reader
+    obj: Objects.Object
+begin
+  LocateObj(F, x, y, loc, @obj)
+  lim := loc.org + loc.lin.len_
+  end_ := loc.pos
+  Texts.OpenReader(@R, F.text, end_)
+  Texts.Read(@R, @ch)
+  if R.lib # nil then
+    if (R.lib is Fonts.Font) & (ch <= " ") then
+      // backwards
+      repeat
+        dec(end_)
+        Texts.OpenReader(@R, F.text, end_)
+        Texts.Read(@R, @ch)
+      until (end_ < loc.org) or ~(R.lib is Fonts.Font) or (ch > " ")
+
+      inc(end_)
+      pos := end_
+    elsif R.lib # nil then
+      // forward
+      repeat
+        inc(end_)
+        Texts.Read(@R, @ch)
+      until (R.lib = nil) or (end_ >= lim) or (R.lib is Fonts.Font) & (ch <= " ")
+
+      pos := loc.pos
+    end
+
+  else
+    pos := end_
+  end
+
+  repeat
+    dec(pos)
+    Texts.OpenReader(@R, F.text, pos)
+    Texts.Read(@R, @ch)
+  until (pos < loc.org) or (R.lib is Fonts.Font) & (ch <= " ")
+
+  inc(pos)
+  LocatePos(F, pos, loc)
+  Width(F, loc.lin, pos, end_, @loc.dx, @X)
+end LocateString
+
+procedure FindFrame(F: Frame; G: Display.Frame; loc: pointer to Location)
+  var
+    Y: int16
+    L: Line
+    b: Box
+begin
+  Y := F.H - F.top
+  L := F.trailer.next
+  loc.org := F.org
+  loc.pos := -1
+  while L # F.trailer do
+    dec(Y, L.h)
+    if L.box # nil then
+      b := L.box.next
+      while b # L.box do
+        if b.F = G then
+          loc.x := b.X
+          loc.y := Y + L.dsr - b.dY
+          loc.dx := b.F.W
+          loc.pos := loc.org + b.off
+          loc.lin := L
+          return
+        end
+
+        b := b.next
+      end
+    end
+
+    inc(loc.org, L.len_)
+    L := L.next
+  end
+end FindFrame
+
+(*
+PROCEDURE FindObj(F: Frame; G: Display.Frame; VAR pos: LONGINT): BOOLEAN;
+VAR loc: Location;
+BEGIN FindFrame(F, G, loc); pos := loc.pos; RETURN (loc.pos >= 0)
+END FindObj;
+*)
+procedure TouchFrame(F: Frame; M: pointer to Oberon.InputMsg): boolean
+  var
+    X, Y: int16
+    b: Box
+    loc: Location
+    G: Display.Frame
+begin
+  if F.trailer.next # F.trailer then
+    X := M.X - F.X - M.x
+    Y := M.Y - F.Y - M.y
+    LocateLine(F, Y, @loc)
+    if Y < loc.y - loc.lin.dsr then
+      dec(loc.y, loc.lin.dsr + loc.lin.next.asr_) // bottom
+      loc.lin := loc.lin.next
+    end
+    if loc.lin.box # nil then
+      b := loc.lin.box
+      while b.next.X <= X do
+        b := b.next
+      end
+      G := b.F
+      dec(loc.y, b.dY)
+      if (G # nil) & (X < b.X + G.W) & (loc.y <= Y) & (Y < loc.y + G.H) then
+        Oberon.FadeCursor(@Oberon.Mouse) // clip !
+        inc(M.x, F.X + b.X - G.X)
+        inc(M.y, F.Y + loc.y - G.Y)
+        M.dlink := Mask(F)
+        G.handle(G, M)
+        return M.res >= 0
+      end
+    end
+  end
+
+  return false
+end TouchFrame
+
+procedure Pos*(F: Frame; X, Y: int16): int32
+  // local coords
+  var
+    loc: Location
+    obj: Objects.Object
+begin
+  LocateObj(F, X, Y, @loc, @obj)
+  return loc.pos
+end Pos
+
+procedure ParaBeg(T: Texts.Text; pos: int32; org: pointer to int32)
+  var
+    R: Texts.Reader
+    ch: char
+    obj: Objects.Object
+begin
+  org^ := pos
+  while org^ > 0 do
+    Texts.OpenReader(@R, T, org^ - 1)
+    Texts.Read(@R, @ch)
+    R.lib.GetObj(R.lib, val(int16, ord(ch)), @obj)
+    if (ch = CR) & (obj is Fonts.Char) or (obj is Styles.Style) then
+      return
+    end
+    dec(org^)
+  end
+end ParaBeg
+
+procedure Validate(F: Frame; pos: pointer to int32)
+  // find org of line
+  var
+    org: int32
+    L: Line
+    loc: Location
+begin
+  if F.trailer.next # F.trailer then
+    if pos^ >= F.org then
+      LocateOrg(F, F.org, pos^, @loc) // find start of line within line list
+      if pos^ < loc.org + loc.lin.len_ then
+        pos^ := loc.org
+        return
+      end
+    end
+  end
+
+  if pos^ > F.text.len_ then
+    pos^ := F.text.len_
+  end
+  if pos^ > 0 then
+    ParaBeg(F.text, pos^, @org)
+    InitFormatter(F, org)
+    FormatLine(@L)
+    while org + L.len_ <= pos^ do
+      inc(org, L.len_)
+      FormatLine(@L)
+    end
+    pos^ := org
+  else
+    pos^ := 0
+  end
+end Validate
+
+procedure SetAttributes(F: Frame; pos: int32)
+  var
+    R: Texts.Reader
+    x: char
+begin
+  if (F.text.len_ > 0) & (pos = F.text.len_) then
+    dec(pos)
+  end
+  Texts.OpenReader(@R, F.text, pos)
+  Texts.Read(@R, @x)
+  if (R.lib = nil) or ~(R.lib is Fonts.Font) then
+    Texts.SetFont(@KW, Oberon.CurFnt)
+    Texts.SetColor(@KW, Oberon.CurCol)
+    Texts.SetOffset(@KW, Oberon.CurOff)
+  else
+    Texts.SetFont(@KW, R.lib)
+    Texts.SetColor(@KW, R.col)
+    Texts.SetOffset(@KW, R.voff)
+  end
+end SetAttributes
+
+// ---caret & selection---
+
+procedure SetCaret*(F: Frame; pos: int32)
+begin
+  if ~F.car or (F.carLoc.pos # pos) then
+    if F.car then
+      Marks(F, car)
+      F.car := false
+    end
+    if (pos < F.org) or (pos >= Lim(F)) then
+      show(F, pos)
+    end
+    LocatePos(F, pos, @F.carLoc) // old version
+    Marks(F, car)
+    F.car := true
+    SetAttributes(F, F.carLoc.pos)
+  end
+
+  saved.car := nil
+  saved.text := nil
+end SetCaret
+
+procedure RemoveCaret*(F: Frame)
+begin
+  if F.car then
+    Marks(F, car)
+  end
+  F.car := false
+end RemoveCaret
+
+procedure SetSelection*(F: Frame; beg, end_: int32)
+begin
+  if F.sel then
+    Marks(F, sel)
+  end
+  if (beg < F.org) or (beg >= Lim(F)) then
+    show(F, beg)
+  end
+  LocatePos(F, beg, @F.selBeg)
+  LocatePos(F, end_, @F.selEnd)
+  if F.selBeg.pos < F.selEnd.pos then
+    Marks(F, sel)
+    F.time := Oberon.Time()
+    F.sel := true
+  end
+end SetSelection
+
+procedure RemoveSelection*(F: Frame)
+begin
+  if F.sel then
+    Marks(F, sel)
+    F.sel := false
+  end
+end RemoveSelection
+
+procedure RemoveMarks(F: Frame)
+begin
+  RemoveCaret(F)
+  RemoveSelection(F)
+end RemoveMarks
+
+procedure Neutralize*(F: Frame)
+begin
+  RemoveMarks(F)
+end Neutralize
+
+// ---update---
+
+procedure UpdateVisible(F: Frame; x, y: int16; beg, end_, corr: int32)
+
+  var
+    oldL, oldL0, L, L0: Line
+    oldorg, org, org0: int32
+    oldY, dY, Y, Y0, Y1, botY: int16
+begin
+  org := F.org
+  Y := F.H - F.top
+  L := F.trailer
+  botY := F.bot
+  while (L.next # F.trailer) & (org + L.next.len_ <= beg) do
+    // find line where beg lies in
+    L := L.next
+    inc(org, L.len_)
+    dec(Y, L.h)
+  end
+
+  if L.next # F.trailer then
+    // [org, Y, L.next] = line where update starts
+    oldorg := org
+    oldY := Y
+    oldL := L.next
+    oldL0 := oldL
+    inc(oldorg, oldL.len_) // set org to next line
+    dec(oldY, oldL.h)
+    oldL := oldL.next
+    if (corr <= 0) or (corr < end_ - beg) then
+      while (oldorg < end_) & (oldL # F.trailer) do
+        inc(oldorg, oldL.len_) // find last line of update
+        dec(oldY, oldL.h)
+        oldL := oldL.next
+      end
+    end
+
+    oldorg := oldorg + corr
+    InitFormatter(F, org)
+    FormatLine(@L.next)
+    if Y >= botY + L.next.h then
+      org0 := org // L0 = first line
+      Y0 := Y
+      L0 := L.next
+      loop
+        L := L.next
+        inc(org, L.len_)
+        dec(Y, L.h)
+        if L.eot then
+          exit
+        end
+        while (oldL # F.trailer) & (oldorg < org) do
+          inc(oldorg, oldL.len_)
+          dec(oldY, oldL.h)
+          oldL := oldL.next
+        end
+
+        if (oldorg = org) & (style = oldL.style) then
+          exit // old and new structure are synchronized again
+        end
+        FormatLine(@L.next)
+        if Y < botY + L.next.h then
+          exit // bot of frame
+        end
+      end
+
+      if L.eot or ((oldorg # org) or (style # oldL.style)) & (Y < botY + L.next.h) then
+        // redisplay to bottom of frame
+        DisplaySec0(F, x, y, org0, beg - org0, Y0, oldL0, L0, L.next)
+        BottomLine(F, x, y, Y, @L, org)
+        (*
+        IF org # oldorg THEN BottomLine(F, x, y, Y, L, org) ELSE Erase(F, x, y, botY, Y - botY) END;
+        *)
+        L.next := F.trailer
+      // Erase(F, x, y, botY, Y - botY) cleanup
+      else
+        // (oldorg = org) & (style = oldL.style)
+        dY := Y - oldY // connect line lists
+        L.next := oldL
+        if dY # 0 then
+          Y1 := Y // move sync part
+          inc(F.bot, Max(dY, 0)) // cut off bottom line
+          CollectLines(F, @L, @Y, @org)
+          F.bot := botY
+          Move(F, x, y, Y - dY, Y1 - Y, dY)
+        end
+
+        DisplaySec0(F, x, y, org0, beg - org0, Y0, oldL0, L0, oldL)
+        if dY # 0 then
+          AppendLines(F, x, y, org, L, @Y)
+        end
+      end
+
+    else
+      // L.next := F.trailer; Erase(F, x, y, botY, Y - botY)
+      BottomLine(F, x, y, Y, @L, org)
+      L.next := F.trailer
+    end
+  end
+end UpdateVisible
+
+procedure UpdateSection(F: Frame; x, y: int16; beg, end_, corr: int32)
+
+  var
+    L, L0: Line
+    org: int32
+begin
+  L := F.trailer.next
+  if (F.org > 0) & (beg < F.org + L.len_) then
+    if beg < F.org then
+      inc(F.org, corr)
+      corr := 0
+      beg := F.org
+    end
+    org := F.org - 1 // outside line
+    Validate(F, @org)
+    InitFormatter(F, org)
+    FormatLine(@L0)
+    if (org + L0.len_ = F.org) & (L0.style = L.style) then
+      if end_ > F.org then
+        UpdateVisible(F, x, y, beg, end_, corr)
+      end
+    else
+      if F.org - org < obdiv(L0.len_, 3) then
+        inc(corr, F.org - org)
+        F.org := org
+      else
+        dec(corr, org + L0.len_ - F.org)
+        F.org := org + L0.len_
+      end
+
+      if end_ < F.org then
+        end_ := F.org + corr
+      end
+      UpdateVisible(F, x, y, F.org, end_, corr)
+    end
+
+  else
+    org := F.org
+    L := F.trailer
+    while (L.next # F.trailer) & (org + L.next.len_ <= beg) do
+      L := L.next
+      inc(org, L.len_)
+    end
+    if org > 0 then
+      InitFormatter(F, org - L.len_)
+      FormatLine(@L0)
+      if (L0.len_ # L.len_) or (L.next.style # StyleAt(F, org)) then
+        beg := org - L.len_ // start at prev line
+      end
+    end
+
+    if (beg < org) or (L.next # F.trailer) then
+      UpdateVisible(F, x, y, beg, end_, corr)
+    end
+    (*
+    IF L.next # F.trailer THEN
+    IF org > 0 THEN
+    InitFormatter(F, org - L.len); FormatLine(L0);
+    IF L0.len # L.len THEN beg := org - L.len END (*start at prev line*)
+    END;
+    UpdateVisible(F, x, y, beg, end, corr)
+    END
+    *)
+  end
+end UpdateSection
+
+procedure DisplaySecBrk(F: Frame; x, y, Y0: int16; org0: int32; L0, L1: Line)
+  var
+    L: Line
+    Y: int16
+begin
+  L := L0
+  Y := Y0
+  Texts.OpenReader(@R1, F.text, org0)
+  while L # L1 do
+    if ~L.brk then
+      Erase(F, x, y, Y - L.h, L.h)
+      DisplayLine(F, 0, 0, x, y, 0, Y, L)
+    else
+      Texts.OpenReader(@R1, F.text, Texts.Pos(@R1) + L.len_) // skip
+    end
+
+    dec(Y, L.h)
+    L := L.next
+  end
+end DisplaySecBrk
+
+procedure UpdateStyle(F: Frame; M: pointer to Styles.UpdateMsg)
+
+  var
+    L0, L1: Line
+    org0, org1, pos, len_: int32
+    Y0, Y1, Y: int16
+    style: Styles.Style
+    L: Line
+    org: int32
+    tabs: boolean
+begin
+  RemoveMarks(F)
+  style := M.obj
+  L0 := F.trailer.next // top line
+  org0 := F.org
+  Y0 := F.H - F.top
+  while L0 # F.trailer do
+    if L0.style = style then
+      // [org0 Y0 L0]
+      org1 := org0
+      Y1 := Y0
+      L1 := L0
+      repeat
+        inc(org1, L1.len_)
+        dec(Y1, L1.h)
+        L1 := L1.next
+      until (L1 = F.trailer) or (L1.style # style)
+      // [org1 Y1 L1] (first outside)
+      if (M.id = Styles.leftmarg) & (M.dX # 0) then
+        DisplaySec(F, M.x, M.y, Y0, org0, L0, L1)
+      elsif M.id = Styles.fmode then
+        if (M.dX = Styles.right) & (Styles.left in style.opts) then
+          DisplaySecBrk(F, M.x, M.y, Y0, org0, L0, L1)
+        else
+          DisplaySec(F, M.x, M.y, Y0, org0, L0, L1)
+        end
+
+      elsif M.id = Styles.tabs then
+        while L0 # L1 do
+          if L0.tabs then
+            // format upto next line break
+            L := L0
+            org := org0
+            Y := Y0
+            len_ := 0
+            tabs := false
+            while ~L.brk & (L.next # L1) do
+              if L.tabs then
+                len_ := org + L.len_ - org0 // text portion to be formatted anyway
+              end
+              inc(org, L.len_)
+              dec(Y, L.h)
+              L := L.next
+            end
+
+            if L.tabs then
+              inc(len_, L.len_)
+            end
+            inc(org, L.len_) // line after brk or L1
+            L := L.next
+            dec(Y, L.h)
+            UpdateSection(F, M.x, M.y, org0, org0 + len_, 0) // L0 := L1
+            L0 := L
+            org0 := org
+            Y0 := Y
+          else
+            inc(org0, L0.len_)
+            dec(Y0, L0.h)
+            L0 := L0.next
+          end
+        end
+
+      elsif M.id < 0 then
+      // break -> no formatting
+      else
+        pos := org0 // replace
+        Validate(F, @pos)
+        UpdateSection(F, M.x, M.y, pos, org1, 0)
+      end
+
+      L0 := L1
+      org0 := org1
+      Y0 := Y1
+    else
+      inc(org0, L0.len_)
+      dec(Y0, L0.h)
+      L0 := L0.next
+    end
+  end
+end UpdateStyle
+
+// ---user interface---
+
+procedure TrackCaret*(F: Frame; x, y, X, Y: int16; keysum: pointer to set)
+  var
+    keys: set
+begin
+  if F.trailer.next # F.trailer then
+    keysum^ := {}
+    repeat
+      TrackMouse(@X, @Y, @keys, keysum)
+      SetCaret(F, Pos(F, X - F.X - x, Y - F.Y - y))
+    until keys = {}
+
+    (*
+    LocateObj(F, X - F.X - x, Y - F.Y - y, F.carLoc, obj);
+    FlipCaret(F, x, y);
+    keysum := {};
+    REPEAT
+    TrackMouse(X, Y, keys, keysum); LocateObj(F, X - F.X - x, Y - F.Y - y, loc, obj);
+    IF loc.pos # F.carLoc.pos THEN FlipCaret(F, x, y); F.carLoc := loc; FlipCaret(F, x, y) END
+    UNTIL keys = {};
+    F.car := TRUE;
+    KW.lib := FontAt(F.text, F.carLoc.pos)
+    *)
+  end
+end TrackCaret
+
+procedure TrackSelection*(F: Frame; x, y, X, Y: int16; keysum: pointer to set)
+  var
+    loc: Location
+    obj: Objects.Object
+    modKeys, keys: set
+    M: Oberon.SelectMsg
+begin
+  if F.trailer.next # F.trailer then
+    if F.sel then
+      FlipSelection(F, x, y, @F.selBeg, @F.selEnd)
+    end
+    LocateObj(F, X - F.X - x, Y - F.Y - y, @loc, @obj)
+    if F.sel & (loc.pos = F.selBeg.pos) & (F.selEnd.pos = F.selBeg.pos + 1) then
+      LocateObj(F, F.left, Y - F.Y - y, @F.selBeg, @obj)
+    else
+      F.selBeg := loc
+    end
+
+    F.sel := false
+    inc(loc.pos)
+    inc(loc.x, loc.dx)
+    F.selEnd := loc
+    FlipSelection(F, x, y, @F.selBeg, @F.selEnd)
+    keysum^ := {}
+    repeat
+      TrackMouse(@X, @Y, @keys, keysum)
+      LocateObj(F, X - F.X - x, Y - F.Y - y, @loc, @obj)
+      if loc.pos < F.selBeg.pos then
+        loc := F.selBeg
+      end
+      inc(loc.pos)
+      inc(loc.x, loc.dx)
+      if loc.pos < F.selEnd.pos then
+        FlipSelection(F, x, y, @loc, @F.selEnd)
+      elsif loc.pos > F.selEnd.pos then
+        FlipSelection(F, x, y, @F.selEnd, @loc)
+      end
+
+      F.selEnd := loc
+    until keys = {}
+
+    // ps - 3.4.98
+    Input.KeyState(@modKeys)
+    if Input.SHIFT in modKeys then
+      M.id := Oberon.get
+      M.F := nil
+      M.sel := nil
+      M.text := nil
+      M.time := -1
+      Display.Broadcast(@M)
+      if (M.time > 0) & (M.text = F.text) & (M.sel is Frame) then
+        if M.beg > F.selBeg.pos then
+          M.beg := F.selBeg.pos
+        end
+        if M.end_ < F.selEnd.pos then
+          M.end_ := F.selEnd.pos
+        end
+        FlipSelection(F, x, y, @F.selBeg, @F.selEnd)
+        LocatePos(F, M.beg, @F.selBeg)
+        LocatePos(F, M.end_, @F.selEnd)
+        FlipSelection(F, x, y, @F.selBeg, @F.selEnd)
+        M.F := M.sel
+        M.id := Oberon.set_
+        Display.Broadcast(@M)
+      end
+    end
+
+    F.time := Oberon.Time()
+    F.sel := true
+  end
+end TrackSelection
+
+procedure TrackLine*(F: Frame; x, y, X, Y: int16; org: pointer to int32; keysum: pointer to set)
+  var
+    old, new_: Location
+    keys: set
+begin
+  org^ := -1
+  if F.trailer.next # F.trailer then
+    LocateLine(F, Y - F.Y - y, @old)
+    dec(old.y, old.lin.dsr)
+    InvertRect(F, x, y, F.left + old.lin.off, old.y, old.lin.w0, 2)
+    keysum^ := {}
+    repeat
+      TrackMouse(@X, @Y, @keys, keysum)
+      LocateLine(F, Y - F.Y - y, @new_)
+      dec(new_.y, new_.lin.dsr)
+      if new_.org # old.org then
+        InvertRect(F, x, y, F.left + old.lin.off, old.y, old.lin.w0, 2)
+        InvertRect(F, x, y, F.left + new_.lin.off, new_.y, new_.lin.w0, 2)
+        old := new_
+      end
+    until keys = {}
+
+    InvertRect(F, x, y, F.left + new_.lin.off, new_.y, new_.lin.w0, 2)
+    org^ := new_.org
+  end
+end TrackLine
+
+procedure TrackWord*(F: Frame; x, y, X, Y: int16; pos: pointer to int32; keysum: pointer to set)
+  var
+    old, new_: Location
+    keys: set
+begin
+  pos^ := -1
+  if F.trailer.next # F.trailer then
+    LocateString(F, X - F.X - x, Y - F.Y - y, @old)
+    dec(old.y, old.lin.dsr)
+    InvertRect(F, x, y, old.x, old.y, old.dx, 2)
+    keysum^ := {}
+    repeat
+      TrackMouse(@X, @Y, @keys, keysum)
+      LocateString(F, X - F.X - x, Y - F.Y - y, @new_)
+      dec(new_.y, new_.lin.dsr)
+      if new_.pos # old.pos then
+        InvertRect(F, x, y, old.x, old.y, old.dx, 2)
+        InvertRect(F, x, y, new_.x, new_.y, new_.dx, 2)
+        old := new_
+      end
+    until keys = {}
+
+    InvertRect(F, x, y, new_.x, new_.y, new_.dx, 2)
+    pos^ := new_.pos
+  end
+end TrackWord
+
+procedure Show*(F: Frame; pos: int32)
+  var
+    M: DisplayMsg
+begin
+  if F.trailer.next # F.trailer then
+    Validate(F, @pos)
+    M.device := Display.screen
+    M.id := Display.full
+    M.F := F
+    M.pos := pos
+    Display.Broadcast(@M)
+  end
+end Show
+
+procedure CallCmd(const cmd: pointer to array of char; F: Frame; pos: int32; new_: boolean)
+  var
+    res: int16
+    par: Oberon.ParList
+begin
+  newgc(par)
+  par.frame := F
+  par.text := F.text
+  par.pos := pos
+  Oberon.Call(cmd, par, new_, @res)
+  if res > 0 then
+    Texts.WriteString(@W, "Call error: ")
+    Texts.WriteString(@W, @Modules.resMsg)
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end
+end CallCmd
+
+procedure Call*(F: Frame; pos: int32; new_: boolean)
+  var
+    S: Texts.Scanner
+begin
+  Texts.OpenScanner(@S, F.text, pos)
+  Texts.Scan(@S)
+  if S.class = Texts.Name then
+    CallCmd(@S.s, F, pos + S.len_, new_)
+  end
+end Call
+
+// ---message handling---
+
+procedure Warning(const s: pointer to array of char)
+begin
+  Texts.SetFont(@W, Fonts.Default)
+  Texts.WriteString(@W, s)
+  Texts.WriteLn(@W)
+  Texts.Append(Oberon.Log, W.buf)
+end Warning
+
+procedure Integrate(F: Frame; pos: int32; obj: Objects.Object; new_: boolean)
+  var
+    N: Display.ControlMsg
+    len_: int32
+begin
+  // clear XW.buf
+  while obj # nil do
+    if ~new_ then
+      // unbind
+      // IF (obj.lib = NIL) OR (obj.lib = F.text.obs) OR (obj.lib.name = "") THEN (*free own or public*)
+      N.id := Display.remove
+      N.F := obj(Display.Frame)
+      Display.Broadcast(@N)
+      (*ELSE Warning("cannot insert object: movement across library")
+      END*)
+    end
+
+    case obj of
+    | Display.Frame:
+      Deselect(F, obj(Display.Frame))
+    end
+    if (obj is Display.Frame) or (obj is Styles.Style) then
+      (* (*IF (obj.lib = NIL) OR (obj.lib.name = "") THEN !*)
+      lib := Objs(F.text); lib.GenRef(lib, ref);
+      IF ref > 255 THEN F.text.obs := NIL; lib := Objs(F.text); lib.GenRef(lib, ref) END;
+      lib.PutObj(lib, ref, obj)
+      (*ELSE lib := obj.lib; ref := obj.ref !
+      END*); Texts.SetFont(XW, lib); Texts.Write(XW, CHR(ref))*)
+      Texts.WriteObj(@XW, obj)
+    else
+      Warning("cannot insert object: not a frame")
+    end
+
+    obj := obj.slink
+  end
+
+  len_ := XW.buf.len_
+  Texts.Insert(F.text, pos, XW.buf)
+  if new_ then
+    SetCaret(F, pos + len_)
+  end
+end Integrate
+
+procedure Write*(F: Frame; ch: char; lib: Objects.Library; col, voff: int8)
+
+  var
+    M: Objects.CopyMsg
+    obj: Objects.Object
+    pos, i: int32
+    s: array 64 of char
+
+  procedure char_(ch: char): boolean
+  begin
+    return (" " <= ch) & (ch <= 96X) & (ch # 7FX) or (ch = CR) or (ch = TAB) or (ch = HYPH) // hyph
+  end char_
+
+  procedure ReadAll(ch: char; s: pointer to array of char)
+    var
+      i: int16
+  begin
+    s[0] := ch
+    i := 1
+    while Input.Available() > 0 do
+      Input.Read(@s[i])
+      inc(i)
+    end
+    s[i] := 0X
+  end ReadAll
+begin
+  // F.car
+  pos := F.carLoc.pos
+  if ch = 7FX then
+    if pos > F.org then
+      Texts.Delete(F.text, pos - 1, pos)
+      dec(pos)
+    end
+
+    ReadAll(ch, @s) // flush
+  elsif char_(ch) then
+    ReadAll(ch, @s)
+    // IF FALSE THEN KW.lib := lib; KW.col := col; KW.voff := voff END;
+    i := 0
+    while char_(s[i]) do
+      Texts.Write(@KW, s[i])
+      inc(i)
+    end
+    if i > 0 then
+      Texts.Insert(F.text, pos, KW.buf)
+      inc(pos, i)
+    end
+  else
+    if ch = LeftArrow then
+      dec(pos)
+    elsif ch = RightArrow then
+      inc(pos)
+    elsif ch = BRK then
+      obj := StyleAt(F, pos) // copy style
+      M.id := Objects.deep
+      obj.handle(obj, @M)
+      Integrate(F, pos, M.obj, true)
+      return
+    end
+
+    ReadAll(ch, @s) // flush
+  end
+
+  if (pos < F.text.len_) & (pos >= Lim(F)) then
+    while pos >= Lim(F) do
+      Show(F, F.org + F.trailer.next.len_)
+    end
+  elsif pos < F.org then
+    Show(F, pos)
+  end
+
+  SetCaret(F, pos)
+end Write
+
+procedure Open*(F: Frame; H: Objects.Handler; T: Texts.Text; org: int32; col, left, right, top, bot: int16)
+
+  var
+    L: Line
+begin
+  newgc(L)
+  L.len_ := 0
+  L.w := 0
+  L.eot := false
+  L.next := L
+  F.handle := H
+  F.text := T
+  F.org := org
+  F.trailer := L
+  F.left := left
+  F.right := right
+  F.top := top
+  F.bot := bot
+  F.col := col
+  F.mark := 0
+  F.car := false
+  F.sel := false
+end Open
+
+procedure Copy*(F: Frame; F1: pointer to Frame)
+begin
+  newgc(F1^)
+  Open(F1^, F.handle, F.text, F.org, F.col, F.left, F.right, F.top, F.bot)
+  F1^.hide := F.hide
+end Copy
+
+procedure CopyOver*(F: Frame; text: Texts.Text; beg, end_: int32)
+  var
+    buf: Texts.Buffer
+begin
+  if F.car then
+    SaveAndCopy(F, text, beg, end_, @XW)
+    buf := XW.buf
+    Texts.Insert(F.text, F.carLoc.pos, buf)
+    SetCaret(F, F.carLoc.pos + (end_ - beg))
+  end
+end CopyOver
+
+procedure CopyRecall*(F: Frame)
+  var
+    pos: int32
+begin
+  if F.car then
+    Texts.Recall(@XW.buf)
+    pos := F.carLoc.pos + XW.buf.len_
+    Texts.Insert(F.text, F.carLoc.pos, XW.buf)
+    SetCaret(F, pos)
+  end
+end CopyRecall
+
+procedure GetSelection*(F: Frame; M: pointer to Oberon.SelectMsg)
+begin
+  if F.sel then
+    if F.time > M.time then
+      M.sel := F
+      M.time := F.time
+      M.text := F.text
+      M.beg := F.selBeg.pos
+      M.end_ := Min(F.selEnd.pos, F.text.len_)
+    (*
+    ELSIF (F.text = M.text) & (F.selBeg.pos < M.beg) & (M.sel IS Frame) THEN (* extend selection over frame boundaries *)
+    IF (M.beg <= M.sel(Frame).org) & (F.selEnd.pos >= Pos(F, F.X+F.W, F.Y)) THEN
+    M.beg := F.selBeg.pos
+    END
+    *)
+    elsif F.text = M.text then
+      // extend selection over frame boundaries
+      // 7.4.98 - ps
+      if (F.selBeg.pos < M.beg) & (F.selEnd.pos >= Pos(F, F.X + F.W, F.Y)) then
+        M.beg := F.selBeg.pos
+      end
+      if (F.selEnd.pos > M.end_) & (F.selBeg.pos = F.org) then
+        M.end_ := F.selEnd.pos
+      end
+      if M.end_ > F.text.len_ then
+        M.end_ := F.text.len_
+      end
+    end
+  end
+end GetSelection
+
+procedure GetCaret*(F: Frame; M: pointer to Oberon.CaretMsg)
+begin
+  if F.car then
+    M.car := F
+    M.text := F.text
+    M.pos := F.carLoc.pos
+    M.res := 0
+  end
+end GetCaret
+
+procedure Update*(F: Frame; M: pointer to Texts.UpdateMsg)
+  var
+    end_: int32
+begin
+  // F.text = M.text
+  RemoveMarks(F)
+  ShowBrk(F, 0, M.x, M.y)
+  F.slink := nil
+  end_ := M.beg + M.len_
+  if M.end_ > end_ then
+    end_ := M.end_
+  end
+  UpdateSection(F, M.x, M.y, M.beg, end_, M.beg + M.len_ - M.end_)
+  (*
+  IF M.len = M.end - M.beg THEN UpdateSection(F, M.x, M.y, M.beg, M.end, 0) (*change*)
+  ELSIF M.beg = M.end THEN UpdateSection(F, M.x, M.y, M.beg, M.beg + M.len, M.len) (*insert*)
+  ELSIF M.len = 0 THEN UpdateSection(F, M.x, M.y, M.beg, M.end, M.beg - M.end) (*delete*)
+  (*ELSE UpdateSection(F, M.x, M.y, M.beg, M.end, M.beg - M.end + M.len)*)
+  END
+  *)
+end Update
+
+procedure Recall(F: Frame)
+  var
+    buf: Texts.Buffer
+    pos: int32
+begin
+  // F.car
+  newgc(buf)
+  Texts.OpenBuf(buf)
+  Texts.Recall(@buf)
+  pos := F.carLoc.pos + buf.len_
+  Texts.Insert(F.text, F.carLoc.pos, buf)
+  SetCaret(F, pos)
+end Recall
+
+(*--back scroll--
+PROCEDURE FormatBack(F: Frame; pos: LONGINT; H: INTEGER; VAR org: LONGINT; VAR L: Line; VAR h: INTEGER);
+VAR
+org0, org1: LONGINT;
+L0, L1: Line;
+BEGIN
+org := pos; h := 0;
+REPEAT
+ParaBeg(F.text, org-1, org0); InitFormatter(F, org0); FormatLine(L0); L1 := L0; org1 := org0; INC(h, L1.h);
+WHILE org1 + L1.len < org DO
+INC(org1, L1.len); FormatLine(L1.next); L1 := L1.next; INC(h, L1.h)
+END;
+L1.next := L; L := L0; org := org0
+UNTIL (h >= H) OR (org = 0);
+WHILE h > H DO DEC(h, L.h); INC(org, L.len); L := L.next END (*remove overhead*)
+END FormatBack;
+
+PROCEDURE ScrollBackTo(F: Frame; x, y: INTEGER; pos: LONGINT);
+VAR
+L, L0, L1: Line;
+org, org0: LONGINT;
+h0, Y: INTEGER;
+BEGIN
+org := F.org; Y := F.H - F.top; L := F.trailer.next;
+WHILE org # pos DO INC(org, L.len); DEC(Y, L.h); L := L.next END;
+IF (*(L.next # F.trailer) &*) (F.org > 0) THEN (*last line in frame*)
+L1 := F.trailer.next; (*keep old first line*)
+FormatBack(F, F.org, Y - F.bot - L.h, org0, F.trailer.next, h0);
+RemoveMarks(F); RemTick(F, x, y);
+F.org := org0; Y := F.H - F.top - h0; org := org0;
+L := F.trailer.next; WHILE L.next # L1 DO INC(org, L.len); L := L.next END; (*find last line of new section*)
+INC(org, L.len);
+ScrollBack(F, x, y, L1, L, Y, org); (*Erase(F, x, y, F.bot, Y - F.bot);*)
+BottomLine(F, x, y, Y, L, org); L.next := F.trailer;
+ShowTick(F, x, y);
+ShowBrk(F, Display.FG, x, y)
+END
+END ScrollBackTo;
+
+PROCEDURE ScrollToEnd(F: Frame; x, y: INTEGER);
+VAR L: Line; org: LONGINT; h: INTEGER;
+BEGIN L := F.trailer;
+FormatBack(F, F.text.len, F.H-F.top-F.bot, org, L, h);
+RemoveMarks(F); ShowText(F, x, y, org)
+END ScrollToEnd;
+--no scroll--*)
+// --end scroll--
+
+procedure SaveCaret()
+begin
+  saved.car := nil
+  saved.text := nil
+  saved.id := Oberon.get
+  Display.Broadcast(@saved)
+end SaveCaret
+
+procedure RestoreCaret()
+begin
+  if (saved.car # nil) & (saved.text # nil) then
+    saved.id := Oberon.set_
+    Display.Broadcast(@saved)
+  end
+end RestoreCaret
+
+procedure Edit*(F: Frame; x, y, X, Y: int16; Keys: set)
+
+  var
+    M: Oberon.ConsumeMsg
+    R: Texts.Reader
+    text: Texts.Text
+    time, pos, beg, end_: int32
+    keysum: set
+    ch: char
+begin
+  // M.X & M.Y not inside any object
+  DrawCursor(X, Y)
+  if F.trailer.next = F.trailer then
+    return // as nothing to edit exists
+  end
+  if X < x + F.X + Min(F.left, barW) then
+    // bar
+    (*--back scroll--
+    IF MR IN Keys THEN keysum := Keys; TrackLine(F, x, y, X, Y, pos, keysum); ScrollBackTo(F, x, y, pos)
+    ELSIF MM IN Keys THEN keysum := Keys;
+    --no scroll--*)
+    if (MR in Keys) or (MM in Keys) then
+      keysum := Keys
+      // --end scroll--
+      repeat
+        TrackMouse(@X, @Y, @Keys, @keysum)
+      until Keys = {}
+      if ~(ML in keysum) then
+        if (MR in keysum) or (y + F.Y + F.H < Y) then
+          if MM in keysum then
+            pos := 0
+          else
+            pos := F.org - obdiv(val(int32, F.H * 25), Fonts.Default.height)
+            if pos < 0 then
+              pos := 0
+            end
+          end
+
+        else
+          pos := obdiv((y + F.Y + F.H - Y) * F.text.len_, F.H)
+        end
+
+        Show(F, pos)
+      (*--back scroll--
+      ELSIF ~(MR IN keysum) THEN ScrollToEnd(F, x, y)
+      --no scroll--*)
+      elsif ~(MR in keysum) then
+        pos := F.text.len_
+        Show(F, pos)
+        // --end scroll--
+      end
+
+    elsif ML in Keys then
+      TrackLine(F, x, y, X, Y, @pos, @keysum)
+      if (pos >= 0) & ~(MR in keysum) & (pos # F.org) then
+        Show(F, pos)
+      end
+    end
+
+  else
+    // text
+    if MR in Keys then
+      TrackSelection(F, x, y, X, Y, @keysum)
+      if F.sel then
+        if keysum = {MR,ML} then
+          // delete text
+          Oberon.Defocus() // !
+          Oberon.GetSelection(@text, @beg, @end_, @time)
+          Texts.Delete(text, beg, end_)
+          SetCaret(F, beg)
+        elsif keysum = {MR,MM} then
+          // copy to focus
+          Oberon.GetSelection(@M.text, @M.beg, @M.end_, @time)
+          M.F := nil
+          Display.Broadcast(@M)
+        end
+      end
+
+    elsif MM in Keys then
+      TrackWord(F, x, y, X, Y, @pos, @keysum)
+      if MR in keysum then
+        if (pos >= 0) & ~(ML in keysum) then
+          CallCmd(OpenCmd, F, pos, false)
+        end
+      else
+        if pos >= 0 then
+          Call(F, pos, ML in keysum)
+        end
+      end
+
+    elsif ML in Keys then
+      if Oberon.New & F.car & (Pos(F, X - F.X - x, Y - F.Y - y) = F.carLoc.pos) then
+        // click on caret
+        Oberon.Defocus()
+        RestoreCaret()
+        TrackWord(F, x, y, X, Y, @pos, @keysum)
+        if MR in keysum then
+          if (pos >= 0) & ~(MM in keysum) then
+            CallCmd(OpenCmd, F, pos, false)
+          end
+        else
+          if pos >= 0 then
+            Call(F, pos, false)
+          end
+        end
+
+      else
+        if Oberon.New then
+          SaveCaret()
+        end
+        Oberon.Defocus()
+        TrackCaret(F, x, y, X, Y, @keysum)
+        if F.car then
+          if keysum = {ML,MM} then
+            // copy from selection
+            Oberon.GetSelection(@text, @beg, @end_, @time)
+            if time >= 0 then
+              CopyOver(F, text, beg, end_)
+            else
+              CopyRecall(F)
+            end
+          elsif keysum = {ML,MR} then
+            // copy font
+            Oberon.GetSelection(@text, @beg, @end_, @time)
+            if (time >= 0) & (F.carLoc.pos < F.text.len_) then
+              Texts.OpenReader(@R, F.text, F.carLoc.pos)
+              Texts.Read(@R, @ch)
+              if (R.lib # nil) & (R.lib is Fonts.Font) then
+                Texts.ChangeLooks(text, beg, end_, {0,1,2}, R.lib, R.col, R.voff)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end Edit
+
+procedure Control(F: Frame; M: pointer to Display.ControlMsg)
+  var
+    R: Texts.Finder
+    obj: Objects.Object
+    pos: int32
+begin
+  if M.id = Display.remove then
+    Texts.OpenFinder(@R, F.text, 0)
+    pos := R.pos
+    Texts.FindObj(@R, @obj)
+    while ~R.eot do
+      if obj = M.F then
+        Texts.Delete(F.text, pos, pos + 1)
+        M.res := 0
+        return
+      end
+      pos := R.pos
+      Texts.FindObj(@R, @obj)
+    end
+
+    Broadcast(F, M)
+  else
+    Broadcast(F, M)
+  end
+end Control
+
+procedure ModifyDsc(F: Frame; x, y: int16; M: pointer to Display.ModifyMsg)
+  var
+    R: Texts.Finder
+    obj: Objects.Object
+    G, msk: Display.Frame
+    loc: Location
+    pos, org, lim, lim0: int32
+    dw, mode: int16
+begin
+  org := F.org
+  lim := Lim(F)
+  lim0 := 0
+  mode := M.mode
+  msk := Mask(F)
+  loc.pos := 0
+  Texts.OpenFinder(@R, F.text, 0)
+  pos := R.pos
+  Texts.FindObj(@R, @obj)
+  while ~R.eot & (pos < F.text.len_) & (M.res < 0) do
+    case obj of
+    | Display.Frame:
+      G := obj(Display.Frame)
+      if M.F = G then
+        // direct dsc
+        if (M.dW = 0) & (M.dH = 0) & (M.dX # 0) & (M.dY # 0) then
+          M.res := 0 // move: ignore
+        elsif M.id = Display.extend then
+          dw := val(int16, M.W - Styles.scnW)
+          if dw > 0 then
+            dec(M.W, dw)
+            dec(M.dW, dw)
+          end
+        end
+      end
+
+      if M.res < 0 then
+        if pos < org then
+          M.mode := Display.state // before
+          M.dlink := msk
+          G.handle(G, M)
+          if R.pos >= org then
+            RemoveMarks(F)
+            UpdateSection(F, x, y, pos, pos + 1, 0)
+            org := F.org
+            lim := Lim(F)
+          end
+        else
+          if loc.pos >= 0 then
+            FindFrame(F, G, @loc)
+          end
+          if loc.pos >= 0 then
+            // pos < lim
+            M.x := x + F.X + loc.x - G.X // visible
+            M.y := y + F.Y + loc.y - G.Y
+            if M.F = G then
+              M.mode := Display.state
+              M.dlink := msk
+              G.handle(G, M)
+              RemoveMarks(F)
+              UpdateSection(F, x, y, pos, pos + 1, 0)
+              lim := Lim(F)
+            else
+              M.mode := mode
+              M.dlink := msk
+              G.handle(G, M)
+            end
+
+          else
+            M.mode := Display.state
+            M.dlink := msk
+            G.handle(G, M)
+            if lim0 < lim then
+              lim0 := lim
+              RemoveMarks(F)
+              UpdateSection(F, x, y, lim, lim + 1, 0)
+              lim := Lim(F)
+            end
+          end
+        end
+      end
+    end
+
+    pos := R.pos
+    Texts.FindObj(@R, @obj)
+  end
+
+  M.mode := mode
+end ModifyDsc
+
+procedure Modify(F: Frame; M: pointer to Display.ModifyMsg)
+  var
+    x, y: int16
+begin
+  x := M.x
+  y := M.y
+  if M.F = F then
+    RemTick(F, x, y)
+    RemoveMarks(F)
+    if M.id = Display.extend then
+      if M.dY > 0 then
+        Bar(F, x, y, F.H, M.dY)
+        Move(F, x, y, 0, F.H, M.dY)
+        inc(F.Y, M.dY)
+      end
+
+      Resize(F, x, y, M.Y) // Extend
+    elsif M.id = Display.reduce then
+      Resize(F, x, y, M.Y + M.dY) // Reduce
+      if M.dY > 0 then
+        RemTick(F, x, y)
+        Move(F, x, y, 0, F.H, -M.dY)
+        dec(F.Y, M.dY)
+        if F.H > 0 then
+          ShowTick(F, x, y)
+        end
+      end
+    end
+
+    M.res := 0
+  else
+    ModifyDsc(F, x, y, M)
+  end
+end Modify
+
+procedure Restore(F: Frame; x, y: int16; M: pointer to Display.DisplayMsg)
+  var
+    Y: int16
+begin
+  case M of
+  | PDisplayMsg:
+    RemoveMarks(F)
+    ShowText(F, x, y, M(PDisplayMsg).pos)
+  else
+    Y := F.Y
+    inc(F.Y, F.H)
+    F.H := 0
+    F.trailer.next := F.trailer
+    Resize(F, x, y, Y)
+  end
+end Restore
+
+procedure Handle*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    F1: Frame
+    bcast: boolean
+    x, y: int16
+    dlink: Objects.Object
+begin
+  case F of
+  | Frame:
+    case M of
+    | Display.PModifyMsg:
+      Modify(F, M)
+
+    | Display.PControlMsg:
+      Control(F, M)
+
+    | Display.PFrameMsg:
+      if (M.F = F) or (M.F = nil) then
+        x := M.x // idiot
+        y := M.y
+        dlink := M.dlink
+        bcast := M.F = nil // bcast = "msg has to be broadcasted to every descender"
+        M1 := M
+        case M1 of
+        | Oberon.PInputMsg:
+          if M1.id = Oberon.track then
+            if (M1.keys = {}) or ~TouchFrame(F, M1) then
+              Edit(F, x, y, M1.X, M1.Y, M1.keys)
+              M1.res := 0
+            end
+          elsif M1.id = Oberon.consume then
+            if F.car then
+              Write(F, M1.ch, M1.fnt, M1.col, M1.voff) // ELSE bcast := TRUE
+              M1.res := 0
+            end
+          end
+
+        | Oberon.PControlMsg:
+          if M1.id = Oberon.defocus then
+            RemoveCaret(F)
+          elsif M1.id = Oberon.neutralize then
+            RemoveMarks(F)
+          end
+
+          // bcast := TRUE
+
+        (*
+        ELSIF M1 IS Display.ModifyMsg THEN
+        WITH M1: Display.ModifyMsg DO Modify(F, M1) END
+        ELSIF M1 IS Display.ControlMsg THEN
+        WITH M1: Display.ControlMsg DO Control(F, M1) END
+        *)
+        | Display.PDisplayMsg:
+          if M1.device = Display.screen then
+            Restore(F, x, y, M1)
+          end
+
+        | Display.PConsumeMsg:
+          if F.car & (M1.id = Display.integrate) then
+            Integrate(F, F.carLoc.pos, M1.obj, true)
+            M1.res := 0
+          elsif (M1.F = F) & (M1.id = Display.drop) then
+            Integrate(F, Pos(F, M1.u, M1.v), M1.obj, false)
+            M1.res := 0
+          else
+            Broadcast(F, M1)
+          end
+
+        | Display.PLocateMsg:
+          Broadcast(F, M1)
+          if M1.loc = nil then
+            M1.u := M1.X - F.X - x
+            M1.v := M1.Y - F.Y - y
+            if (M1.u >= 0) & (M1.u <= F.W) & (M1.v >= 0) & (M1.v <= F.H) then
+              M1.loc := F
+              M1.res := 0
+            end
+          end
+
+        | Texts.PUpdateMsg:
+          if F.text = M1.text then
+            Update(F, M1) // cont
+            // ELSE bcast := TRUE
+          end
+
+        | Oberon.PSelectMsg:
+          if M1.id = Oberon.get then
+            GetSelection(F, M1) // ; bcast := TRUE
+          elsif (M1.sel = F) & (M1.text = F.text) then
+            if M1.id = Oberon.set_ then
+              SetSelection(F, M1.beg, M1.end_)
+            elsif M1.id = Oberon.reset then
+              RemoveSelection(F)
+            end
+          end
+
+        | Oberon.PCaretMsg:
+          if M1.id = Oberon.get then
+            GetCaret(F, M1) // ; bcast := TRUE
+          elsif (M1.car = F) & (M1.text = F.text) then
+            if M1.id = Oberon.set_ then
+              SetCaret(F, M1.pos)
+            // IF M1.pos # F.carLoc.pos THEN Show(F, M1.pos); SetCaret(F, M1.pos) END
+            elsif M1.id = Oberon.reset then
+              RemoveCaret(F)
+            end
+          end
+
+        | Oberon.PConsumeMsg:
+          if F.car then
+            CopyOver(F, M1.text, M1.beg, M1.end_) // ELSE bcast := TRUE
+            M1.res := 0
+          end
+
+        | Oberon.PRecallMsg:
+          if F.car then
+            Recall(F) // ELSE bcast := TRUE
+          end
+        (*
+        ELSIF M1 IS FocusMsg THEN  IF F.car THEN M1(FocusMsg).foc := F; M1.res := 0 END
+        *)
+        | PMarkMsg:
+          if M1.F = F then
+            if M1.id = car then
+              FlipCaret(F, x, y)
+            elsif M1.id = sel then
+              FlipSelection(F, x, y, @F.selBeg, @F.selEnd)
+            elsif (M1.id = arrow) & (F.H >= 16) then
+              Display.CopyPattern(FullColor, Display.downArrow, x + F.X, y + F.Y, Display.invert)
+            end
+          end
+
+        | Styles.PUpdateMsg:
+          UpdateStyle(F, M1) //
+          bcast := true
+
+        else
+          bcast := true
+        end
+
+        if bcast then
+          Broadcast(F, M)
+        end
+        M.x := x // reset idiot
+        M.y := y
+        M.dlink := dlink
+      else
+        Broadcast(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      Copy(F, @F1)
+      M.obj := F1
+
+    | Objects.PAttrMsg:
+      if (M.id = Objects.get) & (M.name = "Gen") then
+        copy(@M.s, "ScriptFrames.New", 64)
+      end
+
+    | Objects.PLinkMsg:
+      if M.id = Objects.get then
+        M.obj := F.text
+        M.res := 0
+        // ELSIF (M.id = Objects.set) & (M.obj IS Texts.Text) THEN F.text := M.obj(Texts.Text) END
+      end
+
+      (*
+      ELSIF M IS Objects.BindMsg THEN
+      WITH M: Objects.BindMsg DO
+      IF (F.lib = NIL) OR (F.lib.name = "") & (F.lib # M.lib) THEN
+      M.lib.GenRef(M.lib, ref); M.lib.PutObj(M.lib, ref, F)
+      END
+      END
+      ELSIF M IS Objects.LoadMsg THEN
+      WITH M: Objects.LoadMsg DO Files.Read(M.R, ch);
+      IF ch = Texts.TextBlockId THEN
+      Texts.Load(F.text, Files.Base(M.R), Files.Pos(M.R), len);
+      Files.Set(R, Files.Base(M.R), Files.Pos(M.R)+len)
+      END
+      END
+      ELSIF M IS Objects.StoreMsg THEN
+      WITH M: Objects.StoreMsg DO
+      Texts.Store(obj, Files.Base(M.R), Files.Pos(M.R), len);
+      Files.Set(M.R, Files.Base(M.R), Files.Pos(M.R) + len)
+      END
+      *)
+    end
+  end
+end Handle
+
+// --- creation ---
+
+procedure NewText*(text: Texts.Text; pos: int32): Frame
+  var
+    F: Frame
+begin
+  newgc(F)
+  Open(F, Handle, text, pos, BackCol, left, right, top, bot)
+  return F
+end NewText
+
+procedure LineExtend(L: Line; w, asr_, dsr: pointer to int16; brk: pointer to boolean)
+begin
+  w^ := val(int16, obdiv(L.W, Printer.Unit))
+  if (L.len_ = 1) & (pL.style # L.style) then
+    asr_^ := val(int16, obdiv(L.style.gap, Printer.Unit))
+    dsr^ := 0
+    brk^ := true // for printing: styles always break the line
+  else
+    brk^ := L.brk
+    asr_^ := val(int16, obdiv(val(int32, L.asr_) * Display.Unit, Printer.Unit))
+    dsr^ := val(int16, obdiv(val(int32, L.dsr) * Display.Unit, Printer.Unit))
+  end
+end LineExtend
+
+procedure FirstLine*(T: Texts.Text; w, asr_, dsr, nSpc: pointer to int16; len_: pointer to int32; brk, eot: pointer to boolean)
+  var
+    F: Frame
+    L: Line
+begin
+  newgc(F)
+  F.text := T
+  newgc(pL)
+  pL.style := Styles.defStyle
+  InitFormatter(F, 0)
+  FormatLine(@L)
+  len_^ := L.len_
+  eot^ := L.eot
+  nSpc^ := L.nSpc
+  LineExtend(L, w, asr_, dsr, brk)
+  pL := L
+end FirstLine
+
+procedure NextLine*(w, asr_, dsr, nSpc: pointer to int16; len_: pointer to int32; brk, eot: pointer to boolean)
+  var
+    L: Line
+begin
+  FormatLine(@L)
+  len_^ := L.len_
+  eot^ := L.eot
+  nSpc^ := L.nSpc
+  LineExtend(L, w, asr_, dsr, brk)
+  pL := L
+end NextLine
+
+procedure New*()
+  var
+    text: Texts.Text
+begin
+  newgc(text)
+  Texts.Open(text, "")
+  Objects.NewObj := NewText(text, 0)
+  (*
+  VAR F: Display.Frame;
+  L: Line; b: Box;
+  c: INTEGER;
+  BEGIN
+  F := Oberon.MarkedViewer(); F := F.dsc.next;
+  IF F  IS Frame THEN
+  L := F(Frame).trailer.next;
+  WHILE L # F(Frame).trailer DO
+  IF (L.box = NIL) OR (L.box.next = L.box) THEN Texts.Write(W, "0"); Texts.Write(W, 0DX)
+  ELSE b := L.box.next; c := 0;
+  WHILE b # L.box DO INC(c); b := b.next END;
+  Texts.WriteInt(W, c, 0); Texts.Write(W, 0DX)
+  END;
+  L := L.next
+  END;
+  Texts.Append(Oberon.Log, W.buf)
+  END
+  *)
+end New
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "New" end return New end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("ScriptFrames", cmd_)
+  if Display.Depth(0) # 1 then
+    BackCol := 14
+    BarCol := 13
+    FullColor := Display.FG - BackCol
+  else
+    BackCol := Display.BG
+    BarCol := Display.FG
+    FullColor := Display.FG
+  end
+
+  show := Show
+  barW := Fonts.Default.height + 2
+  top := asr(Fonts.Default.height, 1)
+  bot := top
+  left := barW + top
+  right := top
+  markW := top
+  eolW := top
+  Asr := Fonts.Default.maxY
+  Dsr := -Fonts.Default.minY
+  Texts.OpenWriter(@W)
+  Texts.OpenWriter(@KW)
+  Texts.OpenWriter(@XW)
+end ScriptFrames.

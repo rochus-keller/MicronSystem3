@@ -1,0 +1,57 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module FileDir [level=5]
+
+import OFS, Modules
+// pjm
+
+// Native-compatible FileDir module based on OFS
+
+type
+  FileName* = OFS.FileName
+
+  EntryHandler* = procedure(const name: pointer to array of char; time: int32; date: int32; size_: int32; continue: pointer to boolean)
+
+var
+  PathChar*: char
+  handler: EntryHandler
+
+procedure Handler(const name: pointer to array of char; time, date, size_: int32; flags: pointer to set)
+  var
+    b: boolean
+begin
+  if ~(OFS.EnumSize in flags^) then
+    size_ := (-2147483647-1)
+  end
+  b := true
+  handler(name, time, date, size_, @b)
+  if ~b then
+    flags^ := flags^ + {OFS.EnumStop}
+  end
+end Handler
+
+// Enumerate files matching the mask.  proc is upcalled for every file.  Iff detail is TRUE, the time, date and size parameters will be valid.  Recursive calls to Enumerate are not allocated in proc.
+procedure Enumerate*(const mask: pointer to array of char; detail: boolean; proc_: EntryHandler)
+  var
+    flags: set
+begin
+  if detail then
+    flags := {OFS.EnumSize,OFS.EnumTime}
+  else
+    flags := {}
+  end
+  handler := proc_
+  OFS.Enumerate(mask, @flags, Handler)
+end Enumerate
+
+// Compare two filenames.
+procedure SameName*(a, b: pointer to array of char): boolean
+begin
+  return a^ = b^ // to do: improve implementation to check underlying file system
+end SameName
+
+begin
+  Modules.Register("FileDir", nil)
+  PathChar := "/"
+end FileDir.

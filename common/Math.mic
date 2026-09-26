@@ -1,0 +1,399 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Math [level=5]
+// portable
+// 2026 migrated/compiled from various sources by me@rochus-keller.ch
+
+import Kernel, Modules
+
+(**
+Commonly needed Math for REALs.
+*)
+
+const
+  e* = 2.7182818284590451
+  pi* = 3.1415926535897931
+
+// sqrt:
+
+type
+  Int32Ptr = pointer to int32 // helper type for a variable reinterpreted by SYSTEM.VAL
+
+var
+  c11, c12, c13, c14, c15: real
+  // exp:
+  c21: real
+  c22, c23, c24: real
+  // ln:
+  c41: real
+  c42, c43, c44, c45: real
+  // sin, cos:
+  c31: real
+  p31, p32, p33, p30, q31, q32, q33: real
+  // atan:
+  c51: real
+  s51, c52, s52, p50, q52, q51, q50: real
+
+procedure sin*(x: real): real
+  var
+    n: int32
+    y, yy, f: real
+begin
+  y := c31 * x // c31 = 2/pi
+  n := val(int32, floor(y + 0.5))
+  y := val(real, 2) * (y - val(real, n))
+  yy := y * y
+  if ~((n mod 2) # 0) then
+    f := ((p33 * yy + p32) * yy + p31) / (p30 + yy) * y
+  else
+    f := ((q33 * yy + q32) * yy + q31) / (q31 + yy)
+  end
+
+  if ((asr(n, 1) mod 2) # 0) then
+    f := -f
+  end
+  return f
+end sin
+
+procedure cos*(x: real): real
+  var
+    n: int32
+    y, yy, f: real
+begin
+  y := c31 * x // c31 = 2/pi
+  n := val(int32, floor(y + 0.5))
+  y := val(real, 2) * (y - val(real, n))
+  inc(n)
+  yy := y * y
+  if ~((n mod 2) # 0) then
+    f := ((p33 * yy + p32) * yy + p31) / (p30 + yy) * y
+  else
+    f := ((q33 * yy + q32) * yy + q31) / (q31 + yy)
+  end
+
+  if ((asr(n, 1) mod 2) # 0) then
+    f := -f
+  end
+  return f
+end cos
+
+procedure arctan*(x: real): real
+  var
+    y, yy, s: real
+begin
+  y := abs(x)
+  s := val(real, 0)
+  if y > c51 then
+    y := -(val(real, 1) / y)
+    s := s51
+  elsif y > c52 then
+    y := (y - val(real, 1)) / (y + val(real, 1))
+    s := s52
+  end
+
+  yy := y * y
+  y := p50 * y / (yy + q52 + q51 / (yy + q50)) + s
+  if x < val(real, 0) then
+    y := -y
+  end
+  return y
+end arctan
+
+procedure sqrt*(x: real): real
+  var
+    e: int32
+    a, s: real
+    Error: array 32 of char
+begin
+  if x <= val(real, 0) then
+    if x = val(real, 0) then
+      return val(real, 0)
+    else
+      copy(@Error, "NEGATIVE ARGUMENT", 32)
+      halt(80)
+    end
+  else
+    a := cast(real, ord(bset(cast(uint32, x)) - {23..30} + {24..29})) // expo(a) = 126
+    e := band(sigc(shr(val(int32, cast(int32, x)), 23)), 255) - 126
+    s := c11 * a + c12 + c13 / (c14 + a)
+    s := (s + a / s) * 0.5
+    if ((e mod 2) # 0) then
+      inc(e)
+      s := c15 * s
+    end
+    return cast(real, cast(int32, s) + sigc(shl(val(int32, asr(e, 1)), 23)))
+  end
+  return 0.0 // TODO o2m: Micron requires a result on all control paths
+end sqrt
+
+procedure ln*(x: real): real
+  var
+    e: int32
+    a: real
+    Error: array 32 of char
+begin
+  if x <= val(real, 0) then
+    copy(@Error, "NEGATIVE ARGUMENT", 32)
+    halt(80)
+  else
+    a := cast(real, ord(bset(cast(uint32, x)) - {23..30} + {24..29})) // expo(a) = 126
+    e := band(sigc(shr(val(int32, cast(int32, x)), 23)), 255) - 126
+    if a < c41 then
+      a := val(real, 2) * a
+      dec(e)
+    end
+    a := (a - val(real, 1)) / (a + val(real, 1))
+    a := c42 * val(real, e) + a * (c43 + c44 / (c45 - a * a))
+    return a
+  end
+  return 0.0 // TODO o2m: Micron requires a result on all control paths
+end ln
+
+procedure exp*(x: real): real
+  var
+    n: int32
+    p, y, yy: real
+    Error: array 32 of char
+begin
+  y := c21 * x // 1/ln(2)
+  n := val(int32, floor(y + 0.5))
+  y := y - val(real, n)
+  if y >= val(real, 0) then
+    inc(n)
+  end
+  if n < -128 then
+    return val(real, 0)
+  elsif n > 127 then
+    copy(@Error, "ARGUMENT TOO LARGE", 32)
+    halt(81)
+  else
+    yy := y * y
+    p := (c22 + c23 * yy) * y
+    p := p / (c24 + yy - p) + 0.5
+    if y < val(real, 0) then
+      p := val(real, 2) * p
+    end
+    return cast(real, cast(int32, p) + sigc(shl(val(int32, n), 23)))
+  end
+  return 0.0 // TODO o2m: Micron requires a result on all control paths
+end exp
+
+procedure TestSin(x: real)
+  var
+    n: int32
+    y, yy, f, t: real
+begin
+  y := c31 * x
+  n := val(int32, floor(y + 0.5))
+  y := val(real, 2) * (y - val(real, n))
+  yy := y * y
+  if ~((n mod 2) # 0) then
+    t := p33 * yy + p32
+    t := t * yy + p31
+    f := t / (p30 + yy) * y
+  else
+    t := q33 * yy + q32
+    t := t * yy + q31
+    f := t / (q31 + yy)
+  end
+
+  if ((asr(n, 1) mod 2) # 0) then
+    f := -f
+  end
+  Kernel.WriteHex(cast(int32, f), 8)
+end TestSin
+
+procedure TestCos(x: real)
+  var
+    n: int32
+    y, yy, f, t: real
+begin
+  y := c31 * x
+  n := val(int32, floor(y + 0.5))
+  y := val(real, 2) * (y - val(real, n))
+  inc(n)
+  yy := y * y
+  if ~((n mod 2) # 0) then
+    t := p33 * yy + p32
+    t := t * yy + p31
+    f := t / (p30 + yy) * y
+  else
+    t := q33 * yy + q32
+    t := t * yy + q31
+    f := t / (q31 + yy)
+  end
+
+  if ((asr(n, 1) mod 2) # 0) then
+    f := -f
+  end
+  Kernel.WriteHex(cast(int32, f), 8)
+end TestCos
+
+procedure TestArctan(x: real)
+  var
+    y, yy, s, t: real
+begin
+  y := abs(x)
+  s := val(real, 0)
+  if y > c51 then
+    y := -(val(real, 1) / y)
+    s := s51
+  elsif y > c52 then
+    y := (y - val(real, 1)) / (y + val(real, 1))
+    s := s52
+  end
+
+  yy := y * y
+  t := yy + q50
+  t := q51 / t
+  t := yy + q52 + t
+  y := p50 * y / t + s
+  if x < val(real, 0) then
+    y := -y
+  end
+  Kernel.WriteHex(cast(int32, y), 8)
+end TestArctan
+
+procedure TestLn(x: real)
+  var
+    e: int32
+    a, t: real
+begin
+  a := cast(real, ord(bset(cast(uint32, x)) - {23..30} + {24..29}))
+  e := band(sigc(shr(val(int32, cast(int32, x)), 23)), 255) - 126
+  if a < c41 then
+    a := val(real, 2) * a
+    dec(e)
+  end
+  a := (a - val(real, 1)) / (a + val(real, 1))
+  t := c45 - a * a
+  t := c44 / t
+  t := c43 + t
+  a := c42 * val(real, e) + a * t
+  Kernel.WriteHex(cast(int32, a), 8)
+end TestLn
+
+procedure TestExp(x: real)
+  var
+    n: int32
+    p, y, yy, f: real
+begin
+  y := c21 * x
+  n := val(int32, floor(y + 0.5))
+  y := y - val(real, n)
+  if y >= val(real, 0) then
+    inc(n)
+  end
+  if n < -128 then
+    f := val(real, 0)
+  elsif n > 127 then
+    halt(81)
+  else
+    yy := y * y
+    p := c23 * yy
+    p := (c22 + p) * y
+    p := p / (c24 + yy - p) + 0.5
+    if y < val(real, 0) then
+      p := val(real, 2) * p
+    end
+    f := cast(real, cast(int32, p) + sigc(shl(val(int32, n), 23)))
+  end
+
+  Kernel.WriteHex(cast(int32, f), 8)
+end TestExp
+
+procedure TestSqrt(x: real)
+  var
+    e: int32
+    a, s: real
+begin
+  a := cast(real, ord(bset(cast(uint32, x)) - {23..30} + {24..29}))
+  e := band(sigc(shr(val(int32, cast(int32, x)), 23)), 255) - 126
+  s := c13 / (c14 + a)
+  s := c11 * a + c12 + s
+  s := (s + a / s) * 0.5
+  if ((e mod 2) # 0) then
+    inc(e)
+    s := c15 * s
+  end
+  s := cast(real, cast(int32, s) + sigc(shl(val(int32, asr(e, 1)), 23)))
+  Kernel.WriteHex(cast(int32, s), 8)
+end TestSqrt
+
+procedure Test*()
+begin
+  Kernel.WriteString("Math.Test:")
+  Kernel.WriteLn()
+  Kernel.WriteString(" sin(0)=")
+  TestSin(0.0)
+  Kernel.WriteLn()
+  Kernel.WriteString(" cos(0)=")
+  TestCos(0.0)
+  Kernel.WriteLn()
+  Kernel.WriteString(" atan(0)=")
+  TestArctan(0.0)
+  Kernel.WriteLn()
+  Kernel.WriteString(" ln(1)=")
+  TestLn(1.0)
+  Kernel.WriteLn()
+  Kernel.WriteString(" exp(0)=")
+  TestExp(0.0)
+  Kernel.WriteLn()
+  Kernel.WriteString(" sqrt(4)=")
+  TestSqrt(4.0)
+  Kernel.WriteLn()
+  Kernel.WriteString(" sin(pi/2)=")
+  TestSin(val(real, 1.5707963))
+  Kernel.WriteLn()
+  Kernel.WriteString(" exp(1)=")
+  TestExp(1.0)
+  Kernel.WriteLn()
+  Kernel.WriteString(" sqrt(2)=")
+  TestSqrt(2.0)
+  Kernel.WriteLn()
+  Kernel.WriteString("Math.Test done")
+  Kernel.WriteLn()
+end Test
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Test" end return Test end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Math", cmd_)
+  cast(Int32Ptr, @c11)^ := 1051703937
+  cast(Int32Ptr, @c12)^ := 1063670306
+  cast(Int32Ptr, @c13)^ := val(int32, val(int32, 3199886225))
+  cast(Int32Ptr, @c14)^ := 1056964622
+  cast(Int32Ptr, @c15)^ := 1060439283 // 1/sqrt(2)
+  cast(Int32Ptr, @c21)^ := 1069066811 // 1/ln(2)
+  cast(Int32Ptr, @c22)^ := 1088872876
+  cast(Int32Ptr, @c23)^ := 1030510181
+  cast(Int32Ptr, @c24)^ := 1101433787
+  cast(Int32Ptr, @c41)^ := 1060439283 // 1/sqrt(2)
+  cast(Int32Ptr, @c42)^ := 1060205080 // ln(2)
+  cast(Int32Ptr, @c43)^ := 1063600678
+  cast(Int32Ptr, @c44)^ := 1072314454
+  cast(Int32Ptr, @c45)^ := 1070862669
+  cast(Int32Ptr, @c31)^ := 1059256707 // 2/pi
+  cast(Int32Ptr, @p31)^ := 1112753727
+  cast(Int32Ptr, @p32)^ := val(int32, val(int32, 3230966325))
+  cast(Int32Ptr, @p33)^ := 1035054169
+  cast(Int32Ptr, @p30)^ := 1116110944
+  cast(Int32Ptr, @q31)^ := 1111408585
+  cast(Int32Ptr, @q32)^ := val(int32, val(int32, 3243987960))
+  cast(Int32Ptr, @q33)^ := 1055213816
+  cast(Int32Ptr, @c51)^ := 1075479162 // 1 + sqrt(2)
+  cast(Int32Ptr, @s51)^ := 1070141403 // pi/2
+  cast(Int32Ptr, @c52)^ := 1054086093 // sqrt(2) - 1
+  cast(Int32Ptr, @s52)^ := 1061752795 // pi/4
+  cast(Int32Ptr, @p50)^ := 1087098981
+  cast(Int32Ptr, @q52)^ := 1091149674
+  cast(Int32Ptr, @q51)^ := val(int32, val(int32, 3230530507))
+  cast(Int32Ptr, @q50)^ := 1073638578
+end Math.

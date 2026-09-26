@@ -1,0 +1,1666 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module ColorGadgets [level=5]
+
+import Files, Objects, Math, Display, Printer, Input, Texts, Oberon, Strings, Attributes, Display3, Printer3, Effects, Gadgets, Colors, Images, Modules
+
+// portable *
+// eos
+
+(**
+Gadget controls for displaying and manipulating colors and color objects
+**)
+
+(*
+26.11.1999 - only convert display color to positive value for rendering
+10.05.2000 - avoid losing hue value when tracking wedge (suggested by pjm)
+*)
+
+// color wells displaying color model *
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  Well* = pointer to WellDesc
+  WellDesc* = object (Gadgets.FrameDesc)
+    dcol: int32 // currently displayed value
+  end
+
+  // circular area for manipulating hue and saturation of a color *
+  Disc* = pointer to DiscDesc
+  DiscDesc* = object (Gadgets.FrameDesc)
+    bg: int32 // background color
+    hue: real // current hue and saturation
+    sat: real
+    img: Images.Image // background image with color circle
+  end
+
+  // wedge shaped area for manipulating saturation and value *
+  Wedge* = pointer to WedgeDesc
+  WedgeDesc* = object (Gadgets.FrameDesc)
+    bg: int32 // background color
+    hue: real // current hue, saturation and value
+    sat, val_: real
+    img: Images.Image // background image with colored wedge
+  end
+
+var
+  DragMarker: Oberon.Marker
+  MarkerFG, MarkerBG: AnyPtr
+  Enum: record
+    img: Images.Image
+    x, y: int16
+  end
+
+// --- Support Procedures ---
+
+procedure atan2(x, y: real): real
+  var
+    phi: real
+begin
+  if (abs(x) < 1.0) & (abs(y) >= abs(x * 3.40282347E38)) then
+    // y/x would result in overflow/divide by zero trap
+    if y >= val(real, 0) then
+      phi := val(real, Math.pi / val(longreal, 2))
+    else
+      phi := val(real, val(longreal, 3) * Math.pi / val(longreal, 2))
+    end
+
+  elsif x < val(real, 0) then
+    // 2nd or 3rd quadrant
+    phi := val(real, val(longreal, Math.arctan(y / x)) + Math.pi)
+  elsif y > val(real, 0) then
+    // 1st quadrant
+    phi := Math.arctan(y / x)
+  else
+    // 4th quadrant
+    phi := val(real, val(longreal, 2) * Math.pi + val(longreal, Math.arctan(y / x)))
+  end
+
+  return phi
+end atan2
+
+procedure RestoreRuns(x, y, w, h: int16)
+  var
+    x0, len_, l, i, j: int16
+    line: array 512 of char
+    b: char
+begin
+  x0 := x
+  while h > 0 do
+    x := x0
+    len_ := w
+    repeat
+      if len_ < val(int16, 512) then
+        l := len_
+      else
+        l := val(int16, 512)
+      end
+      Images.GetPixels(Enum.img, x - Enum.x, y - Enum.y, l, @Images.D8, @line, 512, @Images.SrcCopy)
+      i := 0
+      while i < l do
+        b := line[i]
+        j := i + 1
+        while (j < l) & (line[j] = b) do
+          inc(j)
+        end
+        Display.ReplConst(val(int32, ord(b)), x + i, y, j - i, 1, Display.replace)
+        i := j
+      end
+
+      inc(x, l)
+      dec(len_, l)
+    until len_ = 0
+
+    dec(h)
+    inc(y)
+  end
+end RestoreRuns
+
+procedure RestoreBlock(x, y, w, h: int16)
+  var
+    offset: int32
+begin
+  offset := (y - Enum.y) * Enum.img.bpr + asr((x - Enum.x) * Enum.img.fmt.bpp, 3)
+  Display.TransferBlock(Enum.img.mem, Enum.img.memLen, offset, Enum.img.bpr, x, y, w, h, Display.set_)
+end RestoreBlock
+
+procedure RestoreImageRect(img: Images.Image; x, y, w, h, dx, dy: int16; mask: Display3.Mask)
+  var
+    xw, yh: int16
+begin
+  inc(x, dx)
+  inc(y, dy)
+  xw := x + w
+  yh := y + h
+  if x < mask.X then
+    x := mask.X
+  end
+  if xw > mask.X + mask.W then
+    xw := mask.X + mask.W
+  end
+  if y < mask.Y then
+    y := mask.Y
+  end
+  if yh > mask.Y + mask.H then
+    yh := mask.Y + mask.H
+  end
+  w := xw - x
+  h := yh - y
+  Oberon.RemoveMarks(x, y, w, h)
+  Enum.img := img
+  Enum.x := dx
+  Enum.y := dy
+  if Display.TransferFormat(dx) = Display.unknown then
+    Display3.EnumRect(mask, x, y, w, h, RestoreRuns)
+  else
+    Display3.EnumRect(mask, x, y, w, h, RestoreBlock)
+  end
+end RestoreImageRect
+
+// --- Wells ---*
+
+procedure DrawMarker(x, y: int16)
+begin
+  dec(x, 3)
+  dec(y)
+  Effects.OpenCursor(x, y, 16, 17)
+  Display.CopyPattern(Display3.white, MarkerBG, x, y, Display.paint)
+  Display.CopyPattern(Display3.black, MarkerFG, x, y, Display.paint)
+end DrawMarker
+
+procedure FadeMarker(x, y: int16)
+begin
+  Effects.CloseCursor()
+end FadeMarker
+
+procedure InitDragMarker()
+  var
+    p: array 17 of set
+begin
+  p[0] := {}
+  p[1] := {1,2,5,6}
+  p[2] := {3,4}
+  p[3] := {3,4,9,10}
+  p[4] := {3,4,8,11}
+  p[5] := {3,4,7,12}
+  p[6] := {3,4,6,13}
+  p[7] := {3..5,14}
+  p[8] := {3,4,9,14}
+  p[9] := {3..5,8,10,13}
+  p[10] := {4..6,9,12}
+  p[11] := {6,7,9,11,13}
+  p[12] := {8..10,12}
+  p[13] := {9,12}
+  p[14] := {9,12}
+  p[15] := {10,11}
+  p[16] := {}
+  MarkerFG := Display.NewPattern(16, 17, @p)
+  p[0] := {1..6}
+  p[1] := {0..7}
+  p[2] := {2..5}
+  p[3] := {2..5,8..11}
+  p[4] := {2..5,7..12}
+  p[5] := {2..13}
+  p[6] := {2..7,12..14}
+  p[7] := {2..6,13..15}
+  p[8] := {2..5,8..10,13..15}
+  p[9] := {2..14}
+  p[10] := {3..13}
+  p[11] := {5..14}
+  p[12] := {7..13}
+  p[13] := {8..13}
+  p[14] := {8..13}
+  p[15] := {9..12}
+  p[16] := {10,11}
+  MarkerBG := Display.NewPattern(16, 17, @p)
+  DragMarker.Draw := DrawMarker
+  DragMarker.Fade := FadeMarker
+end InitDragMarker
+
+procedure TrackWell(well: Well; msg: pointer to Oberon.InputMsg)
+
+  var
+    fx, fy, x, y, u, v, r, g, b: int16
+    mask: Display3.Mask
+    marker: Oberon.Marker
+    keysum, keys: set
+    frame: Display.Frame
+    lm: Objects.LinkMsg
+    am: Objects.AttrMsg
+    cm: Objects.CopyMsg
+begin
+  fx := msg.x + well.X
+  fy := msg.y + well.Y
+  Gadgets.MakeMask(well, fx, fy, msg.dlink, @mask)
+  Oberon.FadeCursor(@Oberon.Mouse)
+  Display3.Rect3D(mask, Display3.bottomC, Display3.topC, fx, fy, well.W, well.H, 1, Display.replace)
+  marker := Effects.Arrow
+  keysum := msg.keys
+  repeat
+    Input.Mouse(@keys, @x, @y)
+    if keys - keysum # {} then
+      // new key pressed
+      Oberon.FadeCursor(@Oberon.Mouse)
+      Display3.Rect3D(mask, Display3.topC, Display3.bottomC, fx, fy, well.W, well.H, 1, Display.replace)
+      keysum := keysum + keys
+      if keysum = {0..2} then
+        marker := Effects.Arrow
+      else
+        marker := DragMarker
+      end
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @marker, x, y)
+    Input.Mouse(@keys, @x, @y)
+  until keys = {}
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+  Display3.Rect3D(mask, Display3.topC, Display3.bottomC, fx, fy, well.W, well.H, 1, Display.replace)
+  if keysum = {1} then
+    Gadgets.ExecuteAttr(well, "Cmd", msg.dlink, nil, nil)
+  elsif keysum # {} then
+    Gadgets.ThisFrame(x, y, @frame, @u, @v)
+    if frame # nil then
+      if keysum = {2,1} then
+        // share model with target
+        lm.id := Objects.set_
+        lm.obj := well.obj
+        lm.res := -1
+        if well.obj # nil then
+          Attributes.GetString(well, "TargetLink", @lm.name, 32)
+          if keysum = {1,0} then
+            Objects.Stamp(@cm)
+            cm.id := Objects.shallow
+            well.obj.handle(well.obj, @cm)
+            lm.obj := cm.obj
+          end
+
+          lm.id := Objects.set_
+          lm.res := -1
+          frame.handle(frame, @lm)
+          if lm.res >= 0 then
+            Gadgets.Update(well.obj)
+          end
+        end
+      end
+
+      if (keysum = {1,0}) or (lm.res < 0) then
+        // copy color value
+        Attributes.GetString(well, "TargetField", @am.name, 32)
+        am.id := Objects.set_
+        am.class := Objects.Int
+        am.i := well.dcol
+        am.res := -1
+        frame.handle(frame, @am)
+        if (am.res < 0) & (well.dcol < 0) then
+          Display.GetColor(well.dcol, @r, @g, @b)
+          am.i := Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, r, g, b)
+          frame.handle(frame, @am)
+        end
+
+        if am.res >= 0 then
+          Gadgets.Update(frame)
+        end
+      end
+    end
+  end
+
+  Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, x, y)
+  msg.res := 0
+end TrackWell
+
+procedure RestoreWell(well: Well; fx, fy: int16; mask: Display3.Mask)
+  var
+    w, h, r, g, b: int16
+    dcol: int32
+begin
+  w := well.W
+  h := well.H
+  Oberon.RemoveMarks(fx, fy, w, h)
+  Display3.Rect3D(mask, Display3.topC, Display3.bottomC, fx, fy, w, h, 1, Display.replace)
+  Display3.Rect(mask, Display3.groupC, Display.solid, fx + 1, fy + 1, w - 2, h - 2, 1, Display.replace)
+  dcol := well.dcol
+  if (dcol < 0) & ~Display.TrueColor(fx) then
+    Display.GetColor(dcol, @r, @g, @b)
+    dcol := Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, r, g, b)
+  end
+
+  Display3.FilledRect3D(mask, Display3.bottomC, Display3.topC, dcol, fx + 2, fy + 2, w - 4, h - 4, 1, Display.replace)
+  if Gadgets.selected in well.state then
+    Display3.FillPattern(mask, Display3.white, Display3.selectpat, fx, fy, fx, fy, w, h, Display.paint)
+  end
+end RestoreWell
+
+procedure PrintWell(well: Well; msg: pointer to Display.DisplayMsg)
+  var
+    mask: Display3.Mask
+    x, y, w, h, one, two: int16
+
+  procedure pc(x: int32): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end pc
+begin
+  Gadgets.MakePrinterMask(well, msg.x, msg.y, msg.dlink, @mask)
+  x := msg.x
+  y := msg.y
+  w := pc(well.W)
+  h := pc(well.H)
+  one := pc(1)
+  two := 2 * one
+  Printer3.Rect3D(mask, Display3.topC, Display3.bottomC, x, y, w, h, one, Display.replace)
+  Printer3.Rect(mask, Display3.groupC, Display.solid, x + one, y + one, w - two, h - two, one, Display.replace)
+  Printer3.FilledRect3D(mask, Display3.bottomC, Display3.topC, well.dcol, x + two, y + two, w - 2 * two, h - 2 * two, one, Display.replace)
+  if Gadgets.selected in well.state then
+    Printer3.FillPattern(mask, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end PrintWell
+
+procedure UpdateWell(well: Well; msg: pointer to Display.FrameMsg)
+  var
+    am: Objects.AttrMsg
+    fx, fy: int16
+    mask: Display3.Mask
+begin
+  if well.obj # nil then
+    Attributes.GetString(well, "Field", @am.name, 32)
+    am.id := Objects.get
+    am.class := Objects.Inval
+    am.res := -1
+    well.obj.handle(well.obj, @am)
+    if (am.res >= 0) & (am.class = Objects.Int) & (am.i # well.dcol) then
+      well.dcol := am.i
+      fx := msg.x + well.X
+      fy := msg.y + well.Y
+      Gadgets.MakeMask(well, fx, fy, msg.dlink, @mask)
+      RestoreWell(well, fx, fy, mask)
+    end
+  end
+end UpdateWell
+
+procedure ConsumeWell(well: Well; msg: pointer to Display.ConsumeMsg)
+  var
+    am: Objects.AttrMsg
+begin
+  am.id := Objects.get
+  copy(@am.name, "Value", 32)
+  am.class := Objects.Inval
+  am.res := -1
+  msg.obj.handle(msg.obj, @am)
+  if (am.res >= 0) & (am.class = Objects.Int) then
+    well.dcol := am.i
+    if well.obj # nil then
+      Attributes.GetString(well, "Field", @am.name, 32)
+      am.id := Objects.set_
+      am.res := -1
+      well.obj.handle(well.obj, @am)
+      if am.res >= 0 then
+        Gadgets.Update(well.obj)
+      end
+
+    else
+      Gadgets.Update(well)
+    end
+  end
+end ConsumeWell
+
+procedure WellAttr(well: Well; msg: pointer to Objects.AttrMsg)
+  var
+    am: Objects.AttrMsg
+begin
+  if msg.id = Objects.enum then
+    msg.Enum("Color")
+    msg.Enum("Field")
+    msg.Enum("Cmd")
+    msg.Enum("TargetLink")
+    msg.Enum("TargetField")
+    Gadgets.framehandle(well, msg)
+  elsif msg.id = Objects.get then
+    if msg.name = "Gen" then
+      msg.class := Objects.String
+      copy(@msg.s, "ColorGadgets.NewWell", 64)
+      msg.res := 0
+    elsif msg.name = "Color" then
+      msg.class := Objects.Int
+      msg.i := well.dcol
+      msg.res := 0
+    else
+      Gadgets.framehandle(well, msg)
+      if msg.res < 0 then
+        if msg.name = "Field" then
+          msg.class := Objects.String
+          copy(@msg.s, "Color", 64)
+          msg.res := 0
+        elsif msg.name = "Cmd" then
+          msg.class := Objects.String
+          copy(@msg.s, "", 64)
+          msg.res := 0
+        elsif msg.name = "TargetLink" then
+          msg.class := Objects.String
+          copy(@msg.s, "Model", 64)
+          msg.res := 0
+        elsif msg.name = "TargetField" then
+          msg.class := Objects.String
+          copy(@msg.s, "Color", 64)
+          msg.res := 0
+        end
+      end
+    end
+
+  elsif msg.id = Objects.set_ then
+    if msg.name = "Color" then
+      if (msg.class = Objects.Int) & (msg.i < 256) then
+        well.dcol := msg.i
+        msg.res := 0
+        if well.obj # nil then
+          Attributes.GetString(well, "Field", @am.name, 32)
+          am.id := Objects.set_
+          am.class := Objects.Int
+          am.i := well.dcol
+          am.res := -1
+          well.obj.handle(well.obj, @am)
+          if am.res >= 0 then
+            Gadgets.Update(well.obj)
+          end
+        end
+      end
+
+    else
+      Gadgets.framehandle(well, msg)
+    end
+  end
+end WellAttr
+
+procedure CopyWell*(msg: pointer to Objects.CopyMsg; from, to_: Well)
+begin
+  Gadgets.CopyFrame(msg, from, to_)
+  to_.dcol := from.dcol
+end CopyWell
+
+procedure HandleWell*(obj: Objects.Object; msg: pointer to Objects.ObjMsg)
+  var
+    msg3: Display.PFrameMsg
+    well, copy_: Well
+    fx, fy: int16
+    mask: Display3.Mask
+    ver: int32
+begin
+  well := obj(Well)
+  case msg of
+  | Display.PFrameMsg:
+    if (msg.F = nil) or (msg.F = well) then
+      msg3 := msg
+      case msg3 of
+      | Oberon.PInputMsg:
+        if (msg3.id = Oberon.track) & (msg3.keys = {1}) & ~(Gadgets.selected in well.state) & Gadgets.InActiveArea(well, msg3) then
+
+          TrackWell(well, msg3)
+        else
+          Gadgets.framehandle(well, msg3)
+        end
+
+      | Display.PDisplayMsg:
+        if msg3.device = Display.screen then
+          fx := msg3.x + well.X
+          fy := msg3.y + well.Y
+          if msg3.id = Display.full then
+            Gadgets.MakeMask(well, fx, fy, msg3.dlink, @mask)
+            RestoreWell(well, fx, fy, mask)
+          elsif msg3.id = Display.area then
+            Gadgets.MakeMask(well, fx, fy, msg3.dlink, @mask)
+            Display3.AdjustMask(mask, fx + msg3.u, fy + (well.H - 1) + msg3.v, msg3.w, msg3.h)
+            RestoreWell(well, fx, fy, mask)
+          end
+
+        elsif msg3.device = Display.printer then
+          PrintWell(well, msg3)
+        end
+
+      | Gadgets.PUpdateMsg:
+        if msg3.obj = well.obj then
+          UpdateWell(well, msg3)
+        elsif msg3.obj = well then
+          fx := msg3.x + well.X
+          fy := msg3.y + well.Y
+          Gadgets.MakeMask(well, fx, fy, msg3.dlink, @mask)
+          RestoreWell(well, fx, fy, mask)
+        end
+
+      | Display.PControlMsg:
+        if well.obj # nil then
+          well.obj.handle(well.obj, msg3)
+        end
+
+        if (msg3.id = Display.restore) & (msg3.stamp # well.stamp) then
+          well.stamp := msg3.stamp
+          UpdateWell(well, msg3)
+        end
+
+      | Display.PConsumeMsg:
+        if (msg3.id = Display.drop) & (msg3.obj # nil) then
+          ConsumeWell(well, msg3)
+        end
+
+      else
+        Gadgets.framehandle(well, msg3)
+      end
+    end
+
+  | Objects.PAttrMsg:
+    WellAttr(well, msg(Objects.PAttrMsg))
+  | Objects.PCopyMsg:
+    if msg.stamp # well.stamp then
+      newgc(copy_)
+      well.dlink := copy_
+      well.stamp := msg.stamp
+      CopyWell(msg, well, copy_)
+    end
+
+    msg.obj := well.dlink
+
+  | Objects.PFileMsg:
+    Gadgets.framehandle(well, msg)
+    if msg.id = Objects.store then
+      Files.WriteNum(@msg.R, 1)
+      Files.WriteLInt(@msg.R, well.dcol)
+    elsif msg.id = Objects.load then
+      Files.ReadNum(@msg.R, @ver)
+      Files.ReadLInt(@msg.R, @well.dcol)
+    end
+
+  else
+    Gadgets.framehandle(well, msg)
+  end
+end HandleWell
+
+procedure NewWell*()
+  var
+    well: Well
+begin
+  newgc(well)
+  well.handle := HandleWell
+  well.W := 20
+  well.H := 20
+  Objects.NewObj := well
+end NewWell
+
+// --- Discs ---*
+
+procedure GetDiscCoords(disc: Disc; x, y: pointer to int16)
+begin
+  if disc.sat < 0.001 then
+    x^ := asr(disc.W, 1)
+    y^ := asr(disc.H, 1)
+  else
+    x^ := val(int16, val(int16, floor((val(real, 1) + disc.sat * Math.cos(val(real, val(longreal, 2) * Math.pi * val(longreal, disc.hue)))) * (val(real, disc.W) / val(real, 2)))))
+    y^ := val(int16, val(int16, floor((val(real, 1) + disc.sat * Math.sin(val(real, val(longreal, 2) * Math.pi * val(longreal, disc.hue)))) * (val(real, disc.H) / val(real, 2)))))
+  end
+end GetDiscCoords
+
+procedure UpdateDiscModel(disc: Disc)
+  var
+    am: Objects.AttrMsg
+begin
+  if disc.obj # nil then
+    Attributes.GetString(disc, "SatField", @am.name, 32)
+    am.id := Objects.set_
+    am.class := Objects.Real
+    am.x := disc.sat
+    am.res := -1
+    disc.obj.handle(disc.obj, @am)
+    if am.res >= 0 then
+      Attributes.GetString(disc, "HueField", @am.name, 32)
+      am.id := Objects.set_
+      am.class := Objects.Real
+      am.x := disc.hue
+      am.res := -1
+      disc.obj.handle(disc.obj, @am)
+      if am.res >= 0 then
+        Gadgets.Update(disc.obj)
+      end
+    end
+  end
+end UpdateDiscModel
+
+procedure TrackDisc(disc: Disc; msg: pointer to Oberon.InputMsg)
+  var
+    fx, fy, px, py, mx, my, x, y: int16
+    mask: Display3.Mask
+    hue, sat, dx, dy: real
+    keysum, keys: set
+begin
+  fx := msg.x + disc.X
+  fy := msg.y + disc.Y
+  Gadgets.MakeMask(disc, fx, fy, msg.dlink, @mask)
+  GetDiscCoords(disc, @px, @py)
+  hue := disc.hue
+  sat := disc.sat
+  keysum := msg.keys
+  mx := -1
+  my := -1
+  repeat
+    Input.Mouse(@keys, @x, @y)
+    keysum := keysum + keys
+    if (keys # {}) & ((x # mx) or (y # my)) then
+      RestoreImageRect(disc.img, px - 2, py - 2, 5, 5, fx, fy, mask)
+      dx := val(real, 2 * (x - fx)) / val(real, disc.W) - val(real, 1)
+      dy := val(real, 2 * (y - fy)) / val(real, disc.H) - val(real, 1)
+      disc.sat := Math.sqrt(dx * dx + dy * dy)
+      if disc.sat > 1.0 then
+        disc.sat := 1.0
+      end
+      if disc.sat < 0.001 then
+        disc.hue := val(real, Colors.undefined)
+      else
+        disc.hue := val(real, val(longreal, atan2(dx, dy)) * (val(longreal, 1) / (val(longreal, 2) * Math.pi)))
+      end
+
+      UpdateDiscModel(disc)
+      GetDiscCoords(disc, @px, @py)
+      Display3.Rect(mask, Display3.black, Display.solid, fx + px - 2, fy + py - 2, 5, 5, 1, Display.replace)
+      mx := x
+      my := y
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, x, y)
+    end
+  until keys = {}
+
+  if keysum = {0..2} then
+    RestoreImageRect(disc.img, px - 2, py - 2, 5, 5, fx, fy, mask)
+    disc.hue := hue
+    disc.sat := sat
+    GetDiscCoords(disc, @px, @py)
+    Display3.Rect(mask, Display3.black, Display.solid, fx + px - 2, fy + py - 2, 5, 5, 1, Display.replace)
+    UpdateDiscModel(disc)
+  end
+
+  Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, x, y)
+  msg.res := 0
+end TrackDisc
+
+procedure RestoreDiscImage(disc: Disc)
+  var
+    r, g, b, j, i: int16
+    pix: Images.Pixel
+    dx, dy, y, x, sat, hue, rr, gg, bb: real
+begin
+  if disc.img = nil then
+    newgc(disc.img)
+  end
+
+  if (disc.img.width # disc.W) or (disc.img.height # disc.H) then
+    Images.Create(disc.img, disc.W, disc.H, @Images.DisplayFormat)
+    Display.GetColor(disc.bg, @r, @g, @b)
+    Images.SetRGB(@pix, r, g, b)
+    Images.Fill(disc.img, 0, 0, disc.W, disc.H, @pix, @Images.SrcCopy)
+    dx := val(real, 2) / val(real, disc.W)
+    dy := val(real, 2) / val(real, disc.H)
+    j := 0
+    y := -1.0
+    while j < disc.H do
+      i := 0
+      x := -1.0
+      while i < disc.W do
+        sat := Math.sqrt(x * x + y * y)
+        if sat <= val(real, 1) then
+          hue := val(real, val(longreal, atan2(x, y)) * (val(longreal, 1) / (val(longreal, 2) * Math.pi)))
+          Colors.HSVToRGB(hue, sat, 1.0, @rr, @gg, @bb)
+          r := val(int16, val(int16, floor(val(real, 255) * rr)))
+          g := val(int16, val(int16, floor(val(real, 255) * gg)))
+          b := val(int16, val(int16, floor(val(real, 255) * bb)))
+          Images.SetRGB(@pix, r, g, b)
+          Images.Put(disc.img, i, j, @pix, @Images.SrcCopy)
+        end
+
+        inc(i)
+        x := x + dx
+      end
+
+      inc(j)
+      y := y + dy
+    end
+  end
+end RestoreDiscImage
+
+procedure RestoreDisc(disc: Disc; fx, fy: int16; mask: Display3.Mask)
+  var
+    x, y: int16
+begin
+  RestoreDiscImage(disc)
+  RestoreImageRect(disc.img, 0, 0, disc.W, disc.H, fx, fy, mask)
+  GetDiscCoords(disc, @x, @y)
+  Display3.Rect(mask, Display3.black, Display.solid, fx + x - 2, fy + y - 2, 5, 5, 1, Display.replace)
+  if Gadgets.selected in disc.state then
+    Display3.FillPattern(mask, Display3.white, Display3.selectpat, fx, fy, fx, fy, disc.W, disc.H, Display.paint)
+  end
+end RestoreDisc
+
+procedure PrintDisc(disc: Disc; msg: pointer to Display.DisplayMsg)
+  var
+    mask: Display3.Mask
+    w, h, j, i: int16
+    dx, dy, y, x, sat, hue, r, g, b: real
+begin
+  Gadgets.MakePrinterMask(disc, msg.x, msg.y, msg.dlink, @mask)
+  w := val(int16, obdiv(disc.W * Display.Unit, Printer.Unit))
+  h := val(int16, obdiv(disc.H * Display.Unit, Printer.Unit))
+  Printer3.ReplConst(mask, disc.bg, msg.x, msg.y, w, h, Display.replace)
+  dx := val(real, 2) / val(real, w)
+  dy := val(real, 2) / val(real, h)
+  j := 0
+  y := -1.0
+  while j < h do
+    i := 0
+    x := -1.0
+    while i < w do
+      if Display3.Visible(mask, msg.x + i, msg.y + j, 1, 1) then
+        sat := Math.sqrt(x * x + y * y)
+        if sat <= val(real, 1) then
+          hue := val(real, val(longreal, atan2(x, y)) * (val(longreal, 1) / (val(longreal, 2) * Math.pi)))
+          Colors.HSVToRGB(hue, sat, 1.0, @r, @g, @b)
+          Printer.UseColor(val(int16, val(int16, floor(val(real, 255) * r))), val(int16, val(int16, floor(val(real, 255) * g))), val(int16, val(int16, floor(val(real, 255) * b))))
+          Printer.ReplConst(msg.x + i, msg.y + j, 1, 1)
+        end
+
+        inc(i)
+        x := x + dx
+      end
+
+      inc(j)
+      y := y + dy
+    end
+  end
+
+  if Gadgets.selected in disc.state then
+    Printer3.FillPattern(mask, Display3.white, Display3.selectpat, msg.x, msg.y, msg.x, msg.y, w, h, Display.paint)
+  end
+end PrintDisc
+
+procedure UpdateDisc(disc: Disc; msg: pointer to Display.FrameMsg)
+  var
+    hue, sat: real
+    fld: array 32 of char
+    fx, fy: int16
+    mask: Display3.Mask
+begin
+  if disc.obj # nil then
+    hue := disc.hue
+    sat := disc.sat
+    Attributes.GetString(disc, "HueField", @fld, 32)
+    Attributes.GetReal(disc.obj, @fld, @hue)
+    Attributes.GetString(disc, "SatField", @fld, 32)
+    Attributes.GetReal(disc.obj, @fld, @sat)
+    if (hue # disc.hue) or (sat # disc.sat) then
+      disc.hue := hue
+      disc.sat := sat
+      fx := msg.x + disc.X
+      fy := msg.y + disc.Y
+      Gadgets.MakeMask(disc, fx, fy, msg.dlink, @mask)
+      RestoreDisc(disc, fx, fy, mask)
+    end
+  end
+end UpdateDisc
+
+procedure DiscAttr(disc: Disc; msg: pointer to Objects.AttrMsg)
+begin
+  if msg.id = Objects.enum then
+    msg.Enum("BGColor")
+    msg.Enum("Hue")
+    msg.Enum("Saturation")
+    msg.Enum("HueField")
+    msg.Enum("SatField")
+    Gadgets.framehandle(disc, msg)
+  elsif msg.id = Objects.get then
+    if msg.name = "Gen" then
+      msg.class := Objects.String
+      copy(@msg.s, "ColorGadgets.NewDisc", 64)
+      msg.res := 0
+    elsif msg.name = "BGColor" then
+      msg.class := Objects.Int
+      msg.i := disc.bg
+      msg.res := 0
+    elsif msg.name = "Hue" then
+      msg.class := Objects.Real
+      msg.x := disc.hue
+      msg.res := 0
+    elsif msg.name = "Saturation" then
+      msg.class := Objects.Real
+      msg.x := disc.sat
+      msg.res := 0
+    else
+      Gadgets.framehandle(disc, msg)
+      if msg.res < 0 then
+        if msg.name = "HueField" then
+          msg.class := Objects.String
+          copy(@msg.s, "HueSV", 64)
+          msg.res := 0
+        elsif msg.name = "SatField" then
+          msg.class := Objects.String
+          copy(@msg.s, "HSaturationV", 64)
+          msg.res := 0
+        end
+      end
+    end
+
+  elsif msg.id = Objects.set_ then
+    if msg.name = "BGColor" then
+      if (msg.class = Objects.Int) & (msg.i < 256) then
+        disc.bg := msg.i
+        msg.res := 0
+        disc.img := nil
+      end
+    elsif msg.name = "Hue" then
+      if (msg.class = Objects.Int) & (0 <= msg.i) & (msg.i <= 1) then
+        disc.hue := val(real, msg.i)
+        msg.res := 0
+      elsif (msg.class = Objects.Real) & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        disc.hue := msg.x
+        msg.res := 0
+      elsif (msg.class = Objects.LongReal) & (val(longreal, 0) <= msg.y) & (msg.y <= val(longreal, 1)) then
+        disc.hue := val(real, msg.y)
+        msg.res := 0
+      elsif msg.class = Objects.String then
+        Strings.StrToReal(@msg.s, @msg.y)
+        if (val(longreal, 0) <= msg.y) & (msg.y <= val(longreal, 1)) then
+          disc.hue := val(real, msg.y)
+          msg.res := 0
+        end
+      end
+
+      if (msg.res >= 0) & (disc.obj # nil) then
+        UpdateDiscModel(disc)
+      end
+
+    elsif msg.name = "Saturation" then
+      if (msg.class = Objects.Int) & (0 <= msg.i) & (msg.i <= 1) then
+        disc.sat := val(real, msg.i)
+        msg.res := 0
+      elsif (msg.class = Objects.Real) & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        disc.sat := msg.x
+        msg.res := 0
+      elsif (msg.class = Objects.LongReal) & (val(longreal, 0) <= msg.y) & (msg.y <= val(longreal, 1)) then
+        disc.sat := val(real, msg.y)
+        msg.res := 0
+      elsif msg.class = Objects.String then
+        Strings.StrToReal(@msg.s, @msg.y)
+        if (val(longreal, 0) <= msg.y) & (msg.y <= val(longreal, 1)) then
+          disc.sat := val(real, msg.y)
+          msg.res := 0
+        end
+      end
+
+      if (msg.res >= 0) & (disc.obj # nil) then
+        UpdateDiscModel(disc)
+      end
+
+    else
+      Gadgets.framehandle(disc, msg)
+    end
+  end
+end DiscAttr
+
+procedure CopyDisc*(msg: pointer to Objects.CopyMsg; from, to_: Disc)
+begin
+  Gadgets.CopyFrame(msg, from, to_)
+  to_.bg := from.bg
+  to_.hue := from.hue
+  to_.sat := from.sat
+  to_.img := nil
+end CopyDisc
+
+procedure HandleDisc*(obj: Objects.Object; msg: pointer to Objects.ObjMsg)
+  var
+    msg2: Display.PFrameMsg
+    disc, copy_: Disc
+    fx, fy: int16
+    mask: Display3.Mask
+    ver: int32
+begin
+  disc := obj(Disc)
+  case msg of
+  | Display.PFrameMsg:
+    if (msg.F = nil) or (msg.F = disc) then
+      msg2 := msg
+      case msg2 of
+      | Oberon.PInputMsg:
+        if (msg2.id = Oberon.track) & (msg2.keys = {1}) & ~(Gadgets.selected in disc.state) & Gadgets.InActiveArea(disc, msg2) then
+
+          TrackDisc(disc, msg2)
+        else
+          Gadgets.framehandle(disc, msg2)
+        end
+
+      | Display.PDisplayMsg:
+        if msg2.device = Display.screen then
+          fx := msg2.x + disc.X
+          fy := msg2.y + disc.Y
+          if msg2.id = Display.full then
+            Gadgets.MakeMask(disc, fx, fy, msg2.dlink, @mask)
+            RestoreDisc(disc, fx, fy, mask)
+          elsif msg2.id = Display.area then
+            Gadgets.MakeMask(disc, fx, fy, msg2.dlink, @mask)
+            Display3.AdjustMask(mask, fx + msg2.u, fy + (disc.H - 1) + msg2.v, msg2.w, msg2.h)
+            RestoreDisc(disc, fx, fy, mask)
+          end
+
+        elsif msg2.device = Display.printer then
+          PrintDisc(disc, msg2)
+        end
+
+      | Gadgets.PUpdateMsg:
+        if msg2.obj = disc.obj then
+          UpdateDisc(disc, msg2)
+        elsif msg2.obj = disc then
+          fx := msg2.x + disc.X
+          fy := msg2.y + disc.Y
+          Gadgets.MakeMask(disc, fx, fy, msg2.dlink, @mask)
+          RestoreDisc(disc, fx, fy, mask)
+        end
+
+      | Display.PControlMsg:
+        if disc.obj # nil then
+          disc.obj.handle(disc.obj, msg2)
+        end
+
+        if (msg2.id = Display.restore) & (msg2.stamp # disc.stamp) then
+          disc.stamp := msg2.stamp
+          UpdateDisc(disc, msg2)
+        end
+
+      else
+        Gadgets.framehandle(disc, msg2)
+      end
+    end
+
+  | Objects.PAttrMsg:
+    DiscAttr(disc, msg(Objects.PAttrMsg))
+  | Objects.PCopyMsg:
+    if msg.stamp # disc.stamp then
+      newgc(copy_)
+      disc.dlink := copy_
+      disc.stamp := msg.stamp
+      CopyDisc(msg, disc, copy_)
+    end
+
+    msg.obj := disc.dlink
+
+  | Objects.PFileMsg:
+    Gadgets.framehandle(disc, msg)
+    if msg.id = Objects.store then
+      Files.WriteNum(@msg.R, 1)
+      Files.WriteLInt(@msg.R, disc.bg)
+      Files.WriteReal(@msg.R, disc.hue)
+      Files.WriteReal(@msg.R, disc.sat)
+    elsif msg.id = Objects.load then
+      Files.ReadNum(@msg.R, @ver)
+      Files.ReadLInt(@msg.R, @disc.bg)
+      Files.ReadReal(@msg.R, @disc.hue)
+      Files.ReadReal(@msg.R, @disc.sat)
+      disc.img := nil
+    end
+
+  else
+    Gadgets.framehandle(disc, msg)
+  end
+end HandleDisc
+
+procedure NewDisc*()
+  var
+    disc: Disc
+begin
+  newgc(disc)
+  disc.handle := HandleDisc
+  disc.W := 100
+  disc.H := 100
+  disc.bg := Display3.groupC
+  Objects.NewObj := disc
+end NewDisc
+
+// --- Wedges ---*
+
+procedure GetWedgeCoords(wedge: Wedge; x, y: pointer to int16)
+begin
+  if wedge.hue < val(real, 0) then
+    x^ := 0
+  else
+    x^ := val(int16, val(int16, floor(wedge.sat * wedge.val_ * val(real, wedge.W))))
+  end
+
+  y^ := val(int16, val(int16, floor(wedge.val_ * val(real, wedge.H) - 0.001)))
+end GetWedgeCoords
+
+procedure UpdateWedgeModel(wedge: Wedge)
+  var
+    am: Objects.AttrMsg
+begin
+  if wedge.obj # nil then
+    Attributes.GetString(wedge, "SatField", @am.name, 32)
+    am.id := Objects.set_
+    am.class := Objects.Real
+    am.x := wedge.sat
+    am.res := -1
+    wedge.obj.handle(wedge.obj, @am)
+    if am.res >= 0 then
+      Attributes.GetString(wedge, "ValueField", @am.name, 32)
+      am.id := Objects.set_
+      am.class := Objects.Real
+      am.x := wedge.val_
+      am.res := -1
+      wedge.obj.handle(wedge.obj, @am)
+      if am.res >= 0 then
+        Gadgets.Update(wedge.obj)
+      end
+    end
+  end
+end UpdateWedgeModel
+
+procedure TrackWedge(wedge: Wedge; msg: pointer to Oberon.InputMsg)
+  var
+    fx, fy, px, py, mx, my, x, y: int16
+    mask: Display3.Mask
+    sat, val_: real
+    keysum, keys: set
+begin
+  fx := msg.x + wedge.X
+  fy := msg.y + wedge.Y
+  Gadgets.MakeMask(wedge, fx, fy, msg.dlink, @mask)
+  GetWedgeCoords(wedge, @px, @py)
+  sat := wedge.sat
+  val_ := wedge.val_
+  keysum := msg.keys
+  mx := -1
+  my := -1
+  repeat
+    Input.Mouse(@keys, @x, @y)
+    keysum := keysum + keys
+    if (keys # {}) & ((x # mx) or (y # my)) then
+      RestoreImageRect(wedge.img, px - 2, py - 2, 5, 5, fx, fy, mask)
+      wedge.val_ := val(real, y - fy) / val(real, wedge.H)
+      if wedge.val_ < 0.001 then
+        wedge.val_ := 0.001
+      elsif wedge.val_ > val(real, 1) then
+        wedge.val_ := val(real, 1)
+      end
+
+      if wedge.hue < val(real, 0) then
+        wedge.sat := val(real, 0)
+      else
+        wedge.sat := val(real, x - fx) / (wedge.val_ * val(real, wedge.W))
+        if wedge.sat < 0.001 then
+          wedge.sat := 0.001
+        elsif wedge.sat > val(real, 1) then
+          wedge.sat := val(real, 1)
+        end
+      end
+
+      UpdateWedgeModel(wedge)
+      GetWedgeCoords(wedge, @px, @py)
+      Display3.Rect(mask, Display3.black, Display.solid, fx + px - 2, fy + py - 2, 5, 5, 1, Display.replace)
+      mx := x
+      my := y
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, x, y)
+    end
+  until keys = {}
+
+  if keysum = {0..2} then
+    RestoreImageRect(wedge.img, px - 2, py - 2, 5, 5, fx, fy, mask)
+    wedge.sat := sat
+    wedge.val_ := val_
+    GetWedgeCoords(wedge, @px, @py)
+    Display3.Rect(mask, Display3.black, Display.solid, fx + px - 2, fy + py - 2, 5, 5, 1, Display.replace)
+    UpdateWedgeModel(wedge)
+  end
+
+  Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, x, y)
+  msg.res := 0
+end TrackWedge
+
+procedure RestoreWedgeImage(wedge: Wedge)
+  var
+    r, g, b, j, i: int16
+    bg, pix: Images.Pixel
+    val_, dval, sat, dsat, rr, gg, bb: real
+begin
+  if wedge.img = nil then
+    newgc(wedge.img)
+  end
+
+  if (wedge.img.width # wedge.W) or (wedge.img.height # wedge.H) then
+    Images.Create(wedge.img, wedge.W, wedge.H, @Images.DisplayFormat)
+    Display.GetColor(wedge.bg, @r, @g, @b)
+    Images.SetRGB(@bg, r, g, b)
+    Images.Fill(wedge.img, 0, 0, wedge.W, wedge.H, @bg, @Images.SrcCopy)
+    j := 0
+    val_ := val(real, 0)
+    dval := val(real, 1) / val(real, wedge.H)
+    while j < wedge.H do
+      if wedge.hue < val(real, 0) then
+        g := val(int16, val(int16, floor(val(real, 255) * val_)))
+        Images.SetRGB(@pix, g, g, g)
+        i := 1 + val(int16, obdiv(val(int32, j) * (wedge.W - 1), wedge.H))
+        Images.Fill(wedge.img, 0, j, i, j + 1, @pix, @Images.SrcCopy)
+      else
+        i := 0
+        sat := val(real, 0)
+        dsat := val(real, 1) / (val(real, wedge.W) * val_)
+        while sat <= val(real, 1) do
+          Colors.HSVToRGB(wedge.hue, sat, val_, @rr, @gg, @bb)
+          r := val(int16, val(int16, floor(val(real, 255) * rr)))
+          g := val(int16, val(int16, floor(val(real, 255) * gg)))
+          b := val(int16, val(int16, floor(val(real, 255) * bb)))
+          Images.SetRGB(@pix, r, g, b)
+          Images.Put(wedge.img, i, j, @pix, @Images.SrcCopy)
+          inc(i)
+          sat := sat + dsat
+        end
+
+        if i < wedge.img.width then
+          Images.Put(wedge.img, i, j, @bg, @Images.SrcCopy)
+        end
+      end
+
+      inc(j)
+      val_ := val_ + dval
+    end
+  end
+end RestoreWedgeImage
+
+procedure RestoreWedge(wedge: Wedge; fx, fy: int16; mask: Display3.Mask)
+  var
+    x, y: int16
+begin
+  RestoreWedgeImage(wedge)
+  RestoreImageRect(wedge.img, 0, 0, wedge.W, wedge.H, fx, fy, mask)
+  GetWedgeCoords(wedge, @x, @y)
+  Display3.Rect(mask, Display3.black, Display.solid, fx + x - 2, fy + y - 2, 5, 5, 1, Display.replace)
+  if Gadgets.selected in wedge.state then
+    Display3.FillPattern(mask, Display3.white, Display3.selectpat, fx, fy, fx, fy, wedge.W, wedge.H, Display.paint)
+  end
+end RestoreWedge
+
+procedure PrintWedge(wedge: Wedge; msg: pointer to Display.DisplayMsg)
+  var
+    mask: Display3.Mask
+    w, h, j, i, x0, x1: int16
+    val_, dval, sat, dsat, r, g, b: real
+begin
+  Gadgets.MakePrinterMask(wedge, msg.x, msg.y, msg.dlink, @mask)
+  w := val(int16, obdiv(wedge.W * Display.Unit, Printer.Unit))
+  h := val(int16, obdiv(wedge.H * Display.Unit, Printer.Unit))
+  Printer3.ReplConst(mask, wedge.bg, msg.x, msg.y, w, h, Display.replace)
+  j := 0
+  val_ := val(real, 0)
+  dval := val(real, 1) / val(real, h)
+  while j < h do
+    if wedge.hue < val(real, 0) then
+      i := val(int16, val(int16, floor(val(real, 255) * val_)))
+      Printer.UseColor(i, i, i)
+      i := 1 + val(int16, obdiv(val(int32, j) * (w - 1), h))
+      if Display3.Visible(mask, msg.x, msg.y + j, i, 1) then
+        Printer.ReplConst(msg.x, msg.y + j, i, 1)
+      else
+        x0 := 0
+        repeat
+          while (x0 < i) & ~Display3.Visible(mask, msg.x + x0, msg.y + j, 1, 1) do
+            inc(x0)
+          end
+          x1 := x0
+          while (x1 < i) & Display3.Visible(mask, msg.x + x1, msg.y + j, 1, 1) do
+            inc(x1)
+          end
+          if x0 < x1 then
+            Printer.ReplConst(msg.x + x0, msg.y + j, x1 - x0, 1)
+          end
+
+          x0 := x1
+        until x0 >= i
+      end
+
+    else
+      i := 0
+      sat := val(real, 0)
+      dsat := val(real, 1) / (val(real, w) * val_)
+      while sat <= val(real, 1) do
+        if Display3.Visible(mask, msg.x + i, msg.y + j, 1, 1) then
+          Colors.HSVToRGB(wedge.hue, sat, val_, @r, @g, @b)
+          Printer.UseColor(val(int16, val(int16, floor(val(real, 255) * r))), val(int16, val(int16, floor(val(real, 255) * g))), val(int16, val(int16, floor(val(real, 255) * b))))
+          Printer.ReplConst(msg.x + i, msg.y + j, 1, 1)
+        end
+
+        inc(i)
+        sat := sat + dsat
+      end
+    end
+
+    inc(j)
+    val_ := val_ + dval
+  end
+
+  if Gadgets.selected in wedge.state then
+    Printer3.FillPattern(mask, Display3.white, Display3.selectpat, msg.x, msg.y, msg.x, msg.y, w, h, Display.paint)
+  end
+end PrintWedge
+
+procedure UpdateWedge(wedge: Wedge; msg: pointer to Display.FrameMsg)
+  var
+    hue, sat, val_: real
+    fld: array 32 of char
+    fx, fy: int16
+    mask: Display3.Mask
+begin
+  if wedge.obj # nil then
+    hue := wedge.hue
+    sat := wedge.sat
+    val_ := wedge.val_
+    Attributes.GetString(wedge, "HueField", @fld, 32)
+    Attributes.GetReal(wedge.obj, @fld, @hue)
+    Attributes.GetString(wedge, "SatField", @fld, 32)
+    Attributes.GetReal(wedge.obj, @fld, @sat)
+    Attributes.GetString(wedge, "ValueField", @fld, 32)
+    Attributes.GetReal(wedge.obj, @fld, @val_)
+    if (hue # wedge.hue) or (sat # wedge.sat) or (val_ # wedge.val_) then
+      if hue # wedge.hue then
+        wedge.hue := hue
+        wedge.img := nil
+      end
+
+      wedge.sat := sat
+      wedge.val_ := val_
+      fx := msg.x + wedge.X
+      fy := msg.y + wedge.Y
+      Gadgets.MakeMask(wedge, fx, fy, msg.dlink, @mask)
+      RestoreWedge(wedge, fx, fy, mask)
+    end
+  end
+end UpdateWedge
+
+procedure WedgeAttr*(wedge: Wedge; msg: pointer to Objects.AttrMsg)
+begin
+  if msg.id = Objects.enum then
+    msg.Enum("BGColor")
+    msg.Enum("Saturation")
+    msg.Enum("Value")
+    msg.Enum("HueField")
+    msg.Enum("SatField")
+    msg.Enum("ValueField")
+    Gadgets.framehandle(wedge, msg)
+  elsif msg.id = Objects.get then
+    if msg.name = "Gen" then
+      msg.class := Objects.String
+      copy(@msg.s, "ColorGadgets.NewWedge", 64)
+      msg.res := 0
+    elsif msg.name = "BGColor" then
+      msg.class := Objects.Int
+      msg.i := wedge.bg
+      msg.res := 0
+    elsif msg.name = "Saturation" then
+      msg.class := Objects.Real
+      msg.x := wedge.sat
+      msg.res := 0
+    elsif msg.name = "Value" then
+      msg.class := Objects.Real
+      msg.x := wedge.val_
+      msg.res := 0
+    else
+      Gadgets.framehandle(wedge, msg)
+      if msg.res < 0 then
+        if msg.name = "HueField" then
+          msg.class := Objects.String
+          copy(@msg.s, "HueSV", 64)
+          msg.res := 0
+        elsif msg.name = "SatField" then
+          msg.class := Objects.String
+          copy(@msg.s, "HSaturationV", 64)
+          msg.res := 0
+        elsif msg.name = "ValueField" then
+          msg.class := Objects.String
+          copy(@msg.s, "HSValue", 64)
+          msg.res := 0
+        end
+      end
+    end
+
+  elsif msg.id = Objects.set_ then
+    if msg.name = "BGColor" then
+      if (msg.class = Objects.Int) & (msg.i < 256) then
+        wedge.bg := msg.i
+        msg.res := 0
+        wedge.img := nil
+      end
+    elsif msg.name = "Saturation" then
+      if (msg.class = Objects.Int) & (0 <= msg.i) & (msg.i <= 1) then
+        wedge.sat := val(real, msg.i)
+        msg.res := 0
+      elsif (msg.class = Objects.Real) & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        wedge.sat := msg.x
+        msg.res := 0
+      elsif (msg.class = Objects.LongReal) & (val(longreal, 0) <= msg.y) & (msg.y <= val(longreal, 1)) then
+        wedge.sat := val(real, msg.y)
+        msg.res := 0
+      elsif msg.class = Objects.String then
+        Strings.StrToReal(@msg.s, @msg.y)
+        if (val(longreal, 0) <= msg.y) & (msg.y <= val(longreal, 1)) then
+          wedge.sat := val(real, msg.y)
+          msg.res := 0
+        end
+      end
+
+      if (msg.res >= 0) & (wedge.obj # nil) then
+        UpdateWedgeModel(wedge)
+      end
+
+    elsif msg.name = "Value" then
+      if (msg.class = Objects.Int) & (0 <= msg.i) & (msg.i <= 1) then
+        wedge.val_ := val(real, msg.i)
+        msg.res := 0
+      elsif (msg.class = Objects.Real) & (val(real, 0) <= msg.x) & (msg.x <= val(real, 1)) then
+        wedge.val_ := msg.x
+        msg.res := 0
+      elsif (msg.class = Objects.LongReal) & (val(longreal, 0) <= msg.y) & (msg.y <= val(longreal, 1)) then
+        wedge.val_ := val(real, msg.y)
+        msg.res := 0
+      elsif msg.class = Objects.String then
+        Strings.StrToReal(@msg.s, @msg.y)
+        if (val(longreal, 0) <= msg.y) & (msg.y <= val(longreal, 1)) then
+          wedge.val_ := val(real, msg.y)
+          msg.res := 0
+        end
+      end
+
+      if (msg.res >= 0) & (wedge.obj # nil) then
+        UpdateWedgeModel(wedge)
+      end
+
+    else
+      Gadgets.framehandle(wedge, msg)
+    end
+  end
+end WedgeAttr
+
+procedure CopyWedge*(msg: pointer to Objects.CopyMsg; from, to_: Wedge)
+begin
+  Gadgets.CopyFrame(msg, from, to_)
+  to_.bg := from.bg
+  to_.hue := from.hue
+  to_.sat := from.sat
+  to_.val_ := from.val_
+  to_.img := nil
+end CopyWedge
+
+procedure HandleWedge*(obj: Objects.Object; msg: pointer to Objects.ObjMsg)
+  var
+    msg1: Display.PFrameMsg
+    wedge, copy_: Wedge
+    fx, fy: int16
+    mask: Display3.Mask
+    ver: int32
+begin
+  wedge := obj(Wedge)
+  case msg of
+  | Display.PFrameMsg:
+    if (msg.F = nil) or (msg.F = wedge) then
+      msg1 := msg
+      case msg1 of
+      | Oberon.PInputMsg:
+        if (msg1.id = Oberon.track) & (msg1.keys = {1}) & ~(Gadgets.selected in wedge.state) & Gadgets.InActiveArea(wedge, msg1) then
+
+          TrackWedge(wedge, msg1)
+        else
+          Gadgets.framehandle(wedge, msg1)
+        end
+
+      | Display.PDisplayMsg:
+        if msg1.device = Display.screen then
+          fx := msg1.x + wedge.X
+          fy := msg1.y + wedge.Y
+          if msg1.id = Display.full then
+            Gadgets.MakeMask(wedge, fx, fy, msg1.dlink, @mask)
+            RestoreWedge(wedge, fx, fy, mask)
+          elsif msg1.id = Display.area then
+            Gadgets.MakeMask(wedge, fx, fy, msg1.dlink, @mask)
+            Display3.AdjustMask(mask, fx + msg1.u, fy + (wedge.H - 1) + msg1.v, msg1.w, msg1.h)
+            RestoreWedge(wedge, fx, fy, mask)
+          end
+
+        elsif msg1.device = Display.printer then
+          PrintWedge(wedge, msg1)
+        end
+
+      | Gadgets.PUpdateMsg:
+        if msg1.obj = wedge.obj then
+          UpdateWedge(wedge, msg1)
+        elsif msg1.obj = wedge then
+          fx := msg1.x + wedge.X
+          fy := msg1.y + wedge.Y
+          Gadgets.MakeMask(wedge, fx, fy, msg1.dlink, @mask)
+          RestoreWedge(wedge, fx, fy, mask)
+        end
+
+      | Display.PControlMsg:
+        if wedge.obj # nil then
+          wedge.obj.handle(wedge.obj, msg1)
+        end
+
+        if (msg1.id = Display.restore) & (msg1.stamp # wedge.stamp) then
+          wedge.stamp := msg1.stamp
+          UpdateWedge(wedge, msg1)
+        end
+
+      else
+        Gadgets.framehandle(wedge, msg1)
+      end
+    end
+
+  | Objects.PAttrMsg:
+    WedgeAttr(wedge, msg(Objects.PAttrMsg))
+  | Objects.PCopyMsg:
+    if msg.stamp # wedge.stamp then
+      newgc(copy_)
+      wedge.dlink := copy_
+      wedge.stamp := msg.stamp
+      CopyWedge(msg, wedge, copy_)
+    end
+
+    msg.obj := wedge.dlink
+
+  | Objects.PFileMsg:
+    Gadgets.framehandle(wedge, msg)
+    if msg.id = Objects.store then
+      Files.WriteNum(@msg.R, 1)
+      Files.WriteLInt(@msg.R, wedge.bg)
+      Files.WriteReal(@msg.R, wedge.hue)
+      Files.WriteReal(@msg.R, wedge.sat)
+      Files.WriteReal(@msg.R, wedge.val_)
+    elsif msg.id = Objects.load then
+      Files.ReadNum(@msg.R, @ver)
+      Files.ReadLInt(@msg.R, @wedge.bg)
+      Files.ReadReal(@msg.R, @wedge.hue)
+      Files.ReadReal(@msg.R, @wedge.sat)
+      Files.ReadReal(@msg.R, @wedge.val_)
+      wedge.img := nil
+    end
+
+  else
+    Gadgets.framehandle(wedge, msg)
+  end
+end HandleWedge
+
+procedure NewWedge*()
+  var
+    wedge: Wedge
+begin
+  newgc(wedge)
+  wedge.handle := HandleWedge
+  wedge.W := 50
+  wedge.H := 100
+  wedge.bg := Display3.groupC
+  wedge.hue := val(real, -1)
+  Objects.NewObj := wedge
+end NewWedge
+
+// --- Commands ---*
+
+// set selected text color *
+procedure SetText*()
+  var
+    text: Texts.Text
+    beg, end_, time: int32
+    s: Attributes.Scanner
+    r, g, b, col: int16
+begin
+  Oberon.GetSelection(@text, @beg, @end_, @time)
+  if time # -1 then
+    Attributes.OpenScanner(@s, Oberon.Par.text, Oberon.Par.pos)
+    Attributes.Scan(@s)
+    if s.class = Attributes.Int then
+      if s.i < 0 then
+        Display.GetColor(s.i, @r, @g, @b)
+        col := Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, r, g, b)
+      else
+        col := val(int16, s.i)
+      end
+
+      Texts.ChangeLooks(text, beg, end_, {1}, nil, val(int8, col), 0)
+    end
+  end
+end SetText
+
+// get color of selected text and store it in attribute (2.) of named (1.) object *
+procedure GetText*()
+
+  var
+    text: Texts.Text
+    beg, end_, time: int32
+    r: Texts.Reader
+    ch: char
+    s: Attributes.Scanner
+    obj: Objects.Object
+    am: Objects.AttrMsg
+begin
+  Oberon.GetSelection(@text, @beg, @end_, @time)
+  if time # -1 then
+    Texts.OpenReader(@r, text, beg)
+    Texts.Read(@r, @ch)
+    Attributes.OpenScanner(@s, Oberon.Par.text, Oberon.Par.pos)
+    Attributes.Scan(@s)
+    if s.class in {Attributes.Name,Attributes.String} then
+      obj := Gadgets.FindObj(Gadgets.context, @s.s)
+      if obj # nil then
+        Attributes.Scan(@s)
+        if s.class in {Attributes.Name,Attributes.String} then
+          am.id := Objects.set_
+          copy(@am.name, @s.s, 32)
+          am.class := Objects.Int
+          am.res := -1
+          obj.handle(obj, @am)
+          if am.res >= 0 then
+            Gadgets.Update(obj)
+          end
+        end
+      end
+    end
+  end
+end GetText
+
+// set attribute (1.) of selected objects to color value (2.) *
+procedure SetAttr*()
+  var
+    sel: Objects.Object
+    time: int32
+    s: Attributes.Scanner
+    am: Objects.AttrMsg
+    r, g, b: int16
+begin
+  Gadgets.GetSelection(@sel, @time)
+  if (time # -1) & (sel # nil) then
+    Attributes.OpenScanner(@s, Oberon.Par.text, Oberon.Par.pos)
+    Attributes.Scan(@s)
+    if s.class in {Attributes.Name,Attributes.String} then
+      copy(@am.name, @s.s, 32)
+      Attributes.Scan(@s)
+      if s.class = Attributes.Int then
+        am.id := Objects.set_
+        am.class := Objects.Int
+        am.i := s.i
+        repeat
+          am.i := s.i
+          am.res := -1
+          sel.handle(sel, @am)
+          if (am.res < 0) & (s.i < 0) then
+            Display.GetColor(s.i, @r, @g, @b)
+            am.i := Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, r, g, b)
+            sel.handle(sel, @am)
+          end
+
+          if am.res >= 0 then
+            Gadgets.Update(sel)
+          end
+
+          sel := sel.slink
+        until sel = nil
+      end
+    end
+  end
+end SetAttr
+
+// get attribute (1.) of selected objects and set attribute (3.) of named (2.) object *
+procedure GetAttr*()
+  var
+    sel, obj: Objects.Object
+    time, col: int32
+    s: Attributes.Scanner
+    am: Objects.AttrMsg
+begin
+  Gadgets.GetSelection(@sel, @time)
+  if (time # -1) & (sel # nil) then
+    Attributes.OpenScanner(@s, Oberon.Par.text, Oberon.Par.pos)
+    Attributes.Scan(@s)
+    if s.class in {Attributes.Name,Attributes.String} then
+      am.id := Objects.get
+      copy(@am.name, @s.s, 32)
+      am.class := Objects.Inval
+      am.res := -1
+      sel.handle(sel, @am)
+      if (am.res >= 0) & (am.class = Objects.Int) then
+        col := am.i
+        Attributes.Scan(@s)
+        if s.class in {Attributes.Name,Attributes.String} then
+          obj := Gadgets.FindObj(Gadgets.context, @s.s)
+          if obj # nil then
+            Attributes.Scan(@s)
+            if s.class in {Attributes.Name,Attributes.String} then
+              am.id := Objects.set_
+              copy(@am.name, @s.s, 32)
+              am.class := Objects.Int
+              am.i := col
+              am.res := -1
+              obj.handle(obj, @am)
+              if am.res >= 0 then
+                Gadgets.Update(obj)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end GetAttr
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewWell" end return NewWell end
+  if i = 1 then if name # nil then name^ := "NewDisc" end return NewDisc end
+  if i = 2 then if name # nil then name^ := "NewWedge" end return NewWedge end
+  if i = 3 then if name # nil then name^ := "SetText" end return SetText end
+  if i = 4 then if name # nil then name^ := "GetText" end return GetText end
+  if i = 5 then if name # nil then name^ := "SetAttr" end return SetAttr end
+  if i = 6 then if name # nil then name^ := "GetAttr" end return GetAttr end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("ColorGadgets", cmd_)
+  InitDragMarker()
+end ColorGadgets.

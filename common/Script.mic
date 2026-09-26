@@ -1,0 +1,1570 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Script [level=5]
+
+import ScriptFrames, Texts, MenuViewers, TextFrames, Oberon, Fonts, Objects, Printer, Display, Styles, Files, Modules
+// portable
+// RS, Wed, 9-Jun-1993
+
+(* ChangeFont only fnt.type = Objects.font
+Fri, 26-Nov-93 Search: trap on no selection
+Tue, 17-May-1994 visualize page breaks
+Fri, 10-Jun-1994 generich search/replace
+*)
+
+// MenuStr = "System.Close  System.Copy  System.Grow  Script.NewStyle  Script.Style  Script.Search  Script.Store";
+
+const
+  MenuStr = "System.Close  System.Copy  System.Grow  Script.NewStyle  Script.Search  Script.Replace  Script.Store"
+  TAB = 9X
+  MaxPatLen = 32
+
+  // print options
+  pageNo = 0
+  onTop = 1
+  alter = 2
+  header = 3
+  notFirst = 4
+
+  // print units
+  PrtUnit = 3048
+
+// print layout
+(*
+leftX = 290;
+headY = 3300; topY = 3200; botY = 300; pagY = 150;
+pagW = Styles.pageW DIV PrtUnit;
+*)
+
+var
+  W: Texts.Writer
+  sPat: array 32 (* MaxPatLen *) of char // search pattern [read only]
+  sTab: array 256 of int16 // table for Boyer Moore algorithm
+  sPatLen: int16 // number of valid characters in sPat [read only]
+  rBuf: Texts.Buffer // replace buffer [read only]
+  lTime: int32 // most recent time for sPat and/or rBuf
+  lastPno: int16
+  printer, ext, options: array 32 of char
+  open: boolean // very ugly: printer flag
+
+  // print layout
+  leftX: int16
+  headY, topY, botY, pagY, pagW: int16
+
+  head: Objects.Object // page break position
+  tail: Objects.Object
+  pages: int16
+
+procedure MarkBrk(pos: int32)
+begin
+  if tail # nil then
+    tail.stamp := pos
+    newgc(tail.slink)
+    tail := tail.slink
+    tail.stamp := 2147483647
+    inc(pages)
+  end
+end MarkBrk
+
+procedure OpenViewer(const name: pointer to array of char; F: Display.Frame)
+  var
+    X, Y: int16
+    V: MenuViewers.Viewer
+begin
+  Oberon.AllocateUserViewer(Oberon.UserTrack(Oberon.Mouse.X), @X, @Y)
+  V := MenuViewers.New(TextFrames.NewMenu(name, MenuStr, 1), F, TextFrames.menuH, X, Y)
+end OpenViewer
+
+procedure OpenScanner(S: pointer to Texts.Scanner; F: TextFrames.Frame)
+  var
+    M: Oberon.SelectMsg
+begin
+  Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos)
+  Texts.Scan(S)
+  if (S.class = Texts.Char) & (S.c = "^") then
+    if F # nil then
+      M.time := -1
+      M.id := Oberon.get
+      TextFrames.GetSelection(F, @M)
+    else
+      Oberon.GetSelection(@M.text, @M.beg, @M.end_, @M.time)
+    end
+
+    if M.time > 0 then
+      Texts.OpenScanner(S, M.text, M.beg)
+      Texts.Scan(S)
+    end
+  end
+end OpenScanner
+
+// -------- Script commands --------
+
+procedure Open*()
+  var
+    S: Texts.Scanner
+    F: ScriptFrames.Frame
+    T: Texts.Text
+    name: array 32 of char
+begin
+  OpenScanner(@S, nil)
+  if S.class # Texts.Name then
+    copy(@name, "Script.Open", 32)
+  else
+    copy(@name, @S.s, 32)
+  end
+  newgc(T)
+  Texts.Open(T, @name)
+  F := ScriptFrames.NewText(T, 0)
+  Texts.Scan(@S)
+  F.hide := (S.class = Texts.Char) & (S.c = Oberon.OptionChar) & (S.nextCh = "n")
+  OpenViewer(@name, F)
+end Open
+
+procedure Backup(name: pointer to array of char)
+  var
+    res, i: int16
+    bak: array 32 of char
+begin
+  i := 0
+  while name[i] # 0X do
+    bak[i] := name[i]
+    inc(i)
+  end
+  if i > 31i1 - 4i1 then
+    i := 31i1 - 4i1
+  end
+  bak[i] := "."
+  bak[i + 1] := "B"
+  bak[i + 2] := "a"
+  bak[i + 3] := "k"
+  bak[i + 4] := 0X
+  Files.Rename(name, @bak, @res)
+end Backup
+
+procedure Store*()
+  (*
+  Script.Store from title bar = store text of open viewer (name = document name)
+  otherwise store marked viewer
+  Script.Store X.Text (name from parameterlist)
+  Script.Store ^ (name from selection)
+  *)
+
+  var
+    F: ScriptFrames.Frame
+    par: Oberon.ParList
+    V: Display.Frame
+    S: Texts.Scanner
+    f: Files.File
+    len_: int32
+begin
+  Texts.WriteString(@W, "Script.Store ")
+  par := Oberon.Par
+  copy(@S.s, "", 64)
+  if par.frame = par.vwr.dsc then
+    // command in menu frame
+    V := par.vwr // !
+    MenuViewers.GetName(V(MenuViewers.Viewer), @S.s, 64)
+  else
+    V := Oberon.MarkedViewer()
+    OpenScanner(@S, nil)
+  end
+
+  if (V.dsc # nil) & (V.dsc.next # nil) & (V.dsc.next is ScriptFrames.Frame) then
+    Texts.WriteString(@W, @S.s)
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+    F := V.dsc.next(ScriptFrames.Frame)
+    ScriptFrames.Mark(F, -1)
+    Backup(@S.s)
+    f := Files.New(@S.s)
+    Texts.Store(F.text, f, 0, @len_)
+    Files.Register(f)
+    ScriptFrames.Mark(F, 1)
+  end
+end Store
+
+(*
+PROCEDURE FindPat(F: ScriptFrames.Frame; pos: LONGINT);
+(* searches pattern sPat beginning at position pos *)
+VAR R: Texts.Reader; buf: ARRAY MaxPatLen OF CHAR;
+len, lPos: LONGINT;  n, j: INTEGER;
+
+PROCEDURE Forward (n: INTEGER);
+VAR m: INTEGER; j: INTEGER;
+BEGIN m := sPatLen - n; j := 0;
+WHILE j # m DO buf[j] := buf[n + j]; INC(j) END;
+WHILE j # sPatLen DO Texts.Read(R, buf[j]); INC(j) END
+END Forward;
+
+BEGIN
+ScriptFrames.Mark(F, -1);
+len := F.text.len;
+Texts.OpenReader(R, F.text, pos);
+Forward(sPatLen); pos := pos + sPatLen;
+LOOP j := sPatLen;
+REPEAT DEC(j) UNTIL (j < 0) OR (buf[j] # sPat[j]);
+IF (j < 0) OR (pos >= len) THEN EXIT END;
+n := sTab[ORD(buf[sPatLen-1])];
+Forward(n); pos := pos + n
+END;
+IF j < 0 THEN
+ScriptFrames.Neutralize(F);
+IF (pos < ScriptFrames.Pos(F, 0, F.H)) OR (ScriptFrames.Pos(F, F.W, 0) < pos) THEN
+ScriptFrames.Show(F, pos - 200)
+END;
+Oberon.Defocus; ScriptFrames.SetCaret(F, pos);
+ScriptFrames.SetSelection(F, pos - sPatLen, pos); lTime := F.time
+ELSE
+ScriptFrames.Neutralize(F)
+END;
+ScriptFrames.Mark(F, 1)
+END FindPat;
+
+PROCEDURE Search*;
+VAR F: ScriptFrames.Frame;
+R: Texts.Reader; text: Texts.Text;
+pos, beg, end, time: LONGINT;  i: INTEGER;
+par: Oberon.ParList;
+BEGIN par := Oberon.Par; F := NIL;
+IF (par.vwr # NIL) & (par.frame = par.vwr.dsc) THEN
+IF par.frame.next IS ScriptFrames.Frame THEN F := par.frame.next(ScriptFrames.Frame) END
+ELSE F := FocusFrame()
+END;
+IF F = NIL THEN RETURN END; (*###*)
+text := NIL; Oberon.GetSelection(text, beg, end, time);
+IF (time >= 0) & (*(text # NIL) &*) (text.len > 0) & (time > lTime) THEN (* set search pattern *)
+Texts.OpenReader(R, text, beg);
+i := 0; pos := beg;
+REPEAT Texts.Read(R, sPat[i]); INC(i); INC(pos) UNTIL (i = MaxPatLen) OR (pos = end);
+sPatLen := i; lTime := time;
+i := 0; WHILE i # 256 DO sTab[i] := sPatLen; INC(i) END;
+i := 0; WHILE i # sPatLen - 1 DO sTab[ORD(sPat[i])] := sPatLen - 1 - i; INC(i) END
+END;
+IF F.car THEN pos := F.carLoc.pos ELSE pos := 0 END;
+FindPat(F, pos)
+END Search;
+
+PROCEDURE replace(): BOOLEAN;
+VAR F: ScriptFrames.Frame;
+R: Texts.Reader; tBuf: Texts.Buffer; text: Texts.Text;
+pos, beg, end, time, p, len: LONGINT;  i: INTEGER; ch: CHAR;
+BEGIN
+F := FocusFrame();
+IF F = NIL THEN RETURN FALSE END; (*###*)
+text := NIL; Oberon.GetSelection(text, beg, end, time);
+IF (time >= 0) & (*(text # NIL) &*) (time > lTime) THEN (* set replace buffer *)
+lTime := time; NEW(rBuf); Texts.OpenBuf(rBuf); Texts.Save(text, beg, end, rBuf)
+END;
+IF ~F.car OR ~ (sPatLen > 0) OR (rBuf = NIL) THEN RETURN FALSE END; (*###*)
+pos := F.carLoc.pos; p := pos - sPatLen;
+IF p < 0 THEN RETURN FALSE END; (*###*)
+Texts.OpenReader(R, F.text, p); Texts.Read(R, ch); i := 0;
+WHILE (ch = sPat[i]) & (i < sPatLen) DO Texts.Read(R, ch); INC(i) END;
+IF i = sPatLen THEN
+NEW(tBuf); Texts.OpenBuf(tBuf); Texts.Copy(rBuf, tBuf); len := tBuf.len;
+Texts.Replace(F.text, p, pos, tBuf); pos := p + len
+(*
+Texts.Delete(F.text, p, pos); pos := p;
+NEW(tBuf); Texts.OpenBuf(tBuf);
+Texts.Copy(rBuf, tBuf); len := tBuf.len;
+Texts.Insert(F.text, pos, tBuf); pos := pos + len
+*)
+END;
+FindPat(F, pos);
+RETURN F.car
+END replace;
+*)
+
+procedure SetCaret(F: Display.Frame; text: Texts.Text; pos: int32)
+  var
+    M: Oberon.CaretMsg
+begin
+  M.res := -1
+  M.dlink := nil
+  Objects.Stamp(@M)
+  M.id := Oberon.set_
+  M.F := F
+  M.car := F
+  M.text := text
+  M.pos := pos
+  F.handle(F, @M)
+end SetCaret
+
+procedure SetSelection(F: Display.Frame; text: Texts.Text; beg, end_: int32; time: pointer to int32)
+  var
+    M: Oberon.SelectMsg
+begin
+  M.res := -1
+  M.dlink := nil
+  Objects.Stamp(@M)
+  M.id := Oberon.set_
+  M.F := F
+  M.sel := F
+  M.text := text
+  M.beg := beg
+  M.end_ := end_
+  F.handle(F, @M)
+  M.id := Oberon.get
+  M.res := -1
+  M.time := -1
+  F.handle(F, @M)
+  time^ := M.time
+end SetSelection
+
+procedure GetCaret(F: pointer to Display.Frame; text: pointer to Texts.Text; pos: pointer to int32)
+  var
+    M: Oberon.CaretMsg
+begin
+  text^ := nil
+  F^ := nil
+  M.id := Oberon.get
+  M.F := nil
+  M.car := nil
+  Display.Broadcast(@M)
+  if M.car # nil then
+    F^ := M.car
+    text^ := M.text
+    pos^ := M.pos
+  end
+end GetCaret
+
+procedure FindPat(F: Display.Frame; text: Texts.Text; pos, time: int32): boolean
+  // searches pattern sPat beginning at position pos
+  var
+    R: Texts.Reader
+    buf: array 32 (* MaxPatLen *) of char
+    len_: int32
+    n, j: int16
+    N: Oberon.ControlMsg
+
+  procedure Forward(n: int16; R: pointer to Texts.Reader; buf: pointer to array 32 (* MaxPatLen *) of char)
+    var
+      m, j: int16
+  begin
+    m := sPatLen - n
+    j := 0
+    while j # m do
+      buf[j] := buf[n + j]
+      inc(j)
+    end
+    while j # sPatLen do
+      Texts.Read(R, @buf[j])
+      inc(j)
+    end
+  end Forward
+begin
+  len_ := text.len_
+  Texts.OpenReader(@R, text, pos)
+  Forward(sPatLen, @R, @buf)
+  pos := pos + sPatLen
+  loop
+    j := sPatLen
+    repeat
+      dec(j)
+    until (j < 0) or (buf[j] # sPat[j])
+    if (j < 0) or (pos >= len_) then
+      exit
+    end
+    n := sTab[ord(buf[sPatLen - 1])]
+    Forward(n, @R, @buf)
+    pos := pos + n
+  end
+
+  if j < 0 then
+    N.id := Oberon.neutralize
+    N.F := F
+    Display.Broadcast(@N)
+    Oberon.Defocus()
+    SetCaret(F, text, pos)
+    SetSelection(F, text, pos - sPatLen, pos, @lTime)
+    return true
+  else
+    N.id := Oberon.neutralize
+    N.F := F
+    Display.Broadcast(@N)
+    return false
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end FindPat
+
+procedure GetFrame(F: pointer to Display.Frame; text: pointer to Texts.Text; pos: pointer to int32)
+  var
+    M: Objects.LinkMsg
+    par: Oberon.ParList
+begin
+  par := Oberon.Par
+  GetCaret(F, text, pos)
+  if (par.vwr # nil) & (par.frame # nil) & (par.frame = par.vwr.dsc) & (F^ # par.frame.next) then
+    F^ := par.frame.next // title bar overrides focus frame
+    Objects.Stamp(@M)
+    M.id := Objects.get // get text
+    M.name[0] := 0X
+    M.res := -1
+    M.obj := nil
+    F^.handle(F^, @M)
+    if (M.obj # nil) & (M.obj is Texts.Text) then
+      text^ := M.obj(Texts.Text)
+      pos^ := 0
+    else
+      F^ := nil
+    end
+  end
+end GetFrame
+
+procedure Search*()
+  var
+    F: Display.Frame
+    R: Texts.Reader
+    text, seltext: Texts.Text
+    pos, beg, end_, time: int32
+    i: int16
+begin
+  GetFrame(@F, @text, @pos)
+  if F # nil then
+    Oberon.GetSelection(@seltext, @beg, @end_, @time)
+    if (time >= 0) & (seltext.len_ > 0) & (time > lTime) then
+      // set search pattern
+      Texts.OpenReader(@R, seltext, beg)
+      i := 0
+      repeat
+        Texts.Read(@R, @sPat[i])
+        inc(i)
+        inc(beg)
+      until (i = MaxPatLen) or (beg = end_)
+      sPatLen := i
+      lTime := time
+      i := 0
+      while i # 256 do
+        sTab[i] := sPatLen
+        inc(i)
+      end
+      i := 0
+      while i # sPatLen - 1 do
+        sTab[ord(sPat[i])] := sPatLen - 1 - i
+        inc(i)
+      end
+    end
+
+    if FindPat(F, text, pos, time) then
+    end
+  end
+end Search
+
+procedure replace(): boolean
+  var
+    F: Display.Frame
+    R: Texts.Reader
+    tBuf: Texts.Buffer
+    text, repltext: Texts.Text
+    pos, beg, end_, time, p, len_: int32
+    i: int16
+    ch: char
+begin
+  GetFrame(@F, @text, @pos)
+  if F # nil then
+    Oberon.GetSelection(@repltext, @beg, @end_, @time)
+    if (time >= 0) & (time > lTime) then
+      // set replace buffer
+      lTime := time
+      newgc(rBuf)
+      Texts.OpenBuf(rBuf)
+      Texts.Save(repltext, beg, end_, rBuf)
+    end
+
+    if ~(sPatLen > 0) or (rBuf = nil) then
+      return false // ###
+    end
+    p := pos - sPatLen
+    if p < 0 then
+      return false // ###
+    end
+    Texts.OpenReader(@R, text, p)
+    Texts.Read(@R, @ch)
+    i := 0
+    while (ch = sPat[i]) & (i < sPatLen) do
+      Texts.Read(@R, @ch)
+      inc(i)
+    end
+    if i = sPatLen then
+      newgc(tBuf)
+      Texts.OpenBuf(tBuf)
+      Texts.Copy(rBuf, tBuf)
+      len_ := tBuf.len_
+      Texts.Replace(text, p, pos, tBuf)
+      pos := p + len_
+    end
+
+    return FindPat(F, text, pos, time)
+  end
+
+  return false
+end replace
+
+procedure Replace*()
+begin
+  if replace() then
+  end
+end Replace
+
+procedure ReplaceAll*()
+begin
+  while replace() do
+  end
+end ReplaceAll
+
+procedure Font(const name: pointer to array of char): Fonts.Font
+  // append .Scn.Fnt if necessary
+  var
+    i, j: int16
+begin
+  i := 0
+  while (name[i] # ".") & (name[i] # 0X) do
+    inc(i)
+  end
+  if name[i] = 0X then
+    j := 0
+    while ext[j] # 0X do
+      name[i] := ext[j]
+      inc(i)
+      inc(j)
+    end
+    name[i] := 0X
+  end
+
+  return Fonts.This(name)
+end Font
+
+procedure ChangeFont*()
+  var
+    S: Texts.Scanner
+    T: Texts.Text
+    beg, end_, time: int32
+    fnt: Fonts.Font
+begin
+  OpenScanner(@S, nil)
+  if S.class = Texts.Name then
+    Oberon.GetSelection(@T, @beg, @end_, @time)
+    fnt := Font(@S.s)
+    if (time >= 0) & (fnt.type_ = Fonts.font) then
+      Texts.ChangeLooks(T, beg, end_, {0}, fnt, 0, 0)
+    end
+  end
+end ChangeFont
+
+procedure ChangeColor*()
+  var
+    S: Texts.Scanner
+    T: Texts.Text
+    col: int8
+    beg, end_, time: int32
+begin
+  OpenScanner(@S, nil)
+  if S.class # Texts.Int then
+    col := S.col
+  else
+    col := val(int8, val(int16, S.i))
+  end
+  Oberon.GetSelection(@T, @beg, @end_, @time)
+  if time >= 0 then
+    Texts.ChangeLooks(T, beg, end_, {1}, nil, col, 0)
+  end
+end ChangeColor
+
+procedure ChangeOffset*()
+  var
+    S: Texts.Scanner
+    T: Texts.Text
+    voff: int8
+    beg, end_, time: int32
+begin
+  OpenScanner(@S, nil)
+  if S.class # Texts.Int then
+    voff := S.voff
+  else
+    voff := val(int8, val(int16, S.i))
+  end
+  Oberon.GetSelection(@T, @beg, @end_, @time)
+  if time >= 0 then
+    Texts.ChangeLooks(T, beg, end_, {2}, nil, 0, voff)
+  end
+end ChangeOffset
+
+procedure Recall*()
+  var
+    M: Oberon.RecallMsg
+begin
+  M.F := nil
+  Display.Broadcast(@M)
+end Recall
+
+procedure NewStyle*()
+  var
+    M: Display.ConsumeMsg
+begin
+  M.id := Display.integrate
+  M.res := -1
+  M.obj := Styles.NewStyle()
+  M.F := nil
+  Display.Broadcast(@M)
+end NewStyle
+
+procedure SetStyle*()
+  var
+    M: Styles.ParamMsg
+    style: Styles.Style
+    F: Display.Frame
+begin
+  F := Oberon.Par.frame
+  case F of
+  | TextFrames.Frame:
+    OpenScanner(@M.S, F(TextFrames.Frame))
+    TextFrames.RemoveSelection(F(TextFrames.Frame))
+  else
+    OpenScanner(@M.S, nil)
+  end
+
+  Styles.SelStyle(@style)
+  if style # nil then
+    M.id := Styles.set_
+    style.handle(style, @M)
+  end
+end SetStyle
+
+procedure GetStyle*()
+  var
+    M: Styles.ParamMsg
+    style: Styles.Style
+    F: Display.Frame
+begin
+  F := Oberon.Par.frame
+  case F of
+  | TextFrames.Frame:
+    OpenScanner(@M.S, F(TextFrames.Frame))
+    TextFrames.RemoveSelection(F(TextFrames.Frame))
+  else
+    OpenScanner(@M.S, nil)
+  end
+
+  Styles.SelStyle(@style)
+  if style # nil then
+    M.T := Oberon.Log
+    M.id := Styles.get
+    style.handle(style, @M)
+  end
+end GetStyle
+
+procedure Style*()
+  var
+    V, F: Display.Frame
+    par: Oberon.ParList
+    M: Display.DisplayMsg
+    S: Texts.Scanner
+begin
+  par := Oberon.Par
+  V := nil
+  if par.frame = par.vwr.dsc then
+    V := par.vwr // menu frame
+  else
+    Texts.OpenScanner(@S, par.text, par.pos)
+    Texts.Scan(@S)
+    if (S.class = Texts.Char) & (S.c = "*") then
+      V := Oberon.MarkedViewer()
+    end
+  end
+
+  if (V # nil) & (V.dsc # nil) & (V.dsc.next # nil) then
+    F := V.dsc.next
+    case F of
+    | ScriptFrames.Frame:
+      ScriptFrames.Neutralize(F)
+      F.hide := ~F.hide
+      M.F := F
+      M.device := Display.screen
+      M.id := Display.full
+      Display.Broadcast(@M)
+
+    end
+  end
+end Style
+
+// Script.Print server ( * | ^ | name) {option} ~
+procedure PrintUnit(T: Texts.Text; const name: pointer to array of char; fnt: Fonts.Font; opts: set; pn0, pnb, pne, copies: int16)
+
+  type
+    Line = pointer to LineDesc
+
+    LineDesc = record
+      next: Line
+      len_: int32
+      w, asr_, dsr, h, nSpc: int16
+      eot, brk: boolean
+    end
+
+  (*
+  style height
+  *)
+
+  var
+    R: Texts.Reader
+    Y, Y0, pno: int16
+    pbrk: boolean
+    buf, L: Line
+    style: Styles.Style
+    h0, ox, sx, rx: int16
+
+  procedure log(ch: char)
+  begin
+    Texts.Write(@W, ch)
+    Texts.Append(Oberon.Log, W.buf)
+  end log
+
+  procedure ToPrt(d: int16): int16
+  begin
+    return val(int16, obdiv(val(int32, d) * Display.Unit, Printer.Unit))
+  end ToPrt
+
+  procedure OpenPrinter()
+    var
+      retries: int16
+  begin
+    retries := 4
+    Printer.Open(@printer, @options)
+    while (Printer.res > 0) & (Printer.res < 4) & (retries > 0) do
+      log("-")
+      Printer.Open(@printer, @options)
+      dec(retries)
+    end
+
+    if Printer.res = 1 then
+      Texts.WriteString(@W, " no such printer")
+    elsif Printer.res = 2 then
+      Texts.WriteString(@W, " no link")
+    elsif Printer.res = 3 then
+      Texts.WriteString(@W, " printer not ready")
+    elsif Printer.res = 4 then
+      Texts.WriteString(@W, " no permission")
+    end
+
+    (*
+    IF Printer.FrameX > leftX THEN leftX := Printer.FrameX END; (*adjust sizes*)
+    IF Printer.FrameY > pagY THEN pagY := Printer.FrameY + ToPrt(fnt.height); botY := pagY + 150 END;
+    IF Printer.FrameW < pagW THEN pagW := Printer.FrameW END;
+    IF Printer.FrameY + Printer.FrameH < headY THEN
+    headY := Printer.FrameY + Printer.FrameH - ToPrt(fnt.height); topY := headY - 100
+    END
+    *)
+  end OpenPrinter
+
+  procedure InitFormatterPrt(T: Texts.Text; L: pointer to Line; style: pointer to Styles.Style)
+  begin
+    newgc(L^)
+    ScriptFrames.FirstLine(T, @L^.w, @L^.asr_, @L^.dsr, @L^.nSpc, @L^.len_, @L^.brk, @L^.eot)
+    L^.h := L^.asr_ + L^.dsr
+    style^ := Styles.defStyle
+  end InitFormatterPrt
+
+  procedure FormatLinePrt(L: pointer to Line)
+  begin
+    newgc(L^)
+    ScriptFrames.NextLine(@L^.w, @L^.asr_, @L^.dsr, @L^.nSpc, @L^.len_, @L^.brk, @L^.eot)
+    L^.h := L^.asr_ + L^.dsr
+  end FormatLinePrt
+
+  procedure FrameDsr(F: Display.Frame): int16
+    var
+      B: Objects.AttrMsg
+  begin
+    B.dlink := nil
+    B.i := 0
+    Objects.Stamp(@B)
+    B.res := -1
+    B.id := Objects.get
+    copy(@B.name, "LineupHY", 32)
+    F.handle(F, @B)
+    return ToPrt(val(int16, B.i))
+  end FrameDsr
+
+  procedure ChW(fnt: Fonts.Font; ch: char): int16
+    var
+      obj: Objects.Object
+      unit: int32
+  begin
+    Styles.MetricFnt(fnt, @unit, @fnt)
+    fnt.GetObj(fnt, val(int16, ord(ch)), @obj)
+    if fnt.type_ = Fonts.metric then
+      return obj(Fonts.Char).dx
+    else
+      return val(int16, obdiv(unit * obj(Fonts.Char).dx, Printer.Unit))
+    end
+    return 0 // TODO o2m: Micron requires a result on all control paths
+  end ChW
+
+  procedure print_(pno, pnb, pne: int16): boolean
+  begin
+    return (pnb <= pno) & (pno < pne)
+  end print_
+
+  procedure Offsets(L: Line; ox, sx, rx: pointer to int16; style: pointer to Styles.Style)
+    var
+      dw: int16
+  begin
+    ox^ := val(int16, obdiv(style^.left, Printer.Unit))
+    sx^ := 0
+    rx^ := 0
+    dw := val(int16, obdiv(style^.paraW, Printer.Unit)) - L.w
+    if Styles.left in style^.opts then
+      if (Styles.right in style^.opts) & ~L.brk & (L.nSpc > 0) then
+        sx^ := obdiv(dw, L.nSpc)
+        rx^ := obmod(dw, L.nSpc)
+      end
+
+    else
+      if Styles.right in style^.opts then
+        inc(ox^, dw)
+      else
+        inc(ox^, asr(dw, 1))
+      end
+    end
+  end Offsets
+
+  procedure PrintFrame(G: Display.Frame; X, Y, pno: int16)
+    // handles big frames
+    var
+      M: Display.DisplayMsg
+  begin
+    M.res := -1
+    M.device := Display.printer
+    M.id := Display.full
+    M.dlink := nil
+    M.x := X
+    M.y := Y - FrameDsr(G)
+    Objects.Stamp(@M)
+    if M.x = leftX then
+      if ToPrt(G.W) > pagW then
+        dec(M.x, asr(ToPrt(G.W) - pagW, 1)) // !
+      end
+      if (M.y < 100) or (M.y + ToPrt(G.H) > topY) then
+        M.y := 100 // !
+      end
+    end
+
+    G.dlink := nil // G.dlink : HACK
+    M.F := G
+    G.handle(G, @M)
+  end PrintFrame
+
+  procedure PrintLine(R: pointer to Texts.Reader; X, Y, pno, sx, rx: int16; len_: int32; pbrk: pointer to boolean; pnb: pointer to int16; pne: pointer to int16; style: pointer to Styles.Style)
+    // X, Y: baseline
+
+    var
+      buf: array 256 of char
+      pos, ddX, unit: int32
+      obj, mobj: Objects.Object // mobj: the metric font does not deliver into obj, which the type case designates
+      G: Display.Frame
+      lib: Objects.Library
+      mlib: Fonts.Font
+      k, x, dx, dY, dX, X0, voff, offX, col: int16
+      ch: char
+
+    procedure Out(pnb: pointer to int16; pne: pointer to int16; X0: pointer to int16; Y: pointer to int16; buf: pointer to array 256 of char; dY: pointer to int16; k: pointer to int16; lib: pointer to Objects.Library; pno: pointer to int16)
+    begin
+      if (k^ > 0) & print_(pno^, pnb^, pne^) then
+        buf[k^] := 0X
+        Printer.String(X0^, Y^ + dY^, buf, lib^(Fonts.Font))
+      end
+      k^ := 0
+    end Out
+
+    procedure UseColor(col: int16; pnb: pointer to int16; pne: pointer to int16; pno: pointer to int16)
+      var
+        r, g, b: int16
+    begin
+      if print_(pno^, pnb^, pne^) then
+        if col >= 0 then
+          Display.GetColor(band(col, 255), @r, @g, @b)
+        else
+          Display.GetColor(band(col + 256, 255), @r, @g, @b)
+        end
+
+        Printer.UseColor(r, g, b)
+      end
+    end UseColor
+  begin
+    lib := nil
+    col := -1
+    k := 0
+    pos := 0
+    pbrk^ := false
+    x := 0
+    X0 := X
+    offX := X
+    while pos # len_ do
+      Texts.Read(R, @ch)
+      inc(pos)
+      if R.lib # nil then
+        if (lib # R.lib) or (voff # R.voff) or (col # R.col) then
+          Out(pnb, pne, @X0, @Y, @buf, @dY, @k, @lib, @pno)
+          X0 := X
+          if col # R.col then
+            col := R.col
+            UseColor(col, pnb, pne, @pno)
+          end
+          lib := R.lib
+          voff := R.voff
+          dY := 0
+          case lib of
+          | Fonts.Font:
+            dY := obdiv(ToPrt(lib(Fonts.Font).height) * voff, 100)
+            Styles.MetricFnt(lib(Fonts.Font), @unit, @mlib)
+          end
+        end
+
+        lib.GetObj(lib, val(int16, ord(ch)), @obj)
+        case obj of
+        | Fonts.Char:
+          dx := obj(Fonts.Char).dx
+          mlib.GetObj(mlib, val(int16, ord(ch)), @mobj)
+          dX := mobj(Fonts.Char).dx
+          if mlib.type_ # Fonts.metric then
+            dX := val(int16, obdiv(unit * dX, Printer.Unit))
+          end
+          if (ch = " ") & ((sx # 0) or (rx # 0)) then
+            Out(pnb, pne, @X0, @Y, @buf, @dY, @k, @lib, @pno)
+            inc(dX, sx)
+            if rx > 0 then
+              inc(dX)
+              dec(rx)
+            end
+            inc(X, dX)
+            X0 := X
+          elsif ch = TAB then
+            Out(pnb, pne, @X0, @Y, @buf, @dY, @k, @lib, @pno)
+            Styles.Tab(style^, lib(Fonts.Font), x, val(int32, X - offX) * Printer.Unit, @dx, @ddX)
+            inc(X, val(int16, obdiv(ddX, Printer.Unit)))
+            X0 := X
+          elsif ch >= " " then
+            buf[k] := ch
+            inc(k)
+            inc(X, dX)
+          elsif (ch = 1FX) & (pos = len_) then
+            buf[k] := "_" // hyph
+            inc(k)
+          end
+
+        else
+          // object
+          case obj of
+          | Styles.Style:
+            style^ := obj(Styles.Style)
+            pbrk^ := Styles.break in style^.opts
+            return
+          end
+          case obj of
+          | Display.Frame:
+            G := obj(Display.Frame)
+            dx := G.W
+            dX := ToPrt(dx)
+            if print_(pno, pnb^, pne^) then
+              PrintFrame(G, X, Y + dY + ToPrt(obdiv(voff * G.H, 100)), pno)
+              col := -1
+            end
+            inc(X, dX)
+            X0 := X
+          end
+        end
+
+        inc(x, dx)
+      end
+    end
+
+    Out(pnb, pne, @X0, @Y, @buf, @dY, @k, @lib, @pno)
+  end PrintLine
+
+  procedure PrintNum(x, y, n: int16; fnt: Fonts.Font; right: boolean)
+
+    var
+      s: array 8 of char
+      i, w, k: int16
+  begin
+    i := 7
+    repeat
+      s[i] := chr(obmod(n, 10) + 48)
+      dec(i)
+      n := obdiv(n, 10)
+    until n = 0
+    k := 0
+    w := 0
+    while i < 7 do
+      inc(i)
+      s[k] := s[i]
+      w := w + ChW(fnt, s[k])
+      inc(k)
+    end
+    s[k] := 0X
+    if right then
+      dec(x, w)
+    end
+    Printer.String(x, y, @s, fnt)
+  end PrintNum
+
+  procedure PageHeader(title: pointer to array of char; pn: int16; opts: set; fnt: pointer to Fonts.Font; pnb: pointer to int16; pne: pointer to int16)
+    var
+      y, i, w: int16
+  begin
+    if ~print_(pn, pnb^, pne^) then
+      return
+    end
+    Printer.UseColor(0, 0, 0) // black
+    if header in opts then
+      // only if (pageNo IN opts) & (onTop IN opts)
+      if (pageNo in opts) & (onTop in opts) & (alter in opts) & ~((pn mod 2) # 0) then
+        // place header right adjusted
+        i := 0
+        w := 0
+        while title[i] # 0X do
+          w := w + ChW(fnt^, title[i])
+          inc(i)
+        end
+        Printer.String(leftX + pagW - w, headY, title, fnt^)
+      else
+        Printer.String(leftX, headY, title, fnt^)
+      end
+    end
+
+    if pageNo in opts then
+      if onTop in opts then
+        y := headY
+      else
+        y := pagY
+      end
+      if (alter in opts) & ~((pn mod 2) # 0) then
+        PrintNum(leftX, y, pn, fnt^, false)
+      else
+        PrintNum(leftX + pagW, y, pn, fnt^, true)
+      end
+    end
+  end PageHeader
+
+  procedure Empty(L: Line): boolean
+  begin
+    return L.brk & (L.len_ = 1)
+  end Empty
+
+  procedure Title(L0, L: Line): boolean
+  begin
+    // L is Title
+    return L.brk & (L.len_ > 1) & L0.brk & (L0.len_ = 1)
+  end Title
+
+  procedure StartPage(pno: int16; Y: pointer to int16; fnt: pointer to Fonts.Font; name: pointer to array of char; opts: pointer to set; pn0: pointer to int16; pnb: pointer to int16; pne: pointer to int16)
+  begin
+    Y^ := topY
+    if ~open & (pno >= pnb^) then
+      OpenPrinter()
+      open := true
+      if Printer.res # 0 then
+        return
+      end
+      if (pno > pn0^) or ~(notFirst in opts^) then
+        PageHeader(name, pno, opts^, fnt, pnb, pne)
+      end
+    else
+      PageHeader(name, pno, opts^, fnt, pnb, pne)
+    end
+  end StartPage
+
+  procedure Page(nextL: Line; Y: pointer to int16; R: pointer to Texts.Reader; copies: pointer to int16; fnt: pointer to Fonts.Font; name: pointer to array of char; opts: pointer to set; pbrk: pointer to boolean; pn0: pointer to int16; pnb: pointer to int16; pne: pointer to int16; pno: pointer to int16)
+  begin
+    pbrk^ := false // not really needed
+    MarkBrk(Texts.Pos(R))
+    if print_(pno^, pnb^, pne^) then
+      Printer.Page(copies^)
+      log(".")
+    end
+    if nextL # nil then
+      inc(pno^)
+      StartPage(pno^, Y, fnt, name, opts, pn0, pnb, pne)
+    end
+  end Page
+
+  procedure Flush(L: Line; Y: int16; h0: pointer to int16; R: pointer to Texts.Reader; buf: pointer to Line; pbrk: pointer to boolean; pnb: pointer to int16; pne: pointer to int16; pno: pointer to int16; style: pointer to Styles.Style)
+    var
+      ox, sx, rx: int16
+  begin
+    // print buffer upto L (excl) or page break
+    while (buf^ # L) & ~pbrk^ do
+      h0^ := buf^.h
+      Offsets(buf^, @ox, @sx, @rx, style)
+      PrintLine(R, leftX + ox, Y - buf^.asr_, pno^, sx, rx, buf^.len_, pbrk, pnb, pne, style)
+      dec(Y, buf^.h)
+      buf^ := buf^.next
+    end
+
+    if ~pbrk^ then
+      h0^ := 0
+    end
+  end Flush
+
+  procedure CompletePage(L: Line; Y: pointer to int16; R: pointer to Texts.Reader; buf: pointer to Line; copies: pointer to int16; fnt: pointer to Fonts.Font; name: pointer to array of char; opts: pointer to set; pbrk: pointer to boolean; pn0: pointer to int16; pnb: pointer to int16; pne: pointer to int16; pno: pointer to int16; style: pointer to Styles.Style)
+    var
+      h0: int16
+  begin
+    Flush(L, Y^, @h0, R, buf, pbrk, pnb, pne, pno, style)
+    Page(L, Y, R, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno)
+    dec(Y^, h0)
+  end CompletePage
+
+  procedure CompletePage0(L: pointer to Line; Y: pointer to int16; R: pointer to Texts.Reader; buf: pointer to Line; copies: pointer to int16; fnt: pointer to Fonts.Font; name: pointer to array of char; opts: pointer to set; pbrk: pointer to boolean; pn0: pointer to int16; pnb: pointer to int16; pne: pointer to int16; pno: pointer to int16; style: pointer to Styles.Style)
+    var
+      h0: int16
+  begin
+    Flush(L^, Y^, @h0, R, buf, pbrk, pnb, pne, pno, style)
+    // here
+    if ~pbrk^ then
+      // skip empty lines on top of page
+      while Empty(L^) & ~L^.eot & ~pbrk^ do
+        h0 := L^.h
+        PrintLine(R, 0, 0, pno^, 0, 0, L^.len_, pbrk, pnb, pne, style)
+        FormatLinePrt(L)
+      end
+
+      // ~Empty OR pbrk
+      buf^ := L^
+    end
+
+    Page(L^, Y, R, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno)
+    dec(Y^, h0)
+  end CompletePage0
+
+  procedure CompletePage1(R: pointer to Texts.Reader; Y: pointer to int16; buf: pointer to Line; copies: pointer to int16; fnt: pointer to Fonts.Font; name: pointer to array of char; opts: pointer to set; pbrk: pointer to boolean; pn0: pointer to int16; pnb: pointer to int16; pne: pointer to int16; pno: pointer to int16; style: pointer to Styles.Style)
+    // end of doc
+    var
+      h0: int16
+  begin
+    repeat
+      Flush(nil, Y^, @h0, R, buf, pbrk, pnb, pne, pno, style)
+      Page(buf^, Y, R, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno)
+      dec(Y^, h0)
+    until buf^ = nil
+  end CompletePage1
+
+  procedure ResetBuf(L: pointer to Line; Y0: pointer to int16; R: pointer to Texts.Reader; Y: pointer to int16; buf: pointer to Line; copies: pointer to int16; fnt: pointer to Fonts.Font; name: pointer to array of char; opts: pointer to set; pbrk: pointer to boolean; pn0: pointer to int16; pnb: pointer to int16; pne: pointer to int16; pno: pointer to int16; style: pointer to Styles.Style)
+    var
+      L0: Line
+      i: int16
+  begin
+    L0 := buf^
+    Y0^ := topY - L0.h
+    i := 1
+    while L0 # L^ do
+      L0 := L0.next
+      dec(Y0^, L0.h)
+      inc(i)
+    end
+    while ~L^.eot & (i < 5) do
+      FormatLinePrt(@L^.next)
+      L^ := L^.next
+      dec(Y0^, L^.h)
+      if Y0^ < botY then
+        CompletePage0(L, Y, R, buf, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno, style) // !
+        Y0^ := topY - L^.h
+        i := 0
+      end
+      inc(i)
+    end
+  end ResetBuf
+
+  procedure PageBreak(L: pointer to Line; Y: pointer to int16; R: pointer to Texts.Reader; buf: pointer to Line; copies: pointer to int16; fnt: pointer to Fonts.Font; name: pointer to array of char; opts: pointer to set; pbrk: pointer to boolean; pn0: pointer to int16; pnb: pointer to int16; pne: pointer to int16; pno: pointer to int16; style: pointer to Styles.Style)
+    var
+      L0, L1: Line
+  begin
+    // L goes to next page
+    L0 := buf^.next
+    L1 := L0.next
+    if Title(buf^, L0) & Empty(L1) then
+      CompletePage(L0, Y, R, buf, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno, style) // Title at L0
+    elsif Title(L0, L1) then
+      CompletePage(L1, Y, R, buf, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno, style) // Title at L1
+    else
+      L0 := L1
+      L1 := L0.next
+      // IF Title(L0, L1) OR ~L1.brk & (L.brk OR L0.brk) THEN CompletePage(L1, Y) break before L1
+      if Title(L0, L1) or ~L1.brk & L0.brk then
+        CompletePage(L1, Y, R, buf, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno, style) // Title OR first 2 lines of para
+      elsif ~L1.brk & L^.brk then
+        // last 2 lines of para
+        if buf^.next.brk & ~L0.brk then
+          CompletePage(L0, Y, R, buf, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno, style) // 3 lines para at once
+        else
+          CompletePage(L1, Y, R, buf, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno, style) // last 2 lines of para
+        end
+
+      else
+        CompletePage0(L, Y, R, buf, copies, fnt, name, opts, pbrk, pn0, pnb, pne, pno, style) // normal break at L
+      end
+    end
+  end PageBreak
+begin
+  Texts.WriteString(@W, name)
+  if T.len_ > 0 then
+    Texts.WriteString(@W, " printing")
+    Texts.Append(Oberon.Log, W.buf)
+    InitFormatterPrt(T, @buf, @style)
+    Texts.OpenReader(@R, T, 0)
+    L := buf
+    Y := topY
+    ResetBuf(@L, @Y0, @R, @Y, @buf, @copies, @fnt, name, @opts, @pbrk, @pn0, @pnb, @pne, @pno, @style)
+    pno := pn0
+    pbrk := false
+    StartPage(pno, @Y, @fnt, name, @opts, @pn0, @pnb, @pne)
+    if open & (Printer.res # 0) then
+      return
+    end
+    repeat
+      h0 := buf.h // save height for explicit page break (gap)
+      Offsets(buf, @ox, @sx, @rx, @style)
+      PrintLine(@R, leftX + ox, Y - buf.asr_, pno, sx, rx, buf.len_, @pbrk, @pnb, @pne, @style)
+      dec(Y, buf.h)
+      buf := buf.next
+      if pbrk then
+        Page(buf, @Y, @R, @copies, @fnt, name, @opts, @pbrk, @pn0, @pnb, @pne, @pno) // explicit
+        ResetBuf(@L, @Y0, @R, @Y, @buf, @copies, @fnt, name, @opts, @pbrk, @pn0, @pnb, @pne, @pno, @style)
+        dec(Y, h0)
+        dec(Y0, h0)
+      end
+      if ~L.eot then
+        FormatLinePrt(@L.next)
+        L := L.next
+        dec(Y0, L.h)
+        if Y0 < botY then
+          PageBreak(@L, @Y, @R, @buf, @copies, @fnt, name, @opts, @pbrk, @pn0, @pnb, @pne, @pno, @style)
+          ResetBuf(@L, @Y0, @R, @Y, @buf, @copies, @fnt, name, @opts, @pbrk, @pn0, @pnb, @pne, @pno, @style)
+          L.eot := L.eot or (pno >= pne)
+        end
+      end
+
+      if open & (Printer.res # 0) then
+        return
+      end
+    until L.eot
+
+    CompletePage1(@R, @Y, @buf, @copies, @fnt, name, @opts, @pbrk, @pn0, @pnb, @pne, @pno, @style)
+    lastPno := pno
+  // IF open THEN Printer.Close END
+  else
+    Texts.WriteString(@W, " not found")
+    Texts.Append(Oberon.Log, W.buf)
+  end
+end PrintUnit
+
+(*
+opt = {"/" name [par [par]]}.
+
+PROCEDURE OutScan(VAR S: Texts.Scanner; s: ARRAY OF CHAR);
+BEGIN
+Out.String(s); Out.Char(" ");
+IF S.class = Texts.Char THEN Out.String("char ");Out.Char(S.c)
+ELSIF S.class = Texts.Name THEN Out.String("name ");Out.String(S.s)
+ELSIF S.class = Texts.Int THEN Out.String("int ");Out.Int(S.i, 0)
+ELSE HALT(66)
+END;
+Out.Ln
+END OutScan;
+*)
+
+procedure Options(S: pointer to Texts.Scanner; fnt: pointer to Fonts.Font; opts: pointer to set; pn0, pnb, pne, copies: pointer to int16)
+
+  const
+    pageNo = 0
+    onTop = 1
+    alter = 2
+    header = 3
+    notFirst = 4
+
+  var
+    i, line: int16
+    opt: array 16 of char
+begin
+  (* /h header (file name & date)
+  /c 0..9
+  /p[a][t][f][c] [number] alternate/top
+  /r number [number] range
+  /f name
+  *)
+
+  opts^ := {} // init
+  pnb^ := (-32768i2)
+  pne^ := 32767
+  copies^ := 1
+  pn0^ := 0
+  fnt^ := Fonts.Default
+  line := S.line
+  while (S.class = Texts.Char) & (S.c = Oberon.OptionChar) & (S.line = line) do
+    Texts.Scan(S) // opt
+    if (S.line = line) & (S.class = Texts.Name) then
+      copy(@opt, @S.s, 16)
+      Texts.Scan(S)
+      if opt[0] = "h" then
+        opts^ := opts^ + {header} // header
+      elsif opt[0] = "c" then
+        // copies
+        if S.class = Texts.Int then
+          copies^ := val(int16, S.i)
+          Texts.Scan(S)
+        end
+      elsif opt[0] = "r" then
+        // range
+        if S.class = Texts.Int then
+          pnb^ := val(int16, S.i)
+          Texts.Scan(S)
+        end
+        if S.class = Texts.Int then
+          pne^ := val(int16, S.i)
+          Texts.Scan(S)
+        end
+      elsif opt[0] = "f" then
+        // font
+        if S.class = Texts.Name then
+          fnt^ := Font(@S.s)
+          Texts.Scan(S)
+        end
+      elsif opt[0] = "u" then
+        // US letter
+        topY := 2900
+        headY := topY + 100
+      (*
+      PROCEDURE ReadString(VAR R: Texts.Reader; VAR s: ARRAY OF CHAR);
+      VAR i: INTEGER; ch: CHAR;
+      BEGIN Texts.Read(R, ch);
+      WHILE ~R.eot & (ch # 22X) DO Texts.Read(R, ch) END; Texts.Read(R, ch);
+      i := 0; WHILE ~R.eot & (ch # 22X) & (i < LEN(s)-1) DO s[i] := ch; INC(i); Texts.Read(R, ch) END;
+      s[i] := 0X;
+      END ReadString;
+
+      ELSIF opt[0] = "H" THEN (*Header*)
+      IF opt[1] = "t" THEN ReadString(S, ht)
+      ELSIF opt[1] = "c" THEN ReadString(S, hc)
+      ELSE ReadString(S, ht); COPY(ht, hc)
+      END
+      *)
+      elsif opt[0] = "p" then
+        // page numbering
+        opts^ := opts^ + {pageNo}
+        i := 1
+        while opt[i] # 0X do
+          if opt[i] = "a" then
+            opts^ := opts^ + {alter}
+          elsif opt[i] = "t" then
+            opts^ := opts^ + {onTop}
+          elsif opt[i] = "f" then
+            opts^ := opts^ + {notFirst}
+          elsif opt[i] = "c" then
+            pn0^ := lastPno + 1 // continuous
+          end
+
+          inc(i)
+        end
+
+        if S.class = Texts.Int then
+          pn0^ := val(int16, S.i)
+          Texts.Scan(S)
+        end
+      end
+    end
+  end
+end Options
+
+procedure Scale(x: pointer to int16)
+begin
+  x^ := val(int16, obdiv(val(int32, val(int16, x^) * PrtUnit), Printer.Unit))
+end Scale
+
+// Script.Print Pluto (^ | * [opts] | {name [opts]})
+procedure Print*()
+
+  var
+    S: Texts.Scanner
+    V: Display.Frame
+    F: ScriptFrames.Frame
+    title: array 32 of char
+    T: Texts.Text
+    beg, end_, time: int32
+
+  procedure PrintText(T: Texts.Text; const title: pointer to array of char; S: pointer to Texts.Scanner)
+    var
+      opts: set
+      pn0, pnb, pne, copies: int16
+      fnt: Fonts.Font
+  begin
+    leftX := 290 // reset default print metrics
+    pagW := val(int16, obdiv(Styles.pageW, Printer.Unit))
+    headY := 3300
+    topY := 3200
+    botY := 300
+    pagY := 150
+    Scale(@leftX)
+    Scale(@headY)
+    Scale(@topY)
+    Scale(@botY)
+    Scale(@pagY)
+    Texts.Scan(S)
+    Options(S, @fnt, @opts, @pn0, @pnb, @pne, @copies)
+    if T = nil then
+      newgc(T)
+      Texts.Open(T, title)
+    end
+    PrintUnit(T, title, fnt, opts, pn0, pnb, pne, copies)
+  end PrintText
+begin
+  Texts.WriteString(@W, "Script.Print ")
+  Texts.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Texts.Scan(@S)
+  if S.class in {Texts.String,Texts.Name} then
+    copy(@printer, @S.s, 32)
+    copy(@printer, @S.s, 32)
+    if S.nextCh = Oberon.OptionChar then
+      Texts.Scan(@S)
+      Texts.Scan(@S)
+      copy(@options, @S.s, 32)
+    else
+      copy(@options, "", 32)
+    end
+
+    Texts.WriteString(@W, @printer)
+    if options # "" then
+      Texts.Write(@W, Oberon.OptionChar)
+      Texts.WriteString(@W, @options)
+    end
+
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+    (* Printer.Open(S.s, Oberon.User, Oberon.Password);
+    IF Printer.res = 0 THEN
+    *)
+    Texts.Scan(@S)
+    open := false
+    if S.class = Texts.Char then
+      if S.c = "*" then
+        V := Oberon.MarkedViewer()
+        if (V.dsc # nil) & (V.dsc.next # nil) & (V.dsc.next is ScriptFrames.Frame) then
+          F := V.dsc.next(ScriptFrames.Frame)
+          MenuViewers.GetName(V(MenuViewers.Viewer), @title, 32)
+          ScriptFrames.Mark(F, -1)
+          PrintText(F.text, @title, @S)
+          ScriptFrames.Mark(F, 1)
+        end
+
+      elsif S.c = "^" then
+        Oberon.GetSelection(@T, @beg, @end_, @time)
+        if time >= 0 then
+          Texts.OpenScanner(@S, T, beg)
+          Texts.Scan(@S)
+          if S.class = Texts.Name then
+            PrintText(nil, @S.s, @S)
+          end
+        end
+      end
+
+    else
+      while S.class = Texts.Name do
+        PrintText(nil, @S.s, @S)
+        Texts.WriteLn(@W)
+      end
+    end
+
+    if open then
+      Printer.Close()
+    end
+  (*
+  ELSE
+  IF Printer.res = 1 THEN Texts.WriteString(W, " no such printer")
+  ELSIF Printer.res = 2 THEN Texts.WriteString(W, " no link")
+  ELSIF Printer.res = 3 THEN Texts.WriteString(W, " printer not ready")
+  ELSIF Printer.res = 4 THEN Texts.WriteString(W, " no permission")
+  END
+  END*)
+  else
+    Texts.WriteString(@W, " no printer specified")
+  end
+
+  Texts.WriteLn(@W)
+  Texts.Append(Oberon.Log, W.buf)
+end Print
+
+procedure PageBreaks*()
+  var
+    S: Texts.Scanner
+    V: Display.Frame
+    F: ScriptFrames.Frame
+    dmy: array 1 of char
+    d: int16
+    opts: set
+    fnt: Fonts.Font
+begin
+  Texts.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Texts.Scan(@S)
+  if S.c = "*" then
+    V := Oberon.MarkedViewer()
+    if (V.dsc # nil) & (V.dsc.next # nil) & (V.dsc.next is ScriptFrames.Frame) then
+      F := V.dsc.next(ScriptFrames.Frame)
+      leftX := 290 // reset default print metrics
+      pagW := val(int16, obdiv(Styles.pageW, Printer.Unit))
+      headY := 3300
+      topY := 3200
+      botY := 300
+      pagY := 150
+      Scale(@leftX)
+      Scale(@headY)
+      Scale(@topY)
+      Scale(@botY)
+      Scale(@pagY)
+      Texts.Scan(@S)
+      Options(@S, @fnt, @opts, @d, @d, @d, @d)
+      ScriptFrames.Mark(F, -1)
+      newgc(tail)
+      head := tail
+      dmy[0] := 0X
+      pages := 0
+      PrintUnit(F.text, @dmy, Fonts.Default, {}, (-32768i2), 32767, 32767, 0)
+      Texts.WriteInt(@W, pages, 5)
+      Texts.WriteString(@W, " page(s)")
+      Texts.WriteLn(@W)
+      Texts.Append(Oberon.Log, W.buf)
+      F.slink := head
+      tail := nil
+      head := nil
+      ScriptFrames.Mark(F, 1)
+      ScriptFrames.Show(F, F.org)
+    end
+  end
+end PageBreaks
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Open" end return Open end
+  if i = 1 then if name # nil then name^ := "Store" end return Store end
+  if i = 2 then if name # nil then name^ := "Search" end return Search end
+  if i = 3 then if name # nil then name^ := "Replace" end return Replace end
+  if i = 4 then if name # nil then name^ := "ReplaceAll" end return ReplaceAll end
+  if i = 5 then if name # nil then name^ := "ChangeFont" end return ChangeFont end
+  if i = 6 then if name # nil then name^ := "ChangeColor" end return ChangeColor end
+  if i = 7 then if name # nil then name^ := "ChangeOffset" end return ChangeOffset end
+  if i = 8 then if name # nil then name^ := "Recall" end return Recall end
+  if i = 9 then if name # nil then name^ := "NewStyle" end return NewStyle end
+  if i = 10 then if name # nil then name^ := "SetStyle" end return SetStyle end
+  if i = 11 then if name # nil then name^ := "GetStyle" end return GetStyle end
+  if i = 12 then if name # nil then name^ := "Style" end return Style end
+  if i = 13 then if name # nil then name^ := "Print" end return Print end
+  if i = 14 then if name # nil then name^ := "PageBreaks" end return PageBreaks end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Script", cmd_)
+  Texts.OpenWriter(@W)
+  lastPno := 0
+  copy(@ext, ".Scn.Fnt", 32)
+end Script.

@@ -1,0 +1,529 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module PanelDocs [level=5]
+
+import Objects, Display, Display3, Files, Strings, Attributes, Links, Oberon, Panels, Texts, Gadgets, Documents, Desktops, Printer, Modules
+// portable
+// jm 1.2.95
+
+(** Implementation of a document for the panel gadgets.
+*)
+
+(*
+jm 7.11.94 - removed PublicPanel support
+ps 16.07.96 - added commads to support 'dynamic' panels (thanks eos)
+ps 4.8.96 - changed to Printer.Frame
+ps 8.10.96 - improved Detach
+*)
+
+const
+  Menu = "Desktops.StoreDoc[Store]"
+
+type 
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+
+var
+  W: Texts.Writer
+
+procedure Explain()
+begin
+  if (Modules.res # 0) & (Modules.resMsg # "") then
+    Texts.WriteString(@W, " (")
+    Texts.WriteString(@W, @Modules.resMsg)
+    Texts.Write(@W, ")")
+  end
+end Explain
+
+// Loads a panel from disk. VW, VH indicate the prefered size of the panel.
+procedure OpenPanel*(D: Documents.Document; const name: pointer to array of char; VW, VH: pointer to int16): Gadgets.Frame
+  type
+    EmptyMsg = object (Display.FrameMsg)
+    end
+    PEmptyMsg = pointer to EmptyMsg
+  var
+    lib: Objects.Library
+    root: Objects.Object
+    J: EmptyMsg
+    fp: Files.File
+    R: Files.Rider
+    ch: char
+    len_: int32
+    i, x, y: int16
+    s: array 64 of char
+    old: boolean
+    CM: Gadgets.CmdMsg
+begin
+  VW^ := 266
+  VH^ := 200
+  fp := Files.Old(name)
+  if fp # nil then
+    Files.Set(@R, fp, 0)
+    Files.ReadInt(@R, @i)
+    if (i = Documents.Id) or (i = 1831) then
+      Files.ReadString(@R, @s, 64) // skip over tag
+      Files.ReadInt(@R, @x)
+      Files.ReadInt(@R, @y)
+      Files.ReadInt(@R, VW)
+      Files.ReadInt(@R, VH)
+      Files.Read(@R, cast(BytePtr, @ch))
+      if ch = 0F7X then
+        // attachments
+        Documents.LoadAttachments(@R, @D.attr, @D.link)
+        if D.link # nil then
+          copy(@CM.cmd, "PREPARE", 128)
+          CM.res := -1
+          CM.dlink := D
+          Objects.Stamp(@CM)
+          Links.Broadcast(D.link, @CM)
+        end
+
+        Files.Read(@R, cast(BytePtr, @ch))
+      end
+
+      old := false
+    else
+      Files.Set(@R, fp, 0)
+      Files.Read(@R, cast(BytePtr, @ch))
+      old := true
+    end
+
+    if (ch = 4X) or (ch = 2X) then
+      // super or drawings format
+      Files.Read(@R, cast(BytePtr, @ch))
+      if (ch = Objects.LibBlockId) or (ch = 0DBX) then
+        newgc(lib)
+        Objects.OpenLibrary(lib)
+        Objects.LoadLibrary(lib, fp, Files.Pos(@R), @len_)
+        lib.GetObj(lib, 0, @root) // by default
+
+        if (root # nil) & (root is Objects.Dummy) then
+          Texts.WriteString(@W, "  discarding ")
+          Texts.WriteString(@W, @root(Objects.Dummy).GName)
+          Explain()
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+          root := nil
+        elsif (root # nil) & (root is Display.Frame) then
+          case root of
+          | Display.Frame:
+            J.dlink := nil
+            J.F := nil
+            J.x := 0
+            J.y := 0
+            root.handle(root, @J) // send a dummy message down, so that traps are caused early
+            if old then
+              VW^ := root.W
+              VH^ := root.H
+            end
+            return root(Gadgets.Frame)
+          end
+
+        else
+          return nil
+        end
+
+      else
+        Texts.WriteString(@W, "  panel format corrupt")
+        Texts.WriteLn(@W)
+        Texts.Append(Oberon.Log, W.buf)
+      end
+
+    else
+      Texts.WriteString(@W, "  not a panel")
+      Texts.WriteLn(@W)
+      Texts.Append(Oberon.Log, W.buf)
+    end
+  end
+
+  return nil
+end OpenPanel
+
+// Document method.
+procedure LoadPanel*(D: Documents.Document)
+  var
+    obj: Objects.Object
+    main: Gadgets.Frame
+    gen: array 64 of char
+begin
+  main := OpenPanel(D, @D.name, @D.W, @D.H)
+  if main = nil then
+    Attributes.GetString(D, "MainGen", @gen, 64)
+    obj := Gadgets.CreateObject(@gen)
+    main := obj(Gadgets.Frame)
+  end
+
+  Documents.Init(D, main)
+end LoadPanel
+
+// Document method.
+procedure StorePanel*(D: Documents.Document)
+  var
+    lib: Objects.Library
+    f: Files.File
+    len_: int32
+    P: Display.Frame
+    new_, gen: array 64 of char
+    i: int16
+    B: Objects.BindMsg
+    R: Files.Rider
+begin
+  Texts.WriteString(@W, "Store ")
+  Texts.Append(Oberon.Log, W.buf)
+  if D.name # "" then
+    P := D.dsc
+    if P # nil then
+      f := Files.New(@D.name)
+      if f # nil then
+        newgc(lib)
+        Objects.OpenLibrary(lib)
+        B.lib := lib
+        P.handle(P, @B)
+
+        copy(@new_, @D.name, 64)
+        i := 0
+        while new_[i] # 0X do
+          inc(i)
+        end
+        new_[i] := "."
+        new_[i + 1] := "B"
+        new_[i + 2] := "a"
+        new_[i + 3] := "k"
+        new_[i + 4] := 0X
+        Files.Rename(@D.name, @new_, @i) // rename file
+
+        Attributes.GetString(D, "Gen", @gen, 64)
+        Files.Set(@R, f, 0)
+        Files.WriteInt(@R, Documents.Id)
+        Files.WriteString(@R, @gen, 64)
+        Files.WriteInt(@R, 0)
+        Files.WriteInt(@R, 0)
+        Files.WriteInt(@R, P.W)
+        Files.WriteInt(@R, P.H)
+        if (D.attr # nil) or (D.link # nil) then
+          // attachments
+          Documents.StoreAttachments(@R, D.attr, D.link)
+        end
+
+        Files.Write(@R, val(byte, ord(2X))) // SuperId
+        Objects.StoreLibrary(lib, f, Files.Pos(@R), @len_)
+        Files.Register(f)
+
+        Texts.Write(@W, 22X)
+        Texts.WriteString(@W, @D.name)
+        Texts.Write(@W, 22X)
+      else
+        Texts.WriteString(@W, "[Invalid name]")
+      end
+    end
+
+  else
+    Texts.WriteString(@W, "[Untitled document]")
+  end
+
+  Texts.WriteLn(@W)
+  Texts.Append(Oberon.Log, W.buf)
+end StorePanel
+
+procedure PrintPanelDoc(F: Panels.Panel; M: pointer to Display.DisplayMsg)
+  var
+    P: Display.DisplayMsg
+    O: Display3.OverlapMsg
+
+  procedure Dev(x: int16): int16
+  begin
+    return val(int16, obdiv(val(int32, x) * Display.Unit, Printer.Unit))
+  end Dev
+begin
+  if F # nil then
+    newgc(O.M)
+    Display3.Open(O.M)
+    Display3.Add(O.M, 0, -F.H + 1, F.W, F.H)
+    O.x := 0
+    O.y := 0
+    O.F := F
+    O.res := -1
+    F.handle(F, @O)
+    P.device := Display.printer
+    P.id := Display.full
+    Objects.Stamp(@P)
+    if M.id = Display.contents then
+      P.x := Printer.FrameX + asr(Printer.FrameW, 1) - asr(Dev(F.W), 1)
+      if P.x < 0 then
+        P.x := val(int16, obdiv(36000i4 * 5i4, Printer.Unit))
+      end
+      P.y := Printer.FrameY + asr(Printer.FrameH, 1) - asr(Dev(F.H), 1)
+      if P.y < 0 then
+        P.y := Printer.FrameY + Printer.FrameH - val(int16, obdiv(36000i4 * 5i4, Printer.Unit)) - Dev(F.H)
+      end
+    else
+      P.x := M.x
+      P.y := M.y
+    end
+
+    P.res := -1
+    P.dlink := nil
+    F.handle(F, @P)
+    if (M.id = Display.contents) & (Printer.res = 0) then
+      Printer.Page(1)
+    end
+  end
+end PrintPanelDoc
+
+procedure DocHandle*(D: Objects.Object; M: pointer to Objects.ObjMsg)
+begin
+  case D of
+  | Documents.Document:
+    case M of
+    | Objects.PAttrMsg:
+      if M.id = Objects.get then
+        if M.name = "Gen" then
+          M.class := Objects.String
+          copy(@M.s, "PanelDocs.NewDoc", 64)
+          M.res := 0
+        elsif M.name = "MainGen" then
+          M.class := Objects.String
+          copy(@M.s, "Panels.NewPanel", 64)
+          M.res := 0
+        elsif M.name = "Adaptive" then
+          M.class := Objects.Bool
+          M.b := false
+          M.res := 0
+        elsif M.name = "Icon" then
+          M.class := Objects.String
+          copy(@M.s, "Icons.Panel", 64)
+          M.res := 0
+        else
+          Documents.Handler(D, M)
+        end
+
+      else
+        Documents.Handler(D, M)
+      end
+
+    | Objects.PLinkMsg:
+      if (M.id = Objects.get) & (M.name = "DeskMenu") then
+        M.obj := Gadgets.CopyPublicObject("PanelDocs.DeskMenu", true)
+        if M.obj = nil then
+          M.obj := Desktops.NewMenu(Menu)
+        end
+        M.res := 0
+      elsif (M.id = Objects.get) & (M.name = "SystemMenu") then
+        M.obj := Gadgets.CopyPublicObject("PanelDocs.SystemMenu", true)
+        if M.obj = nil then
+          M.obj := Desktops.NewMenu(Menu)
+        end
+        M.res := 0
+      elsif (M.id = Objects.get) & (M.name = "UserMenu") then
+        M.obj := Gadgets.CopyPublicObject("PanelDocs.UserMenu", true)
+        if M.obj = nil then
+          M.obj := Desktops.NewMenu(Menu)
+        end
+        M.res := 0
+      else
+        Documents.Handler(D, M)
+      end
+
+    | Display.PDisplayMsg:
+      if (M.device = Display.printer) & (D.dsc # nil) then
+        PrintPanelDoc(D.dsc(Panels.Panel), M)
+      else
+        Documents.Handler(D, M)
+      end
+
+    else
+      Documents.Handler(D, M)
+    end
+  end
+end DocHandle
+
+procedure InitDoc*(D: Documents.Document; W, H: int16)
+  var
+    main: Objects.Object
+    gen: array 64 of char
+begin
+  D.Load := LoadPanel
+  D.Store := StorePanel
+  D.handle := DocHandle
+  copy(@D.name, "", 128)
+  D.W := W
+  D.H := H
+  Attributes.GetString(D, "MainGen", @gen, 64)
+  main := Gadgets.CreateObject(@gen)
+  Documents.Init(D, main(Gadgets.Frame))
+end InitDoc
+
+procedure NewDoc*()
+  var
+    D: Documents.Document
+begin
+  newgc(D)
+  InitDoc(D, 266, 200)
+  Objects.NewObj := D
+end NewDoc
+
+// append public panel to context panel *
+procedure AppendPanel*()
+
+  var
+    s: Texts.Scanner
+    obj: Objects.Object
+    ctxt, new_: Display.Frame
+    locked: boolean
+    h: int16
+    cm: Display.ConsumeMsg
+    mm: Display.ModifyMsg
+    ctrl: Display.ControlMsg
+begin
+  Texts.OpenScanner(@s, Oberon.Par.text, Oberon.Par.pos)
+  Texts.Scan(@s)
+  if s.class = Texts.Name then
+    obj := Gadgets.CopyPublicObject(@s.s, false)
+    if (obj # nil) & (obj is Display.Frame) & (Gadgets.context # nil) & (Gadgets.context is Display.Frame) then
+      ctxt := Gadgets.context(Display.Frame)
+      Attributes.GetBool(ctxt, "Locked", @locked)
+      Attributes.SetBool(ctxt, "Locked", false)
+      new_ := obj(Display.Frame)
+      h := new_.H
+      cm.F := ctxt
+      cm.id := Display.drop
+      cm.obj := new_
+      cm.u := 0
+      cm.v := -(ctxt.H + h)
+      Display.Broadcast(@cm)
+      Attributes.SetBool(ctxt, "Locked", locked)
+      Objects.Stamp(@ctrl)
+      ctrl.dlink := nil
+      ctrl.F := nil
+      ctrl.x := 0
+      ctrl.y := 0
+      ctrl.id := Display.restore
+      ctrl.res := -1
+      new_.handle(new_, @ctrl)
+      mm.F := ctxt
+      mm.id := Display.move
+      mm.mode := Display.display
+      mm.X := ctxt.X
+      mm.Y := ctxt.Y - h
+      mm.W := ctxt.W
+      mm.H := ctxt.H + h
+      mm.dX := 0
+      mm.dY := -h
+      mm.dW := 0
+      mm.dH := h
+      Display.Broadcast(@mm)
+    end
+  end
+end AppendPanel
+
+// remove context panel from its own context *
+procedure RemovePanel*()
+  var
+    f, ctxt, dsc: Display.Frame
+    list: Objects.Object
+    mm: Display.ModifyMsg
+    cm: Display.ControlMsg
+begin
+  if (Gadgets.context # nil) & (Gadgets.context is Display.Frame) then
+    f := Gadgets.context(Display.Frame)
+    if (f.dlink # nil) & (f.dlink is Display.Frame) then
+      ctxt := f.dlink(Display.Frame)
+      dsc := ctxt.dsc
+      list := nil
+      while dsc # nil do
+        if dsc.Y < f.Y then
+          dsc.slink := list
+          list := dsc
+        end
+
+        dsc := dsc.next
+      end
+
+      mm.id := Display.move
+      mm.mode := Display.state
+      while list # nil do
+        dsc := list(Display.Frame)
+        mm.F := dsc
+        mm.X := dsc.X
+        mm.Y := dsc.Y + f.H
+        mm.W := dsc.W
+        mm.H := dsc.H
+        mm.dX := 0
+        mm.dY := f.H
+        mm.dW := 0
+        mm.dH := 0
+        Display.Broadcast(@mm)
+        list := list.slink
+        dsc.slink := nil
+      end
+
+      (* dsc := ctxt.dsc;
+      WHILE dsc # NIL DO
+      IF dsc.Y < f.Y THEN
+      mm.F := dsc;
+      mm.X := dsc.X; mm.Y := dsc.Y + f.H; mm.W := dsc.W; mm.H := dsc.H;
+      mm.dX := 0; mm.dY := dsc.Y - mm.Y; mm.dW := 0; mm.dH := 0;
+      Display.Broadcast(mm)
+      END;
+      dsc := dsc.next
+      END; *)
+      mm.F := ctxt
+      mm.id := Display.move
+      mm.mode := Display.display
+      mm.X := ctxt.X
+      mm.Y := ctxt.Y + f.H
+      mm.W := ctxt.W
+      mm.H := ctxt.H - f.H
+      mm.dX := 0
+      mm.dY := f.H
+      mm.dW := 0
+      mm.dH := -f.H
+      Display.Broadcast(@mm)
+    end
+
+    cm.F := f
+    cm.id := Display.remove
+    Display.Broadcast(@cm)
+  end
+end RemovePanel
+
+// remove context panel from its context and open as separate document *
+procedure DetachPanel*()
+  var
+    f: Gadgets.Frame
+    doc: Documents.Document
+begin
+  if (Gadgets.context # nil) & (Gadgets.context is Gadgets.Frame) then
+    f := Gadgets.context(Gadgets.Frame)
+    if (f.dlink # nil) & (f.dlink is Panels.Panel) then
+      // ps - 8.10.96
+      RemovePanel()
+      newgc(doc)
+      doc.W := f.W
+      doc.H := f.H
+      doc.Load := LoadPanel
+      doc.Store := StorePanel
+      doc.handle := DocHandle
+      Gadgets.GetObjName(f, @doc.name, 128)
+      Strings.Append(@doc.name, 128, ".Panel")
+      Documents.Init(doc, f)
+      Desktops.ShowDoc(doc)
+    end
+  end
+end DetachPanel
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewDoc" end return NewDoc end
+  if i = 1 then if name # nil then name^ := "AppendPanel" end return AppendPanel end
+  if i = 2 then if name # nil then name^ := "RemovePanel" end return RemovePanel end
+  if i = 3 then if name # nil then name^ := "DetachPanel" end return DetachPanel end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("PanelDocs", cmd_)
+  Texts.OpenWriter(@W)
+end PanelDocs.

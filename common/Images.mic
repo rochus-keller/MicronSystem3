@@ -1,0 +1,3531 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Images [level=5]
+
+import Files, Display, Objects, Texts, Oberon, Out, Colors, SYS, Modules
+
+// non-portable
+// eos   *
+
+(**
+Raster image bitmaps and basic image processing
+**)
+
+(*
+19.9.1999 - spawned from GfxMaps
+25.10.1999 - fixed bytes-per-row calculation in Create (need to make arguments LONG)
+17.11.1999 - eliminated F8 format, replaced by D8 (implemented with module Colors)
+19.11.1999 - fixed missing alpha component in computed palettes
+24.05.2000 - fixed bug in AnyToBGR16 and BGR16ToAny (didn't use bit address for "any" format)
+24.05.2000 - added AnyOverBGRA8888 (bug in Bind)
+*)
+
+(*
+Interfacing with display hardware and foreign framebuffers may suffer a performance hit if their
+bit or byte ordering can't be made compatible with that of a built-in format and has to be converted
+manually. Predefined format A1 has the leftmost pixel in the most significant bit of a byte, and
+all hi/true color formats have their blue component at the lowest address, followed by green,
+red, and possibly alpha (which conforms to the specification of the transfer formats in Display).
+
+As SYSTEM is imported, the module is not portable and has always to be compiled to native code.
+However, it should usually suffice to recompile the module on other platforms without changing
+any code.
+
+Assumptions:
+* CHR(l) = CHR(l MOD 100H) for all l: LONGINT
+* SIZE(LONGINT)=4
+*)
+
+const
+  b* = 0 // index of blue, green, red, and alpha components in a Pixel *
+  g* = 1
+  r* = 2
+  a* = 3
+
+  // format codes *
+  custom* = 0
+  a1* = 1
+  a8* = 2
+  d8* = 3
+  p8* = 4
+  bgr555* = 5
+  bgr565* = 6
+  bgr466* = 7
+  bgr888* = 8
+  bgra8888* = 9
+
+  // components *
+  color* = 0
+  alpha* = 1
+  index* = 2
+
+  // compositing operations (srcCopy = replace, srcOverDst = paint *
+  clear* = 0
+  srcCopy* = 1
+  dstCopy* = 2
+  srcOverDst* = 3
+  dstOverSrc* = 4
+  srcInDst* = 5
+  dstInSrc* = 6
+  srcWithoutDst* = 7
+  dstWithoutSrc* = 8
+  srcAtopDst* = 9
+  dstAtopSrc* = 10
+  srcXorDst* = 11
+
+// general pixels with red, green, blue, and alpha information in range 0..255; alpha is pre-multiplied into RGB *
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  BytesPtr = pointer to array of byte // helper type for VAR ARRAY OF SYSTEM.BYTE parameters
+  CharPtr = pointer to char // helper type for a variable reinterpreted by SYSTEM.VAL
+  Int32Ptr = pointer to int32 // helper type for a variable reinterpreted by SYSTEM.VAL
+  CharArrPtr = pointer to array of char // helper type for an address moved by an offset
+  Int32ArrPtr = pointer to array of int32 // helper type for an address moved by an offset
+  Pixel* = array 4 of char
+
+  // palette structure for indexed formats *
+  Palette* = pointer to PaletteDesc
+  PaletteDesc* = record
+    col*: array 256 of Pixel // color table *
+    used*: int16 // number of valid entries in color table *
+    bits_: int16 // number of bits used for each component in index
+    index: Colors.Index // inverse color mapping for palette
+  end
+
+  // image format *
+  Format0* = object
+    code*: int8 // format code for quick format checks *
+    bpp*: int8 // number of bits per pixel *
+    align*: int8 // bytes per row must be multiple of this *
+    components*: set // components that are stored in a pixel *
+    pal*: Palette // optional palette for indexed formats *
+  end
+  PFormat0* = pointer to Format0
+
+  PackProc* = procedure(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+
+  Format* = object (Format0)
+    pack*: PackProc // store supported pixel components at given address *
+    unpack*: PackProc // load supported pixel components from given address *
+  end
+  PFormat* = pointer to Format
+
+  // raster image *
+  Image* = pointer to ImageDesc
+  ImageDesc* = object (Objects.ObjDesc)
+    width*: int16 // image dimensions *
+    height*: int16
+    fmt*: Format // pixel format *
+    bpr*: int32 // number of bytes per row (may be negative) *
+    adr*: AnyPtr // address of lower left pixel *
+    mem*: pointer to array of char // block where pixels are stored; mem#NIL implies adr=ADR(mem[0]) *
+    memLen*: int32 // number of bytes allocated for mem
+  end
+
+  // transfer mode *
+  Mode0* = object
+    src*: Format // source and destination format *
+    dst*: Format
+    op*: int16 // compositing operation *
+    col*: Pixel // substitute color used when transfering from pure alpha formats to colored ones *
+    buf: Pixel // constant area for special-case moving
+    map: array 256 of char // color map for transfer between indexed formats
+  end
+  PMode0* = pointer to Mode0
+
+  TransferProc* = procedure(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit: int32; len_: int32)
+
+  Mode* = object (Mode0)
+    transfer*: TransferProc // procedure transfering pixels from source to destination *
+  end
+  PMode* = pointer to Mode
+
+  // octree node of the color quantization in ComputePalette
+  Node = pointer to NodeDesc
+  NodeDesc = record
+    dsc: array 8 of Node // descendants
+    link: Node // next reducible node on same level
+    leaf: boolean
+    weight: int32 // accumulated number of pixels represented by this node
+    r: int32 // accumulated color values
+    g, b: int32
+  end
+
+  // message for updating map rectangle *
+  UpdateMsg* = object (Display.FrameMsg)
+    img*: Image // affected image *
+    llx*: int16 // area to update within image *
+    lly*, urx*, ury*: int16
+  end
+  PUpdateMsg* = pointer to UpdateMsg
+
+var
+  A1*: Format // predefined formats *
+  A8*, D8*, BGR555*, BGR565*, BGR466*, BGR888*, BGRA8888*, PixelFormat*: Format // special formats *
+  DisplayFormat*: Format
+  SrcCopy*: Mode // generally usable initialized modes for convenience *
+  SrcOverDst*: Mode
+  Clamp*: array 1280 of char // Clamp[200H+i] = CHR(min(max(i, 0), 0FFH)) *
+
+  LoadProc*, StoreProc*: procedure(img: Image; fname: pointer to array of char; done: pointer to boolean)
+
+  Zero: Pixel // pixel with all components cleared
+  Bit: array 256 of array 8 of boolean // Bit[b, i] means bit i in byte b is set (MSB is bit 0)
+  Set: array 256 of array 8 of char // Set/Clr[b, i] is byte b with bit i set/cleared (MSB is bit 0)
+  Clr: array 256 of array 8 of char
+
+procedure ^ Handle*(obj: Objects.Object; msg: pointer to Objects.ObjMsg)
+
+// --- Color/Pixel conversions ---*
+
+// set pixel to opaque RGB value *
+procedure SetRGB*(pix: pointer to array of char; red, green, blue: int16)
+begin
+  pix[b] := chr(blue)
+  pix[g] := chr(green)
+  pix[r] := chr(red)
+  pix[a] := 0FFX
+end SetRGB
+
+// set pixel to partly transparent RGB value *
+procedure SetRGBA*(pix: pointer to array of char; red, green, blue, alpha: int16)
+begin
+  pix[b] := chr(obdiv(val(int32, blue) * alpha, 255))
+  pix[g] := chr(obdiv(val(int32, green) * alpha, 255))
+  pix[r] := chr(obdiv(val(int32, red) * alpha, 255))
+  pix[a] := chr(alpha)
+end SetRGBA
+
+// retrieve RGB and alpha values from pixel *
+procedure GetRGBA*(const pix: pointer to array of char; red, green, blue, alpha: pointer to int16)
+begin
+  alpha^ := val(int16, ord(pix[a]))
+  if alpha^ = 0 then
+    // color has disappeared
+    red^ := 255
+    green^ := 255
+    blue^ := 255
+  else
+    red^ := val(int16, ord(pix[r]))
+    green^ := val(int16, ord(pix[g]))
+    blue^ := val(int16, ord(pix[b]))
+    if alpha^ # 255 then
+      // un-multiply alpha
+      red^ := val(int16, obdiv(val(int32, 255) * red^, alpha^))
+      if red^ > 255 then
+        red^ := 255
+      end
+      green^ := val(int16, obdiv(val(int32, 255) * green^, alpha^))
+      if green^ > 255 then
+        green^ := 255
+      end
+      blue^ := val(int16, obdiv(val(int32, 255) * blue^, alpha^))
+      if blue^ > 255 then
+        blue^ := 255
+      end
+    end
+  end
+end GetRGBA
+
+// --- Palettes ---*
+
+// return index of color in palette which approximates the requested color reasonably well *
+procedure PaletteIndex*(pal: Palette; red, green, blue: int16): int16
+begin
+  return Colors.Match(pal.index, pal.bits_, red, green, blue)
+end PaletteIndex
+
+// compute internal palette structures whenever palette colors have been modified *
+procedure InitPalette*(pal: Palette; used, bits_: int16)
+  var
+    n, alpha: int16
+    red, green, blue: array 256 of int16
+begin
+  n := 0
+  while n < used do
+    GetRGBA(@pal.col[n], @red[n], @green[n], @blue[n], @alpha)
+    inc(n)
+  end
+
+  Colors.MakeIndex(@pal.index, bits_, used, @red, @green, @blue)
+  pal.used := used
+  pal.bits_ := bits_
+end InitPalette
+
+// compute and initialize a pseudo-optimal palette for an image (in hi-color or true-color format) *
+procedure ComputePalette*(img: Image; pal: Palette; reservedcols, maxcols, bits_: int16)
+  (*
+  uses octree-quantization
+  *)
+
+  var
+    sent, root: Node
+    reducible: array 8 of Node
+    colors, maxDepth, y, x, used: int16
+    adr, aa: AnyPtr
+    bb: int32
+    pix: Pixel
+
+  procedure insert(node: pointer to Node; depth: int16; const pix: pointer to array of char; colors: pointer to int16; maxDepth: pointer to int16; reducible: pointer to array 8 of Node)
+    var
+      idx, bit: int16
+  begin
+    if node^ = nil then
+      newgc(node^)
+      if depth = maxDepth^ then
+        node^.leaf := true
+        inc(colors^)
+      else
+        node^.leaf := false
+        node^.link := reducible[depth]
+        reducible[depth] := node^
+      end
+    end
+
+    inc(node^.weight) // node represents more pixels
+    if node^.leaf then
+      inc(node^.r, val(int32, val(int16, ord(pix[r]))))
+      inc(node^.g, val(int32, val(int16, ord(pix[g]))))
+      inc(node^.b, val(int32, val(int16, ord(pix[b]))))
+    else
+      idx := 0
+      bit := 7 - depth
+      if ((asr(val(int32, val(int16, ord(pix[r]))), usig(val(int32, bit))) mod 2) # 0) then
+        inc(idx, 4)
+      end
+      if ((asr(val(int32, val(int16, ord(pix[g]))), usig(val(int32, bit))) mod 2) # 0) then
+        inc(idx, 2)
+      end
+      if ((asr(val(int32, val(int16, ord(pix[b]))), usig(val(int32, bit))) mod 2) # 0) then
+        inc(idx)
+      end
+      insert(@node^.dsc[idx], depth + 1, pix, colors, maxDepth, reducible)
+    end
+  end insert
+
+  procedure reduce(colors: pointer to int16; maxDepth: pointer to int16; reducible: pointer to array 8 of Node; sent: pointer to Node)
+    var
+      d, n, i: int16
+      node, prev, dsc: Node
+      min_: int32
+  begin
+    d := maxDepth^ - 1
+    while reducible[d] = nil do
+      dec(d)
+      dec(maxDepth^)
+    end
+
+    sent^.link := reducible[d]
+    node := sent^
+    min_ := 2147483647
+    while node.link # nil do
+      if node.link.weight < min_ then
+        min_ := node.link.weight
+        prev := node
+      end
+
+      node := node.link
+    end
+
+    node := prev.link
+    prev.link := node.link
+    reducible[d] := sent^.link
+    n := 1 // number of colors is initially one for the node itself
+    for i := 0 to 7 do
+      dsc := node.dsc[i]
+      if dsc # nil then
+        dec(n) // reducing one color
+        inc(node.r, dsc.r)
+        inc(node.g, dsc.g)
+        inc(node.b, dsc.b)
+        node.dsc[i] := nil
+      end
+    end
+
+    node.leaf := true
+    inc(colors^, n)
+  end reduce
+
+  procedure traverse(node: Node; pal: pointer to Palette; used: pointer to int16)
+    var
+      i: int16
+  begin
+    if node # nil then
+      if node.leaf then
+        pal^.col[used^][r] := chr(obdiv(node.r, node.weight))
+        pal^.col[used^][g] := chr(obdiv(node.g, node.weight))
+        pal^.col[used^][b] := chr(obdiv(node.b, node.weight))
+        pal^.col[used^][a] := 0FFX
+        inc(used^)
+      else
+        for i := 0 to 7 do
+          traverse(node.dsc[i], pal, used)
+        end
+      end
+    end
+  end traverse
+begin
+  // ComputePalette
+  assert(reservedcols + maxcols <= 256)
+  newgc(sent)
+  root := nil
+  colors := 0
+  maxDepth := 8
+  y := 0
+  adr := img.adr
+  while y < img.height do
+    if img.fmt.bpp < 8 then
+      x := 0
+      aa := adr
+      bb := 0
+      while x < img.width do
+        img.fmt.unpack(@img.fmt, aa, bb, @pix)
+        insert(@root, 0, @pix, @colors, @maxDepth, @reducible)
+        while colors > maxcols do
+          reduce(@colors, @maxDepth, @reducible, @sent)
+        end
+
+        inc(x)
+        bb := bb + img.fmt.bpp
+        inc(aa, asr(bb, 3))
+        bb := band(bb, 7)
+      end
+
+    else
+      x := 0
+      aa := adr
+      bb := asr(img.fmt.bpp, 3)
+      while x < img.width do
+        img.fmt.unpack(@img.fmt, aa, 0, @pix)
+        insert(@root, 0, @pix, @colors, @maxDepth, @reducible)
+        while colors > maxcols do
+          reduce(@colors, @maxDepth, @reducible, @sent)
+        end
+
+        inc(x)
+        inc(aa, bb)
+      end
+    end
+
+    inc(y)
+    inc(adr, img.bpr)
+  end
+
+  used := reservedcols
+  traverse(root, @pal, @used)
+  InitPalette(pal, used, bits_)
+end ComputePalette
+
+// --- Formats ---*
+
+// A1 - one bit alpha, MSB leftmost
+procedure PackA1(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    b: char
+begin
+  b := cast(CharPtr, adr)^
+  if pix[a] >= 80X then
+    cast(CharPtr, adr)^ := Set[ord(b)][bit]
+  else
+    cast(CharPtr, adr)^ := Clr[ord(b)][bit]
+  end
+end PackA1
+
+procedure UnpackA1(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    b: char
+begin
+  b := cast(CharPtr, adr)^
+  if Bit[ord(b)][bit] then
+    pix[a] := 0FFX
+  else
+    copy(pix, @Zero, 4)
+  end
+end UnpackA1
+
+// A8 - 8 bit alpha
+procedure PackA8(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+begin
+  cast(CharPtr, adr)^ := pix[a]
+end PackA8
+
+procedure UnpackA8(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    alpha: int32
+begin
+  pix[a] := cast(CharPtr, adr)^
+  if pix[a] = 0X then
+    copy(pix, @Zero, 4)
+  elsif pix[a] # 0FFX then
+    alpha := val(int32, ord(pix[a]))
+    pix[r] := chr(obdiv(val(int32, ord(pix[r])) * alpha, 255))
+    pix[g] := chr(obdiv(val(int32, ord(pix[g])) * alpha, 255))
+    pix[b] := chr(obdiv(val(int32, ord(pix[b])) * alpha, 255))
+  end
+end UnpackA8
+
+// P8 - 8 bit indexed format with custom palette
+procedure PackP8(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+begin
+  if pix[a] # 0X then
+    // model alpha as brightness
+    cast(CharPtr, adr)^ := chr(PaletteIndex(fmt.pal, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+  end
+end PackP8
+
+procedure UnpackP8(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    idx: char
+begin
+  idx := cast(CharPtr, adr)^
+  copy(pix, @fmt.pal.col[ord(idx)], 4)
+end UnpackP8
+
+// D8 - 8 bit indexed format with display palette
+procedure PackD8(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+begin
+  if pix[a] # 0X then
+    // model alpha as brightness
+    cast(CharPtr, adr)^ := chr(Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+  end
+end PackD8
+
+procedure UnpackD8(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    idx: char
+    red, green, blue: int16
+begin
+  idx := cast(CharPtr, adr)^
+  SetRGB(pix, Colors.Red[ord(idx)], Colors.Green[ord(idx)], Colors.Blue[ord(idx)])
+end UnpackD8
+
+// BGR555 - 16 hi-color with 5 bit blue, 5 bit green and 5 bit red in ascending order
+procedure PackBGR555(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    int: int32
+begin
+  if pix[a] # 0X then
+    // model alpha as brightness
+    int := asr(val(int32, val(int16, ord(pix[b]))), 3) + sigc(shl(asr(val(int32, val(int16, ord(pix[g]))), 3), 5)) + sigc(shl(asr(val(int32, val(int16, ord(pix[r]))), 3), 10))
+    cast(CharPtr, adr)^ := chr(int)
+    cast(CharPtr, ptroff(adr, 1))^ := chr(asr(int, 8))
+  end
+end PackBGR555
+
+procedure UnpackBGR555(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    lo, hi: char
+    int: int32
+begin
+  lo := cast(CharPtr, adr)^
+  hi := cast(CharPtr, ptroff(adr, 1))^
+  int := sigc(shl(val(int32, val(int16, ord(hi))), 8)) + val(int32, ord(lo))
+  pix[b] := chr(sigc(shl(band(int, 31), 3)) + 4)
+  pix[g] := chr(sigc(shl(band(asr(int, 5), 31), 3)) + 4)
+  pix[r] := chr(sigc(shl(band(asr(int, 10), 31), 3)) + 4)
+  pix[a] := 0FFX
+end UnpackBGR555
+
+// BGR565 - 16 hi-color with 5 bit blue, 6 bit green and 5 bit red in ascending order
+procedure PackBGR565(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    int: int32
+begin
+  if pix[a] # 0X then
+    // model alpha as brightness
+    int := asr(val(int32, val(int16, ord(pix[b]))), 3) + sigc(shl(asr(val(int32, val(int16, ord(pix[g]))), 2), 5)) + sigc(shl(asr(val(int32, val(int16, ord(pix[r]))), 3), 11))
+    cast(CharPtr, adr)^ := chr(int)
+    cast(CharPtr, ptroff(adr, 1))^ := chr(asr(int, 8))
+  end
+end PackBGR565
+
+procedure UnpackBGR565(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    lo, hi: char
+    int: int32
+begin
+  lo := cast(CharPtr, adr)^
+  hi := cast(CharPtr, ptroff(adr, 1))^
+  int := sigc(shl(val(int32, val(int16, ord(hi))), 8)) + val(int32, ord(lo))
+  pix[b] := chr(sigc(shl(band(int, 31), 3)) + 4)
+  pix[g] := chr(sigc(shl(band(asr(int, 5), 63), 2)) + 2)
+  pix[r] := chr(sigc(shl(band(asr(int, 11), 31), 3)) + 4)
+  pix[a] := 0FFX
+end UnpackBGR565
+
+// BGR466 - 16 hi-color with 4 bit blue, 6 bit green and 6 bit red in ascending order
+procedure PackBGR466(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    int: int32
+begin
+  if pix[a] # 0X then
+    // model alpha as brightness
+    int := asr(val(int32, val(int16, ord(pix[b]))), 4) + sigc(shl(asr(val(int32, val(int16, ord(pix[g]))), 2), 4)) + sigc(shl(asr(val(int32, val(int16, ord(pix[r]))), 2), 10))
+    cast(CharPtr, adr)^ := chr(int)
+    cast(CharPtr, ptroff(adr, 1))^ := chr(asr(int, 8))
+  end
+end PackBGR466
+
+procedure UnpackBGR466(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+  var
+    lo, hi: char
+    int: int32
+begin
+  lo := cast(CharPtr, adr)^
+  hi := cast(CharPtr, ptroff(adr, 1))^
+  int := sigc(shl(val(int32, val(int16, ord(hi))), 8)) + val(int32, ord(lo))
+  pix[b] := chr(sigc(shl(band(int, 15), 4)) + 8)
+  pix[g] := chr(sigc(shl(band(asr(int, 4), 63), 2)) + 2)
+  pix[r] := chr(sigc(shl(band(asr(int, 10), 63), 2)) + 2)
+  pix[a] := 0FFX
+end UnpackBGR466
+
+// BGR888 - 24 bit true color with blue in lower, green in middle, and red in upper byte
+procedure PackBGR888(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+begin
+  if pix[a] # 0X then
+    // model alpha as brightness
+    SYS.MOVE(cast(AnyPtr, @pix[0]), adr, 3)
+  end
+end PackBGR888
+
+procedure UnpackBGR888(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+begin
+  SYS.MOVE(adr, cast(AnyPtr, @pix[0]), 3)
+  pix[a] := 0FFX
+end UnpackBGR888
+
+// BGRA8888 - 32 bit true color with blue in lowest, green in lower middle, red in upper middle, and alpha in top byte
+procedure PackBGRA8888(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+begin
+  SYS.MOVE(cast(AnyPtr, @pix[0]), adr, 4)
+end PackBGRA8888
+
+procedure UnpackBGRA8888(fmt: pointer to Format0; adr: AnyPtr; bit: int32; pix: pointer to array of char)
+begin
+  SYS.MOVE(adr, cast(AnyPtr, @pix[0]), 4)
+end UnpackBGRA8888
+
+// initialize format *
+procedure InitFormat*(fmt: pointer to Format; code, bpp, align: int8; comps: set; pal: Palette; pack, unpack: PackProc)
+begin
+  fmt.code := code
+  fmt.bpp := bpp
+  fmt.align := align
+  fmt.components := comps
+  fmt.pal := pal
+  fmt.pack := pack
+  fmt.unpack := unpack
+end InitFormat
+
+// initialize 8 bit index format with custom palette *
+procedure InitPaletteFormat*(fmt: pointer to Format; pal: Palette)
+begin
+  fmt.code := p8
+  fmt.bpp := 8
+  fmt.align := 1
+  fmt.components := {index}
+  fmt.pal := pal
+  fmt.pack := PackP8
+  fmt.unpack := UnpackP8
+end InitPaletteFormat
+
+// return if two formats are the same *
+procedure Same*(fmt0, fmt1: pointer to Format): boolean
+begin
+  return (fmt0.pack = fmt1.pack) & (fmt0.unpack = fmt1.unpack) & (~(index in fmt0.components) or (fmt0.pal = fmt1.pal))
+
+  // doesn't work if palette has been re-initialized
+end Same
+
+// --- Images ---*
+
+// initialize custom image *
+procedure Init*(img: Image; width, height: int16; fmt: pointer to Format; bpr: int32; adr: AnyPtr)
+begin
+  assert((width > 0) & (height > 0))
+  img.handle := Handle
+  img.width := width
+  img.height := height
+  img.fmt := fmt^
+  img.bpr := bpr
+  img.adr := adr
+end Init
+
+// initialize custom image on byte buffer *
+procedure InitBuf*(img: Image; width, height: int16; fmt: pointer to Format; bpr, offset: int32; buf: pointer to array of char; buf_len: int32)
+begin
+  assert((0 <= offset) & (offset + height * abs(bpr) <= buf_len))
+  if bpr >= 0 then
+    Init(img, width, height, fmt, bpr, cast(AnyPtr, @buf[0]))
+  else
+    Init(img, width, height, fmt, bpr, ptroff(cast(AnyPtr, @buf[offset]), buf_len - bpr))
+  end
+end InitBuf
+
+// initialize image on rectangular area within existing image (lower left corner must fall on byte boundary) *
+procedure InitRect*(img, base: Image; x, y, w, h: int16)
+begin
+  assert((0 <= x) & (x + w <= base.width) & (0 <= y) & (y + h <= base.height))
+  assert(band(x * base.fmt.bpp, 7) = 0)
+  Init(img, w, h, @base.fmt, base.bpr, ptroff(AnyPtr{0}, val(int32, ord(base.adr)) + y * base.bpr + asr(x * base.fmt.bpp, 3)))
+end InitRect
+
+// create image in requested format (allocating or reusing necessary memory) *
+procedure Create*(img: Image; width, height: int16; fmt: pointer to Format)
+  var
+    size_: int32
+    a0, a1: AnyPtr
+begin
+  assert((width > 0) & (height > 0))
+  img.handle := Handle
+  img.width := width
+  img.height := height
+  img.fmt := fmt^
+  img.bpr := asr(val(int32, width) * fmt.bpp + 7, 3)
+  if fmt.align > 1 then
+    img.bpr := obdiv(img.bpr + fmt.align - 1, fmt.align) * fmt.align
+  end
+
+  size_ := height * img.bpr
+  inc(size_, band(-size_, 3))
+  if (img.mem = nil) or (size_ < img.memLen div 2) or (img.memLen < size_) then
+    newgc(img.mem, size_)
+    img.memLen := size_
+  else
+    a0 := cast(AnyPtr, @img.mem[0])
+    a1 := a0
+    inc(a1, size_)
+    while a0 # a1 do
+      cast(Int32Ptr, a0)^ := val(int32, val(int16, 0))
+      inc(a0, val(int32, size(int32)))
+    end
+  end
+
+  img.adr := cast(AnyPtr, @img.mem[0])
+end Create
+
+procedure GetExtension(name, ext: pointer to array of char)
+  var
+    i, j: int32
+    ch: char
+begin
+  i := 0
+  j := 0
+  while name[i] # 0X do
+    if name[i] = "." then
+      j := i + 1
+    end
+    inc(i)
+  end
+
+  i := 0
+  repeat
+    ch := name[j]
+    ext[i] := ch
+    inc(i)
+    inc(j)
+  until ch = 0X
+end GetExtension
+
+procedure Install(s: pointer to Texts.Scanner; ext: pointer to array of char)
+  var
+    str: array 64 of char
+    res: int16
+begin
+  assert(s.class in {Texts.Name,Texts.String})
+  copy(@str, @s.s, 64)
+  Texts.Scan(s)
+  if (s.class = Texts.Char) & (s.c = "=") then
+    // str contains extension
+    if (ext^ # "") & (ext^ # str) then
+      copy(@str, "", 64) // don't try if extension doesn't match
+      Texts.Scan(s)
+      Texts.Scan(s)
+    else
+      copy(@str, "", 64)
+      Texts.Scan(s)
+      if s.class = Texts.Name then
+        copy(@str, @s.s, 64)
+        Texts.Scan(s)
+      end
+    end
+  end
+
+  if str # "" then
+    Oberon.Call(@str, Oberon.Par, false, @res)
+  end
+end Install
+
+procedure TryLoad(img: Image; name: pointer to array of char; const ext: pointer to array of char; done: pointer to boolean)
+  var
+    s: Texts.Scanner
+begin
+  done^ := false
+  Oberon.OpenScanner(@s, "ImageFormats")
+  while ~done^ & (s.class in {Texts.Name,Texts.String}) do
+    LoadProc := nil
+    Install(@s, ext)
+    if LoadProc # nil then
+      LoadProc(img, name, done)
+    end
+  end
+end TryLoad
+
+// initialize image from file (see comment for LoadProc and StoreProc) *
+procedure Load*(img: Image; const name: pointer to array of char; done: pointer to boolean)
+  var
+    file: Files.File
+    ext: array 64 of char
+begin
+  done^ := false
+  img.handle := Handle
+  img.width := 0
+  img.height := 0
+  file := Files.Old(name)
+  if file # nil then
+    GetExtension(name, @ext)
+    TryLoad(img, name, @ext, done)
+    if ~done^ & (ext # "") then
+      TryLoad(img, name, "", done) // try all converters
+    end
+  end
+end Load
+
+// store image in file (see comment for LoadProc and StoreProc) *
+procedure Store*(img: Image; const name: pointer to array of char; done: pointer to boolean)
+  var
+    ext: array 64 of char
+    s: Texts.Scanner
+begin
+  done^ := false
+  GetExtension(name, @ext)
+  if ext # "" then
+    Oberon.OpenScanner(@s, "ImageFormats")
+    while ~done^ & (s.class in {Texts.Name,Texts.String}) do
+      StoreProc := nil
+      Install(@s, @ext)
+      if StoreProc # nil then
+        StoreProc(img, name, done)
+      end
+    end
+  end
+end Store
+
+// --- Transfer Modes ---*
+
+// initialize transfer mode *
+procedure InitMode*(mode: pointer to Mode; op: int16)
+begin
+  mode.op := op
+  SetRGB(@mode.col, 255, 255, 255)
+  mode.src.pack := nil // force re-evaluation of transfer procedure
+  mode.dst.pack := nil
+end InitMode
+
+// initialize transfer mode with color components for pure alpha sources *
+procedure InitModeColor*(mode: pointer to Mode; op, red, green, blue: int16)
+begin
+  mode.op := op
+  SetRGB(@mode.col, red, green, blue)
+  mode.src.pack := nil
+  mode.dst.pack := nil
+end InitModeColor
+
+// set new source color for transfer mode *
+procedure SetModeColor*(mode: pointer to Mode; red, green, blue: int16)
+begin
+  SetRGB(@mode.col, red, green, blue)
+  mode.src.pack := nil
+  mode.dst.pack := nil
+end SetModeColor
+
+// blend source pixel into destination pixel according to compositing operation *
+procedure Blend*(op: int16; src, dst: pointer to array of char)
+  var
+    fs, fd, i: int32
+begin
+  case op of
+    0 (* clear *):
+    fs := 0
+    fd := 0
+  | 1 (* srcCopy *):
+    fs := 255
+    fd := 0
+  | 2 (* dstCopy *):
+    fs := 0
+    fd := 255
+  | 3 (* srcOverDst *):
+    fs := 255
+    fd := val(int32, 255 - val(int16, ord(src[a])))
+  | 4 (* dstOverSrc *):
+    fs := val(int32, 255 - val(int16, ord(dst[a])))
+    fd := 255
+  | 5 (* srcInDst *):
+    fs := val(int32, ord(dst[a]))
+    fd := 0
+  | 6 (* dstInSrc *):
+    fs := 0
+    fd := val(int32, ord(src[a]))
+  | 7 (* srcWithoutDst *):
+    fs := val(int32, 255 - val(int16, ord(dst[a])))
+    fd := 0
+  | 8 (* dstWithoutSrc *):
+    fs := 0
+    fd := val(int32, 255 - val(int16, ord(src[a])))
+  | 9 (* srcAtopDst *):
+    fs := val(int32, ord(dst[a]))
+    fd := val(int32, 255 - val(int16, ord(src[a])))
+  | 10 (* dstAtopSrc *):
+    fs := val(int32, 255 - val(int16, ord(dst[a])))
+    fd := val(int32, ord(src[a]))
+  | 11 (* srcXorDst *):
+    fs := val(int32, 255 - val(int16, ord(dst[a])))
+    fd := val(int32, 255 - val(int16, ord(src[a])))
+  end
+
+  if fs + fd = 0 then
+    for i := 0 to 3 do
+      dst[i] := 0X
+    end
+  elsif fs = 0 then
+    if fd # 255 then
+      for i := 0 to 3 do
+        dst[i] := Clamp[512 + obdiv(fd * val(int32, ord(dst[i])), 255)]
+      end
+    end
+
+  elsif fd = 0 then
+    if fs = 255 then
+      copy(dst, src, 4)
+    else
+      for i := 0 to 3 do
+        dst[i] := Clamp[512 + obdiv(fs * val(int32, ord(src[i])), 255)]
+      end
+    end
+
+  else
+    for i := 0 to 3 do
+      dst[i] := Clamp[512 + obdiv(fs * val(int32, ord(src[i])) + fd * val(int32, ord(dst[i])), 255)]
+    end
+  end
+end Blend
+
+// --- General Transfer ---
+
+procedure AnyBlendAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    spix, dpix: Pixel
+begin
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, sbit, @spix)
+    mode.dst.unpack(@mode.dst, dadr, dbit, @dpix)
+    Blend(mode.op, @spix, @dpix)
+    mode.dst.pack(@mode.dst, dadr, dbit, @dpix)
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    dec(len_)
+  end
+end AnyBlendAny
+
+// --- clear ---
+
+procedure ClearAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    inc_: int32
+begin
+  if band(mode.dst.bpp, 7) = 0 then
+    inc_ := asr(mode.dst.bpp, 3)
+    while len_ > 0 do
+      mode.dst.pack(@mode.dst, dadr, 0, @Zero)
+      inc(dadr, inc_)
+      dec(len_)
+    end
+
+  else
+    while len_ > 0 do
+      mode.dst.pack(@mode.dst, dadr, dbit, @Zero)
+      dbit := dbit + mode.dst.bpp
+      inc(dadr, asr(dbit, 3))
+      dbit := band(dbit, 7)
+      dec(len_)
+    end
+  end
+end ClearAny
+
+procedure Clear1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    out: char
+begin
+  if (dbit > 0) or (len_ < 8) then
+    out := cast(CharPtr, dadr)^
+    while (dbit < 8) & (len_ > 0) do
+      out := Clr[ord(out)][dbit]
+      inc(dbit)
+      dec(len_)
+    end
+
+    cast(CharPtr, dadr)^ := out
+  end
+
+  while len_ >= 32 do
+    cast(Int32Ptr, dadr)^ := val(int32, val(int16, 0))
+    inc(dadr, 4)
+    dec(len_, 32)
+  end
+
+  while len_ >= 8 do
+    cast(CharPtr, dadr)^ := 0X
+    inc(dadr)
+    dec(len_, 8)
+  end
+
+  if len_ > 0 then
+    out := cast(CharPtr, dadr)^
+    dbit := 0
+    repeat
+      out := Clr[ord(out)][dbit]
+      inc(dbit)
+      dec(len_)
+    until len_ = 0
+
+    cast(CharPtr, dadr)^ := out
+  end
+end Clear1
+
+procedure ClearBytes(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  len_ := asr(len_ * mode.dst.bpp, 3)
+  while len_ >= 4 do
+    cast(Int32Ptr, dadr)^ := val(int32, val(int16, 0))
+    inc(dadr, 4)
+    dec(len_)
+  end
+
+  while len_ > 0 do
+    cast(CharPtr, dadr)^ := 0X
+    inc(dadr)
+    dec(len_)
+  end
+end ClearBytes
+
+// --- srcCopy Transfer ---
+
+// constant values
+procedure Set1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    out: char
+begin
+  if (dbit > 0) or (len_ < 8) then
+    out := cast(CharPtr, dadr)^
+    while (dbit < 8) & (len_ > 0) do
+      out := Set[ord(out)][dbit]
+      inc(dbit)
+      dec(len_)
+    end
+
+    cast(CharPtr, dadr)^ := out
+  end
+
+  while len_ >= 8 do
+    cast(CharPtr, dadr)^ := 0FFX
+    inc(dadr)
+    dec(len_, 8)
+  end
+
+  if len_ > 0 then
+    out := cast(CharPtr, dadr)^
+    dbit := 0
+    repeat
+      out := Set[ord(out)][dbit]
+      inc(dbit)
+      dec(len_)
+    until len_ = 0
+
+    cast(CharPtr, dadr)^ := out
+  end
+end Set1
+
+procedure ConstCopy8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  while len_ > 0 do
+    cast(CharPtr, dadr)^ := mode.buf[0]
+    inc(dadr)
+    dec(len_)
+  end
+end ConstCopy8
+
+procedure ConstCopy16(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  while len_ > 0 do
+    SYS.MOVE(cast(AnyPtr, @mode.buf[0]), dadr, 2)
+    inc(dadr, 2)
+    dec(len_)
+  end
+end ConstCopy16
+
+procedure ConstCopy24(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  while len_ > 0 do
+    SYS.MOVE(cast(AnyPtr, @mode.buf[0]), dadr, 3)
+    inc(dadr, 3)
+    dec(len_)
+  end
+end ConstCopy24
+
+// identical formats
+procedure Copy1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_, out: char
+begin
+  in_ := cast(CharPtr, sadr)^
+  while (sbit = 0) & (dbit = 0) & (len_ >= 8) do
+    cast(CharPtr, dadr)^ := in_
+    inc(sadr)
+    inc(dadr)
+    dec(len_, 8)
+    in_ := cast(CharPtr, sadr)^
+  end
+
+  if (dbit > 0) or (len_ < 8) then
+    out := cast(CharPtr, dadr)^
+  end
+
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      out := Set[ord(out)][dbit]
+    else
+      out := Clr[ord(out)][dbit]
+    end
+
+    inc(sbit)
+    inc(dbit)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+
+    if dbit = 8 then
+      cast(CharPtr, dadr)^ := out
+      inc(dadr)
+      dbit := 0
+      if len_ < 8 then
+        out := cast(CharPtr, dadr)^
+      end
+    end
+  end
+
+  if dbit > 0 then
+    cast(CharPtr, dadr)^ := out
+  end
+end Copy1
+
+procedure Copy8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  SYS.MOVE(sadr, dadr, len_)
+end Copy8
+
+procedure I8CopyI8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    byte_: char
+begin
+  while len_ > 0 do
+    byte_ := cast(CharPtr, sadr)^
+    cast(CharPtr, dadr)^ := mode.map[ord(byte_)]
+    inc(sadr)
+    inc(dadr)
+    dec(len_)
+  end
+end I8CopyI8
+
+procedure Copy16(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  SYS.MOVE(sadr, dadr, 2 * len_)
+end Copy16
+
+procedure Copy24(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  SYS.MOVE(sadr, dadr, 3 * len_)
+end Copy24
+
+procedure Copy32(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  SYS.MOVE(sadr, dadr, 4 * len_)
+end Copy32
+
+// general methods
+procedure AnyCopyAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    copy(@pix, @mode.buf, 4)
+    mode.src.unpack(@mode.src, sadr, sbit, @mode.buf)
+    mode.dst.pack(@mode.dst, dadr, dbit, @mode.buf)
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    dec(len_)
+  end
+end AnyCopyAny
+
+procedure AnyBytesCopyAnyBytes(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    sinc, dinc: int32
+    pix: Pixel
+begin
+  sinc := asr(mode.src.bpp, 3)
+  dinc := asr(mode.dst.bpp, 3)
+  while len_ > 0 do
+    copy(@pix, @mode.buf, 4)
+    mode.src.unpack(@mode.src, sadr, sbit, @mode.buf)
+    mode.dst.pack(@mode.dst, dadr, dbit, @mode.buf)
+    inc(sadr, sinc)
+    inc(dadr, dinc)
+    dec(len_)
+  end
+end AnyBytesCopyAnyBytes
+
+// A1
+procedure AnyCopyA1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    out: char
+    pix: Pixel
+begin
+  out := cast(CharPtr, dadr)^
+  pix[a] := 0FFX
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, sbit, @pix)
+    sbit := sbit + mode.src.bpp
+    inc(sadr, band(sbit, 7))
+    sbit := band(sbit, 7)
+    if pix[a] >= 80X then
+      out := Set[ord(out)][dbit]
+    else
+      out := Clr[ord(out)][dbit]
+    end
+
+    inc(dbit)
+    dec(len_)
+    if dbit = 8 then
+      cast(CharPtr, dadr)^ := out
+      inc(dadr)
+      out := cast(CharPtr, dadr)^
+      dbit := 0
+    end
+  end
+
+  cast(CharPtr, dadr)^ := out
+end AnyCopyA1
+
+procedure A8CopyA1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    out, in_: char
+begin
+  if (dbit > 0) or (len_ < 8) then
+    out := cast(CharPtr, dadr)^
+  end
+
+  while len_ > 0 do
+    in_ := cast(CharPtr, sadr)^
+    if in_ >= 80X then
+      out := Set[ord(out)][dbit]
+    else
+      out := Clr[ord(out)][dbit]
+    end
+
+    inc(sadr)
+    inc(dbit)
+    dec(len_)
+    if dbit = 8 then
+      cast(CharPtr, dadr)^ := out
+      inc(dadr)
+      dbit := 0
+      if len_ < 8 then
+        out := cast(CharPtr, dadr)^
+      end
+    end
+  end
+
+  if dbit > 0 then
+    cast(CharPtr, dadr)^ := out
+  end
+end A8CopyA1
+
+procedure BGRA8888CopyA1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    out, in_: char
+begin
+  inc(sadr, a) // only look at alpha component
+  if (dbit > 0) or (len_ < 8) then
+    out := cast(CharPtr, dadr)^
+  end
+
+  while len_ > 0 do
+    in_ := cast(CharPtr, sadr)^
+    if in_ >= 80X then
+      out := Set[ord(out)][dbit]
+    else
+      out := Clr[ord(out)][dbit]
+    end
+
+    inc(sadr, 4)
+    inc(dbit)
+    dec(len_)
+    if dbit = 8 then
+      cast(CharPtr, dadr)^ := out
+      inc(dadr)
+      dbit := 0
+      if len_ < 8 then
+        out := cast(CharPtr, dadr)^
+      end
+    end
+  end
+
+  if dbit > 0 then
+    cast(CharPtr, dadr)^ := out
+  end
+end BGRA8888CopyA1
+
+procedure A1CopyAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_: char
+begin
+  in_ := cast(CharPtr, sadr)^
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      mode.dst.pack(@mode.dst, dadr, dbit, @mode.buf)
+    else
+      mode.dst.pack(@mode.dst, dadr, dbit, @Zero)
+    end
+
+    inc(sbit)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+  end
+end A1CopyAny
+
+procedure A1CopyA8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_: char
+begin
+  in_ := cast(CharPtr, sadr)^
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      cast(CharPtr, dadr)^ := 0FFX
+    else
+      cast(CharPtr, dadr)^ := 0X
+    end
+
+    inc(sbit)
+    inc(dadr)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+  end
+end A1CopyA8
+
+procedure A1CopyBGRA8888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+    in_: char
+begin
+  copy(@pix, @mode.buf, 4)
+  in_ := cast(CharPtr, sadr)^
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      pix[a] := 0FFX
+    else
+      pix[a] := 0X
+    end
+
+    SYS.MOVE(cast(AnyPtr, @pix), dadr, 4)
+    inc(sbit)
+    inc(dadr, 4)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+  end
+end A1CopyBGRA8888
+
+// A8
+procedure AnyCopyA8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  pix[a] := 0FFX
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, sbit, @pix)
+    cast(CharPtr, dadr)^ := pix[a]
+    inc(dadr)
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dec(len_)
+  end
+end AnyCopyA8
+
+procedure BGRA8888CopyA8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    byte_: char
+begin
+  inc(sadr, 3)
+  while len_ > 0 do
+    byte_ := cast(CharPtr, sadr)^
+    cast(CharPtr, dadr)^ := byte_
+    inc(sadr, 4)
+    inc(dadr)
+    dec(len_)
+  end
+end BGRA8888CopyA8
+
+procedure A8CopyBGRA8888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  copy(@pix, @mode.buf, 4)
+  while len_ > 0 do
+    pix[a] := cast(CharPtr, sadr)^
+    SYS.MOVE(cast(AnyPtr, @pix), dadr, 4)
+    inc(sadr)
+    inc(dadr, 4)
+    dec(len_)
+  end
+end A8CopyBGRA8888
+
+// P8
+procedure AnyCopyP8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    copy(@pix, @mode.buf, 4)
+    mode.src.unpack(@mode.src, sadr, sbit, @pix)
+    cast(CharPtr, dadr)^ := chr(PaletteIndex(mode.dst.pal, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+    inc(dadr)
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dec(len_)
+  end
+end AnyCopyP8
+
+procedure Any16CopyP8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, 0, @pix)
+    cast(CharPtr, dadr)^ := chr(PaletteIndex(mode.dst.pal, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+    inc(sadr, 2)
+    inc(dadr)
+    dec(len_)
+  end
+end Any16CopyP8
+
+procedure BGR888CopyP8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    SYS.MOVE(sadr, cast(AnyPtr, @pix[0]), 3)
+    cast(CharPtr, dadr)^ := chr(PaletteIndex(mode.dst.pal, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+    inc(sadr, 3)
+    inc(dadr)
+    dec(len_)
+  end
+end BGR888CopyP8
+
+procedure BGRA8888CopyP8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    SYS.MOVE(sadr, cast(AnyPtr, @pix[0]), 4)
+    cast(CharPtr, dadr)^ := chr(PaletteIndex(mode.dst.pal, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+    inc(sadr, 4)
+    inc(dadr)
+    dec(len_)
+  end
+end BGRA8888CopyP8
+
+procedure P8CopyAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    b: char
+begin
+  while len_ > 0 do
+    b := cast(CharPtr, sadr)^
+    mode.dst.pack(@mode.dst, dadr, dbit, @mode.src.pal.col[ord(b)])
+    inc(sadr)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    dec(len_)
+  end
+end P8CopyAny
+
+procedure P8CopyAny16(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    b: char
+begin
+  while len_ > 0 do
+    b := cast(CharPtr, sadr)^
+    mode.dst.pack(@mode.dst, dadr, 0, @mode.src.pal.col[ord(b)])
+    inc(sadr)
+    inc(dadr, 2)
+    dec(len_)
+  end
+end P8CopyAny16
+
+procedure P8CopyBGR888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    b: char
+begin
+  while len_ > 0 do
+    b := cast(CharPtr, sadr)^
+    SYS.MOVE(cast(AnyPtr, @mode.src.pal.col[ord(b)]), dadr, 3)
+    inc(sadr)
+    inc(dadr, 3)
+    dec(len_)
+  end
+end P8CopyBGR888
+
+procedure P8CopyBGRA8888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    b: char
+begin
+  while len_ > 0 do
+    b := cast(CharPtr, sadr)^
+    SYS.MOVE(cast(AnyPtr, @mode.src.pal.col[ord(b)]), dadr, 4)
+    inc(sadr)
+    inc(dadr, 4)
+    dec(len_)
+  end
+end P8CopyBGRA8888
+
+// D8
+procedure AnyCopyD8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    copy(@pix, @mode.buf, 4)
+    mode.src.unpack(@mode.src, sadr, sbit, @pix)
+    cast(CharPtr, dadr)^ := chr(Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+    inc(dadr)
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dec(len_)
+  end
+end AnyCopyD8
+
+procedure Any16CopyD8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, 0, @pix)
+    cast(CharPtr, dadr)^ := chr(Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+    inc(sadr, 2)
+    inc(dadr)
+    dec(len_)
+  end
+end Any16CopyD8
+
+procedure BGR888CopyD8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    SYS.MOVE(sadr, cast(AnyPtr, @pix[0]), 3)
+    cast(CharPtr, dadr)^ := chr(Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+    inc(sadr, 3)
+    inc(dadr)
+    dec(len_)
+  end
+end BGR888CopyD8
+
+procedure BGRA8888CopyD8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    SYS.MOVE(sadr, cast(AnyPtr, @pix[0]), 4)
+    cast(CharPtr, dadr)^ := chr(Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, val(int16, ord(pix[r])), val(int16, ord(pix[g])), val(int16, ord(pix[b]))))
+    inc(sadr, 4)
+    inc(dadr)
+    dec(len_)
+  end
+end BGRA8888CopyD8
+
+procedure D8CopyAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+    byte_: char
+begin
+  pix[a] := 0FFX
+  while len_ > 0 do
+    byte_ := cast(CharPtr, sadr)^
+    pix[r] := chr(Colors.Red[ord(byte_)])
+    pix[g] := chr(Colors.Green[ord(byte_)])
+    pix[b] := chr(Colors.Blue[ord(byte_)])
+    mode.dst.pack(@mode.dst, dadr, dbit, @pix)
+    inc(sadr)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    dec(len_)
+  end
+end D8CopyAny
+
+procedure D8CopyAny16(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+    byte_: char
+begin
+  pix[a] := 0FFX
+  while len_ > 0 do
+    byte_ := cast(CharPtr, sadr)^
+    pix[r] := chr(Colors.Red[ord(byte_)])
+    pix[g] := chr(Colors.Green[ord(byte_)])
+    pix[b] := chr(Colors.Blue[ord(byte_)])
+    mode.dst.pack(@mode.dst, dadr, 0, @pix)
+    inc(sadr)
+    inc(dadr, 2)
+    dec(len_)
+  end
+end D8CopyAny16
+
+procedure D8CopyBGR888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    byte_: char
+    red, green, blue: int16
+    pix: Pixel
+begin
+  while len_ > 0 do
+    byte_ := cast(CharPtr, sadr)^
+    pix[r] := chr(Colors.Red[ord(byte_)])
+    pix[g] := chr(Colors.Green[ord(byte_)])
+    pix[b] := chr(Colors.Blue[ord(byte_)])
+    SYS.MOVE(cast(AnyPtr, @pix[0]), dadr, 3)
+    inc(sadr)
+    inc(dadr, 3)
+    dec(len_)
+  end
+end D8CopyBGR888
+
+procedure D8CopyBGRA8888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+    byte_: char
+begin
+  pix[a] := 0FFX
+  while len_ > 0 do
+    byte_ := cast(CharPtr, sadr)^
+    pix[r] := chr(Colors.Red[ord(byte_)])
+    pix[g] := chr(Colors.Green[ord(byte_)])
+    pix[b] := chr(Colors.Blue[ord(byte_)])
+    SYS.MOVE(cast(AnyPtr, @pix[0]), dadr, 4)
+    inc(sadr)
+    inc(dadr, 4)
+    dec(len_)
+  end
+end D8CopyBGRA8888
+
+// BGR555, BGR565, BGR466
+procedure AnyCopyAny16(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    copy(@pix, @mode.buf, 4)
+    mode.src.unpack(@mode.src, sadr, sbit, @pix)
+    mode.dst.pack(@mode.dst, dadr, 0, @pix)
+    inc(dadr, 2)
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dec(len_)
+  end
+end AnyCopyAny16
+
+procedure Any16CopyAny16(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, 0, @pix)
+    mode.dst.pack(@mode.dst, dadr, 0, @pix)
+    inc(sadr, 2)
+    inc(dadr, 2)
+    dec(len_)
+  end
+end Any16CopyAny16
+
+procedure BGR888CopyAny16(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  pix[a] := 0FFX
+  while len_ > 0 do
+    SYS.MOVE(sadr, cast(AnyPtr, @pix[0]), 3)
+    mode.dst.pack(@mode.dst, dadr, 0, @pix)
+    inc(sadr, 3)
+    inc(dadr, 2)
+    dec(len_)
+  end
+end BGR888CopyAny16
+
+procedure BGRA8888CopyAny16(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    SYS.MOVE(sadr, cast(AnyPtr, @pix[0]), 4)
+    mode.dst.pack(@mode.dst, dadr, 0, @pix)
+    inc(sadr, 4)
+    inc(dadr, 2)
+    dec(len_)
+  end
+end BGRA8888CopyAny16
+
+procedure Any16CopyAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, 0, @pix)
+    mode.dst.pack(@mode.dst, dadr, dbit, @pix)
+    inc(sadr, 2)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    dec(len_)
+  end
+end Any16CopyAny
+
+procedure Any16CopyBGR888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, 0, @pix)
+    SYS.MOVE(cast(AnyPtr, @pix[0]), dadr, 3)
+    inc(sadr, 2)
+    inc(dadr, 3)
+    dec(len_)
+  end
+end Any16CopyBGR888
+
+procedure Any16CopyBGRA8888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, 0, @pix)
+    SYS.MOVE(cast(AnyPtr, @pix[0]), dadr, 4)
+    inc(sadr, 2)
+    inc(dadr, 4)
+    dec(len_)
+  end
+end Any16CopyBGRA8888
+
+// BGR888
+procedure AnyCopyBGR888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    copy(@pix, @mode.buf, 4)
+    mode.src.unpack(@mode.src, sadr, sbit, @pix)
+    SYS.MOVE(cast(AnyPtr, @pix[0]), dadr, 3)
+    inc(dadr, 3)
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dec(len_)
+  end
+end AnyCopyBGR888
+
+procedure BGRA8888CopyBGR888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  while len_ > 0 do
+    SYS.MOVE(sadr, dadr, 3)
+    inc(sadr, 4)
+    inc(dadr, 3)
+    dec(len_)
+  end
+end BGRA8888CopyBGR888
+
+procedure BGR888CopyAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  pix[a] := 0FFX
+  while len_ > 0 do
+    SYS.MOVE(sadr, cast(AnyPtr, @pix[0]), 3)
+    mode.dst.pack(@mode.dst, dadr, dbit, @pix)
+    inc(sadr, 3)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    dec(len_)
+  end
+end BGR888CopyAny
+
+procedure BGR888CopyBGRA8888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+  while len_ > 0 do
+    SYS.MOVE(sadr, dadr, 3)
+    cast(CharPtr, ptroff(dadr, 3))^ := 0FFX
+    inc(sadr, 3)
+    inc(dadr, 4)
+    dec(len_)
+  end
+end BGR888CopyBGRA8888
+
+// BGRA8888
+procedure AnyCopyBGRA8888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    copy(@pix, @mode.buf, 4)
+    mode.src.unpack(@mode.src, sadr, sbit, @pix)
+    SYS.MOVE(cast(AnyPtr, @pix[0]), dadr, 4)
+    inc(dadr, 4)
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dec(len_)
+  end
+end AnyCopyBGRA8888
+
+procedure BGRA8888CopyAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+begin
+  while len_ > 0 do
+    SYS.MOVE(sadr, cast(AnyPtr, @pix[0]), 4)
+    mode.dst.pack(@mode.dst, dadr, dbit, @pix)
+    inc(sadr, 4)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    dec(len_)
+  end
+end BGRA8888CopyAny
+
+// --- dstCopy Transfer ---
+
+procedure EmptyTransfer(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+begin
+end EmptyTransfer
+
+// --- srcOverDst Transfer ---
+
+// A1
+procedure AnyOverA1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    out: char
+    pix: Pixel
+begin
+  out := cast(CharPtr, dadr)^
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, sbit, @pix)
+    if pix[a] >= 80X then
+      out := Set[ord(out)][dbit]
+    end
+
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    inc(dbit)
+    dec(len_)
+    if dbit = 8 then
+      cast(CharPtr, dadr)^ := out
+      inc(dadr)
+      dbit := 0
+      out := cast(CharPtr, dadr)^
+    end
+  end
+
+  cast(CharPtr, dadr)^ := out
+end AnyOverA1
+
+procedure A1OverA1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_, out: char
+begin
+  in_ := cast(CharPtr, sadr)^
+  out := cast(CharPtr, dadr)^
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      out := Set[ord(out)][dbit]
+    end
+
+    inc(sbit)
+    inc(dbit)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+
+    if dbit = 8 then
+      cast(CharPtr, dadr)^ := out
+      inc(dadr)
+      dbit := 0
+      out := cast(CharPtr, dadr)^
+    end
+  end
+
+  cast(CharPtr, dadr)^ := out
+end A1OverA1
+
+procedure A8OverA1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_, out: char
+begin
+  out := cast(CharPtr, dadr)^
+  while len_ > 0 do
+    in_ := cast(CharPtr, sadr)^
+    if in_ >= 80X then
+      out := Set[ord(out)][dbit]
+    end
+
+    inc(sadr)
+    inc(dbit)
+    dec(len_)
+    if dbit = 8 then
+      cast(CharPtr, dadr)^ := out
+      inc(dadr)
+      dbit := 0
+      out := cast(CharPtr, dadr)^
+    end
+  end
+
+  cast(CharPtr, dadr)^ := out
+end A8OverA1
+
+procedure BGRA8888OverA1(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_, out: char
+begin
+  out := cast(CharPtr, dadr)^
+  while len_ > 0 do
+    in_ := cast(CharPtr, ptroff(sadr, a))^
+    if in_ >= 80X then
+      out := Set[ord(out)][dbit]
+    end
+
+    inc(sadr, 4)
+    inc(dbit)
+    dec(len_)
+    if dbit = 8 then
+      cast(CharPtr, dadr)^ := out
+      inc(dadr)
+      dbit := 0
+      out := cast(CharPtr, dadr)^
+    end
+  end
+
+  cast(CharPtr, dadr)^ := out
+end BGRA8888OverA1
+
+procedure A1OverAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_: char
+begin
+  in_ := cast(CharPtr, sadr)^
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      mode.dst.pack(@mode.dst, dadr, dbit, @mode.buf)
+    end
+
+    inc(sbit)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+  end
+end A1OverAny
+
+procedure A1OverConst8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_: char
+begin
+  in_ := cast(CharPtr, sadr)^
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      cast(CharPtr, dadr)^ := mode.buf[0]
+    end
+
+    inc(sbit)
+    inc(dadr)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+  end
+end A1OverConst8
+
+procedure A1OverConst16(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_: char
+begin
+  in_ := cast(CharPtr, sadr)^
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      SYS.MOVE(cast(AnyPtr, @mode.buf[0]), dadr, 2)
+    end
+
+    inc(sbit)
+    inc(dadr, 2)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+  end
+end A1OverConst16
+
+procedure A1OverConst24(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_: char
+begin
+  in_ := cast(CharPtr, sadr)^
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      SYS.MOVE(cast(AnyPtr, @mode.buf[0]), dadr, 3)
+    end
+
+    inc(sbit)
+    inc(dadr, 3)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+  end
+end A1OverConst24
+
+procedure A1OverConst32(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_: char
+begin
+  in_ := cast(CharPtr, sadr)^
+  while len_ > 0 do
+    if Bit[ord(in_)][sbit] then
+      SYS.MOVE(cast(AnyPtr, @mode.buf[0]), dadr, 4)
+    end
+
+    inc(sbit)
+    inc(dadr, 4)
+    dec(len_)
+    if sbit = 8 then
+      inc(sadr)
+      sbit := 0
+      in_ := cast(CharPtr, sadr)^
+    end
+  end
+end A1OverConst32
+
+// A8
+procedure AnyOverA8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    pix: Pixel
+    b: char
+begin
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, sbit, @pix)
+    if pix[a] = 0FFX then
+      cast(CharPtr, dadr)^ := 0FFX
+    elsif pix[a] # 0X then
+      b := cast(CharPtr, dadr)^
+      cast(CharPtr, dadr)^ := chr(val(int32, ord(pix[a])) + obdiv(val(int32, ord(b)) * val(int32, 255 - val(int16, ord(pix[a]))), 255))
+    end
+
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    inc(dadr)
+    dec(len_)
+  end
+end AnyOverA8
+
+procedure A8OverAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    dpix: Pixel
+begin
+  while len_ > 0 do
+    mode.buf[a] := cast(CharPtr, sadr)^
+    if mode.buf[a] = 0FFX then
+      mode.dst.pack(@mode.dst, dadr, dbit, @mode.buf)
+    elsif mode.buf[a] # 0X then
+      mode.dst.unpack(@mode.dst, dadr, dbit, @dpix)
+      Blend(mode.op, @mode.buf, @dpix)
+      mode.dst.pack(@mode.dst, dadr, dbit, @dpix)
+    end
+
+    inc(sadr)
+    dec(len_)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+  end
+end A8OverAny
+
+procedure A8OverA8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_, out: char
+begin
+  while len_ > 0 do
+    in_ := cast(CharPtr, sadr)^
+    if in_ = 0FFX then
+      cast(CharPtr, dadr)^ := 0FFX
+    elsif in_ # 0X then
+      out := cast(CharPtr, dadr)^
+      cast(CharPtr, dadr)^ := chr(val(int32, ord(in_)) + obdiv(val(int32, ord(out)) * val(int32, 255 - val(int16, ord(in_))), 255))
+    end
+
+    inc(sadr)
+    inc(dadr)
+    dec(len_)
+  end
+end A8OverA8
+
+// BGRA8888
+procedure AnyOverBGRA8888(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    spix, dpix: Pixel
+begin
+  while len_ > 0 do
+    mode.src.unpack(@mode.src, sadr, sbit, @spix)
+    if spix[a] = 0FFX then
+      SYS.MOVE(cast(AnyPtr, @spix[0]), dadr, 4)
+    elsif spix[a] # 0X then
+      SYS.MOVE(dadr, cast(AnyPtr, @dpix[0]), 4)
+      Blend(mode.op, @spix, @dpix)
+      SYS.MOVE(cast(AnyPtr, @dpix[0]), dadr, 4)
+    end
+
+    sbit := sbit + mode.src.bpp
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    inc(dadr, 4)
+    dec(len_)
+  end
+end AnyOverBGRA8888
+
+procedure BGRA8888OverAny(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    spix, dpix: Pixel
+begin
+  while len_ > 0 do
+    SYS.MOVE(sadr, cast(AnyPtr, @spix[0]), 4)
+    if spix[a] = 0FFX then
+      mode.dst.pack(@mode.dst, dadr, dbit, @spix)
+    elsif spix[a] # 0X then
+      mode.dst.unpack(@mode.dst, dadr, dbit, @dpix)
+      Blend(mode.op, @spix, @dpix)
+      mode.dst.pack(@mode.dst, dadr, dbit, @dpix)
+    end
+
+    inc(sadr, 4)
+    dec(len_)
+    dbit := dbit + mode.dst.bpp
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+  end
+end BGRA8888OverAny
+
+procedure BGRA8888OverA8(mode: pointer to Mode0; sadr: AnyPtr; sbit: int32; dadr: AnyPtr; dbit, len_: int32)
+  var
+    in_, out: char
+begin
+  while len_ > 0 do
+    in_ := cast(CharPtr, ptroff(sadr, a))^
+    if in_ = 0FFX then
+      cast(CharPtr, dadr)^ := 0FFX
+    elsif in_ # 0X then
+      out := cast(CharPtr, dadr)^
+      cast(CharPtr, dadr)^ := chr(val(int16, ord(in_)) + obdiv(val(int16, ord(out)) * (255 - val(int16, ord(in_))), 255))
+    end
+
+    inc(sadr, 4)
+    inc(dadr)
+    dec(len_)
+  end
+end BGRA8888OverA8
+
+// find (optimized) pixel transfer procedure for transfer mode and given source and destination formats *
+procedure Bind*(mode: pointer to Mode; src, dst: pointer to Format)
+  var
+    op: int16
+    i: int32
+begin
+  if Same(src, @mode.src) & Same(dst, @mode.dst) then
+    assert(mode.transfer # nil)
+    return // assume transfer procedure is still valid
+  end
+
+  mode.src := src^
+  mode.dst := dst^
+  copy(@mode.buf, @mode.col, 4)
+
+  // try to convert complex composite operations into simpler ones
+  if alpha in src.components * dst.components then
+    // source and destination contain alpha information
+    op := mode.op
+  elsif alpha in src.components then
+    // only source contains alpha
+    case mode.op of
+      4 (* dstOverSrc *):
+      op := dstCopy
+    | 5 (* srcInDst *):
+      op := srcCopy
+    | 7 (* srcWithoutDst *):
+      op := clear
+    | 9 (* srcAtopDst *):
+      op := srcOverDst
+    | 10 (* dstAtopSrc *):
+      op := dstInSrc
+    | 11 (* srcXorDst *):
+      op := dstWithoutSrc
+    else
+      op := mode.op
+    end
+
+  elsif alpha in dst.components then
+    // only destination contains alpha
+    case mode.op of
+      3 (* srcOverDst *):
+      op := srcCopy
+    | 6 (* dstInSrc *):
+      op := dstCopy
+    | 8 (* dstWithoutSrc *):
+      op := clear
+    | 9 (* srcAtopDst *):
+      op := srcInDst
+    | 10 (* dstAtopSrc *):
+      op := dstOverSrc
+    | 11 (* srcXorDst *):
+      op := srcWithoutDst
+    else
+      op := mode.op
+    end
+
+  else
+    // no alpha in either source or destination
+    case mode.op of
+      3 (* srcOverDst *), 5 (* srcInDst *), 9 (* srcAtopDst *):
+      op := srcCopy
+    | 4 (* dstOverSrc *), 6 (* dstInSrc *), 10 (* dstAtopSrc *):
+      op := dstCopy
+    | 7 (* srcWithoutDst *), 8 (* dstWithoutSrc *), 11 (* srcXorDst *):
+      op := clear
+    else
+      op := mode.op
+    end
+  end
+
+  if op = clear then
+    case dst.code of
+      a1:
+      mode.transfer := Clear1
+    | a8, bgr555, bgr565, bgr466, bgr888, bgra8888:
+      mode.transfer := ClearBytes
+    | p8:
+      mode.buf[0] := chr(PaletteIndex(dst.pal, 0, 0, 0))
+      if mode.buf[0] = 0X then
+        mode.transfer := ClearBytes
+      else
+        mode.transfer := ConstCopy8
+      end
+
+    | d8:
+      mode.buf[0] := chr(Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, 0, 0, 0))
+      mode.transfer := ConstCopy8
+    else
+      mode.transfer := ClearAny
+    end
+
+  elsif op = srcCopy then
+    case dst.code of
+      a1:
+      case src.code of
+        a1:
+        mode.transfer := Copy1
+      | a8:
+        mode.transfer := A8CopyA1
+      | bgra8888:
+        mode.transfer := BGRA8888CopyA1
+      else
+        if alpha in src.components then
+          mode.transfer := AnyCopyA1
+        else
+          mode.transfer := Set1
+        end
+      end
+
+    | a8:
+      case src.code of
+        a1:
+        mode.transfer := A1CopyA8
+      | a8:
+        mode.transfer := Copy8
+      | bgra8888:
+        mode.transfer := BGRA8888CopyA8
+      else
+        if alpha in src.components then
+          mode.transfer := AnyCopyA8
+        else
+          mode.buf[0] := 0FFX
+          mode.transfer := ConstCopy8
+        end
+      end
+
+    | p8:
+      case src.code of
+        a1, a8:
+        mode.buf[0] := chr(PaletteIndex(dst.pal, val(int16, ord(mode.col[r])), val(int16, ord(mode.col[g])), val(int16, ord(mode.col[b]))))
+        mode.transfer := ConstCopy8
+      | p8:
+        if src.pal = dst.pal then
+          mode.transfer := Copy8
+        else
+          for i := 0 to src.pal.used - 1 do
+            mode.map[i] := chr(PaletteIndex(dst.pal, val(int16, ord(src.pal.col[i][r])), val(int16, ord(src.pal.col[i][g])), val(int16, ord(src.pal.col[i][b]))))
+          end
+
+          mode.transfer := I8CopyI8
+        end
+
+      | d8:
+        for i := 0 to 255 do
+          mode.map[i] := chr(PaletteIndex(dst.pal, Colors.Red[i], Colors.Green[i], Colors.Blue[i]))
+        end
+
+        mode.transfer := I8CopyI8
+      | bgr555, bgr565, bgr466:
+        mode.transfer := Any16CopyP8
+      | bgr888:
+        mode.transfer := BGR888CopyP8
+      | bgra8888:
+        mode.transfer := BGRA8888CopyP8
+      else
+        mode.transfer := AnyCopyP8
+      end
+
+    | d8:
+      case src.code of
+        a1, a8:
+        mode.buf[0] := chr(Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, val(int16, ord(mode.col[r])), val(int16, ord(mode.col[g])), val(int16, ord(mode.col[b]))))
+        mode.transfer := ConstCopy8
+      | p8:
+        for i := 0 to src.pal.used - 1 do
+          mode.map[i] := chr(Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, val(int16, ord(src.pal.col[i][r])), val(int16, ord(src.pal.col[i][g])), val(int16, ord(src.pal.col[i][b]))))
+        end
+
+        mode.transfer := I8CopyI8
+      | d8:
+        mode.transfer := Copy8
+      | bgr555, bgr565, bgr466:
+        mode.transfer := Any16CopyD8
+      | bgr888:
+        mode.transfer := BGR888CopyD8
+      | bgra8888:
+        mode.transfer := BGRA8888CopyD8
+      else
+        mode.transfer := AnyCopyD8
+      end
+
+    | bgr555, bgr565, bgr466:
+      case src.code of
+        a1, a8:
+        dst.pack(dst, cast(AnyPtr, @mode.buf[0]), 0, @mode.col)
+        mode.transfer := ConstCopy16
+      | p8:
+        mode.transfer := P8CopyAny16
+      | d8:
+        mode.transfer := D8CopyAny16
+      | bgr555, bgr565, bgr466:
+        if src.code = dst.code then
+          mode.transfer := Copy16
+        else
+          mode.transfer := Any16CopyAny16
+        end
+
+      | bgr888:
+        mode.transfer := BGR888CopyAny16
+      | bgra8888:
+        mode.transfer := BGRA8888CopyAny16
+      else
+        mode.transfer := AnyCopyAny16
+      end
+
+    | bgr888:
+      case src.code of
+        a1, a8:
+        copy(@mode.buf, @mode.col, 4)
+        mode.transfer := ConstCopy24
+      | p8:
+        mode.transfer := P8CopyBGR888
+      | d8:
+        mode.transfer := D8CopyBGR888
+      | bgr555, bgr565, bgr466:
+        mode.transfer := Any16CopyBGR888
+      | bgr888:
+        mode.transfer := Copy24
+      | bgra8888:
+        mode.transfer := BGRA8888CopyBGR888
+      else
+        mode.transfer := AnyCopyBGR888
+      end
+
+    | bgra8888:
+      case src.code of
+        a1:
+        mode.transfer := A1CopyBGRA8888
+      | a8:
+        mode.transfer := A8CopyBGRA8888
+      | p8:
+        mode.transfer := P8CopyBGRA8888
+      | d8:
+        mode.transfer := D8CopyBGRA8888
+      | bgr555, bgr565, bgr466:
+        mode.transfer := Any16CopyBGRA8888
+      | bgr888:
+        mode.transfer := BGR888CopyBGRA8888
+      | bgra8888:
+        mode.transfer := Copy32
+      else
+        mode.transfer := AnyCopyBGRA8888
+      end
+
+    else
+      case src.code of
+        a1:
+        mode.transfer := A1CopyAny
+      | p8:
+        mode.transfer := P8CopyAny
+      | d8:
+        mode.transfer := D8CopyAny
+      | bgr555, bgr565, bgr466:
+        mode.transfer := Any16CopyAny
+      | bgr888:
+        mode.transfer := BGR888CopyAny
+      | bgra8888:
+        mode.transfer := BGRA8888CopyAny
+      else
+        if (band(src.bpp, 7) = 0) & (band(dst.bpp, 7) = 0) then
+          mode.transfer := AnyBytesCopyAnyBytes
+        else
+          mode.transfer := AnyCopyAny
+        end
+      end
+    end
+
+  elsif op = dstOverSrc then
+    mode.transfer := EmptyTransfer
+
+  elsif op = srcOverDst then
+    case dst.code of
+      a1:
+      case src.code of
+        a1:
+        mode.transfer := A1OverA1
+      | a8:
+        mode.transfer := A8OverA1
+      | bgra8888:
+        mode.transfer := BGRA8888OverA1
+      else
+        mode.transfer := AnyOverA1
+      end
+
+    | a8:
+      case src.code of
+        a1:
+        mode.buf[0] := 0FFX
+        mode.transfer := A1OverConst8
+      | a8:
+        mode.transfer := A8OverA8
+      | bgra8888:
+        mode.transfer := BGRA8888OverA8
+      else
+        mode.transfer := AnyOverA8
+      end
+
+    | bgra8888:
+      case src.code of
+        a1:
+        copy(@mode.buf, @mode.col, 4)
+        mode.transfer := A1OverConst32
+      | a8:
+        copy(@mode.buf, @mode.col, 4)
+        mode.transfer := A8OverAny
+      else
+        mode.transfer := AnyOverBGRA8888
+      end
+
+    else
+      case src.code of
+        a1:
+        case dst.code of
+          p8:
+          mode.buf[0] := chr(PaletteIndex(dst.pal, val(int16, ord(mode.col[r])), val(int16, ord(mode.col[g])), val(int16, ord(mode.col[b]))))
+          mode.transfer := A1OverConst8
+        | d8:
+          mode.buf[0] := chr(Colors.Match(Colors.DisplayIndex, Colors.DisplayBits, val(int16, ord(mode.col[r])), val(int16, ord(mode.col[g])), val(int16, ord(mode.col[b]))))
+          mode.transfer := A1OverConst8
+        | bgr555, bgr565, bgr466:
+          dst.pack(dst, cast(AnyPtr, @mode.buf[0]), 0, @mode.col)
+          mode.transfer := A1OverConst16
+        | bgr888:
+          copy(@mode.buf, @mode.col, 4)
+          mode.transfer := A1OverConst24
+        else
+          mode.transfer := A1OverAny
+        end
+
+      | a8:
+        copy(@mode.buf, @mode.col, 4)
+        mode.transfer := A8OverAny
+      | bgra8888:
+        mode.transfer := BGRA8888OverAny
+      else
+        mode.transfer := AnyBlendAny
+      end
+    end
+
+  else
+    mode.transfer := AnyBlendAny
+  end
+
+  assert(mode.transfer # nil)
+end Bind
+
+// --- Image Operations ---*
+
+// get pixel from image *
+procedure Get*(img: Image; x, y: int16; pix: pointer to array of char; mode: pointer to Mode)
+  var
+    bit: int32
+    adr: AnyPtr
+begin
+  assert((0 <= x) & (x < img.width) & (0 <= y) & (y < img.height))
+  bit := val(int32, x) * img.fmt.bpp
+  adr := img.adr
+  inc(adr, y * img.bpr)
+  inc(adr, asr(bit, 3))
+  bit := band(bit, 7)
+  Bind(mode, @img.fmt, @PixelFormat)
+  mode.transfer(mode, adr, bit, cast(AnyPtr, pix), 0, 1)
+end Get
+
+// put pixel into image *
+procedure Put*(img: Image; x, y: int16; const pix: pointer to array of char; mode: pointer to Mode)
+  var
+    bit: int32
+    adr: AnyPtr
+begin
+  assert((0 <= x) & (x < img.width) & (0 <= y) & (y < img.height))
+  bit := val(int32, x) * img.fmt.bpp
+  adr := img.adr
+  inc(adr, y * img.bpr)
+  inc(adr, asr(bit, 3))
+  bit := band(bit, 7)
+  Bind(mode, @PixelFormat, @img.fmt)
+  mode.transfer(mode, cast(AnyPtr, @pix[0]), 0, adr, bit, 1)
+end Put
+
+// fill rectangular area *
+procedure Fill*(img: Image; llx, lly, urx, ury: int16; const pix: pointer to array of char; mode: pointer to Mode)
+  var
+    bit: int32
+    adr: AnyPtr
+    bb: int32
+    aa: AnyPtr
+    m: Mode
+    x: int16
+begin
+  assert((0 <= llx) & (llx < urx) & (urx <= img.width) & (0 <= lly) & (lly < ury) & (ury <= img.height))
+  bit := val(int32, llx) * img.fmt.bpp
+  adr := img.adr
+  inc(adr, lly * img.bpr)
+  inc(adr, asr(bit, 3))
+  bit := band(bit, 7)
+  Bind(mode, @PixelFormat, @img.fmt)
+  if (mode.op in {clear,srcCopy}) or (pix[a] = 0FFX) & (mode.op in {srcOverDst,dstWithoutSrc}) then
+    // dst is replaced
+    // copy one pixel to lower left corner of rect
+    mode.transfer(mode, cast(AnyPtr, @pix[0]), 0, adr, bit, 1)
+
+    // copy pixel to rest of bottom row
+    InitMode(@m, srcCopy)
+    Bind(@m, @img.fmt, @img.fmt)
+    if (bit = 0) & (band(img.fmt.bpp, 7) = 0) then
+      // use simple address calculation
+      bb := asr(img.fmt.bpp, 3)
+      aa := adr
+      inc(aa, bb)
+      x := llx + 1
+      while x < urx do
+        m.transfer(@m, adr, 0, aa, 0, 1)
+        inc(aa, bb)
+        inc(x)
+      end
+
+    else
+      bb := bit + img.fmt.bpp
+      aa := adr
+      inc(aa, asr(bb, 3))
+      bb := band(bb, 7)
+      x := llx + 1
+      while x < urx do
+        m.transfer(@m, adr, bit, aa, bb, 1)
+        bb := bb + img.fmt.bpp
+        inc(aa, asr(bb, 3))
+        bb := band(bb, 7)
+        inc(x)
+      end
+    end
+
+    // now copy bottom row to others
+    inc(lly)
+    aa := adr
+    inc(aa, img.bpr)
+    while lly < ury do
+      m.transfer(@m, adr, bit, aa, bit, urx - llx)
+      inc(lly)
+      inc(aa, img.bpr)
+    end
+
+  else
+    // fill pixel by pixel
+    while lly < ury do
+      x := llx
+      aa := adr
+      bb := bit
+      while x < urx do
+        mode.transfer(mode, cast(AnyPtr, @pix[0]), 0, aa, bb, 1)
+        bb := bb + img.fmt.bpp
+        inc(aa, asr(bb, 3))
+        bb := band(bb, 7)
+        inc(x)
+      end
+
+      inc(lly)
+      inc(adr, img.bpr)
+    end
+  end
+end Fill
+
+// clear image *
+procedure Clear*(img: Image)
+  var
+    mode: Mode
+begin
+  InitMode(@mode, clear)
+  Bind(@mode, @PixelFormat, @img.fmt)
+  Fill(img, 0, 0, img.width, img.height, @Zero, @mode)
+end Clear
+
+// get several pixels and store them in array in requested format *
+procedure GetPixels*(img: Image; x, y, w: int16; fmt: pointer to Format; buf: pointer to array of char; buf_len: int32; mode: pointer to Mode)
+  var
+    sbit: int32
+    sadr: AnyPtr
+begin
+  assert((0 <= x) & (x + w <= img.width) & (0 <= y) & (y <= img.height))
+  assert(asr(w * fmt.bpp, 3) <= val(int16, buf_len))
+  Bind(mode, @img.fmt, fmt)
+  sbit := val(int32, x) * img.fmt.bpp
+  sadr := img.adr
+  inc(sadr, y * img.bpr)
+  inc(sadr, asr(sbit, 3))
+  sbit := band(sbit, 7)
+  mode.transfer(mode, sadr, sbit, cast(AnyPtr, @buf[0]), 0, w)
+end GetPixels
+
+// put several pixels from array in given format into image *
+procedure PutPixels*(img: Image; x, y, w: int16; fmt: pointer to Format; buf: pointer to array of char; buf_len: int32; mode: pointer to Mode)
+  var
+    dbit: int32
+    dadr: AnyPtr
+begin
+  assert((0 <= x) & (x + w <= img.width) & (0 <= y) & (y <= img.height))
+  assert(asr(w * fmt.bpp, 3) <= val(int16, buf_len))
+  dbit := val(int32, x) * img.fmt.bpp
+  dadr := img.adr
+  inc(dadr, y * img.bpr)
+  inc(dadr, asr(dbit, 3))
+  dbit := band(dbit, 7)
+  Bind(mode, fmt, @img.fmt)
+  mode.transfer(mode, cast(AnyPtr, @buf[0]), 0, dadr, dbit, w)
+end PutPixels
+
+// copy rectangular area to the same or another image in specified mode *
+procedure Copy*(src, dst: Image; llx, lly, urx, ury, dx, dy: int16; mode: pointer to Mode)
+  var
+    w, h: int16
+    sbit: int32
+    sadr: AnyPtr
+    dbit: int32
+    dadr: AnyPtr
+    slen: int32
+    sa: AnyPtr
+    sb: int32
+    da: AnyPtr
+    db, len_, l: int32
+begin
+  assert((0 <= llx) & (llx <= urx) & (urx <= src.width) & (0 <= lly) & (lly <= ury) & (ury <= src.height))
+  assert((0 <= dx) & (dx + urx - llx <= dst.width) & (0 <= dy) & (dy + ury - lly <= dst.height))
+  Bind(mode, @src.fmt, @dst.fmt)
+  w := urx - llx
+  h := ury - lly
+  if (src # dst) or (lly > dy) or (lly = dy) & ((llx > dx) or (urx <= dx)) then
+    // copy lines bottom-up
+    sbit := val(int32, llx) * src.fmt.bpp
+    sadr := src.adr
+    inc(sadr, lly * src.bpr)
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dbit := val(int32, dx) * dst.fmt.bpp
+    dadr := dst.adr
+    inc(dadr, dy * dst.bpr)
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    while h > 0 do
+      mode.transfer(mode, sadr, sbit, dadr, dbit, w)
+      inc(sadr, src.bpr)
+      inc(dadr, dst.bpr)
+      dec(h)
+    end
+
+  elsif lly < dy then
+    // copy lines top-down
+    sbit := val(int32, llx) * src.fmt.bpp
+    sadr := src.adr
+    inc(sadr, ury * src.bpr)
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dbit := val(int32, dx) * dst.fmt.bpp
+    dadr := dst.adr
+    inc(dadr, (dy + h) * dst.bpr)
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    while h > 0 do
+      dec(sadr, src.bpr)
+      dec(dadr, dst.bpr)
+      dec(h)
+      mode.transfer(mode, sadr, sbit, dadr, dbit, w)
+    end
+
+  elsif llx # dx then
+    // uh oh! overlapping spans
+    slen := dx + w - urx // maximal span length guaranteeing non-overlapping spans
+    sbit := val(int32, urx) * src.fmt.bpp
+    sadr := src.adr
+    inc(sadr, lly * src.bpr)
+    inc(sadr, asr(sbit, 3))
+    sbit := band(sbit, 7)
+    dbit := val(int32, dx + w) * dst.fmt.bpp
+    dadr := dst.adr
+    inc(dadr, dy * dst.bpr)
+    inc(dadr, asr(dbit, 3))
+    dbit := band(dbit, 7)
+    while h > 0 do
+      sa := sadr
+      sb := sbit
+      da := dadr
+      db := dbit
+      len_ := w
+      while len_ > 0 do
+        l := slen
+        if l > len_ then
+          l := len_
+        end
+        dec(sb, l * src.fmt.bpp)
+        inc(sa, asr(sb, 3))
+        sb := band(sb, 7)
+        dec(db, l * dst.fmt.bpp)
+        inc(da, asr(db, 3))
+        db := band(db, 7)
+        mode.transfer(mode, sa, sb, da, db, l)
+        dec(len_, l)
+      end
+
+      inc(sadr, src.bpr)
+      inc(dadr, dst.bpr)
+      dec(h)
+    end
+  end
+end Copy
+
+// replicate pattern within rectangular area of image using given mode *
+procedure FillPattern*(pat, dst: Image; llx, lly, urx, ury, px, py: int16; mode: pointer to Mode)
+  var
+    pw, ph, olx, oby, ilx, olw, irw, dy, sy, dx, sx, ty: int16
+begin
+  assert((0 <= llx) & (llx <= urx) & (urx <= dst.width) & (0 <= lly) & (lly <= ury) & (ury <= dst.height))
+  pw := pat.width
+  ph := pat.height
+  olx := px + obdiv(llx - px, pw) * pw
+  oby := py + obdiv(lly - py, ph) * ph
+  ilx := olx + pw
+  olw := llx - olx
+  irw := obmod(urx - px, pw)
+  if urx - irw < ilx then
+    irw := olw + urx - llx
+  end
+  dy := lly
+  sy := lly - oby
+  if (oby < lly) & (oby + ph <= ury) then
+    dx := llx
+    sx := olw
+    if (olx < llx) & (ilx <= urx) then
+      Copy(pat, dst, sx, sy, pw, ph, llx, lly, mode)
+      dx := ilx
+      sx := 0
+    end
+
+    while dx + pw <= urx do
+      Copy(pat, dst, 0, sy, pw, ph, dx, lly, mode)
+      inc(dx, pw)
+    end
+
+    if dx < urx then
+      Copy(pat, dst, sx, sy, irw, ph, dx, lly, mode)
+    end
+
+    dy := oby + ph
+    sy := 0
+  end
+
+  while dy + ph <= ury do
+    dx := llx
+    sx := olw
+    if (olx < llx) & (ilx <= urx) then
+      Copy(pat, dst, sx, 0, pw, ph, llx, dy, mode)
+      dx := ilx
+      sx := 0
+    end
+
+    while dx + pw <= urx do
+      Copy(pat, dst, 0, 0, pw, ph, dx, dy, mode)
+      inc(dx, pw)
+    end
+
+    if dx < urx then
+      Copy(pat, dst, sx, 0, irw, ph, dx, dy, mode)
+    end
+
+    inc(dy, ph)
+  end
+
+  if dy < ury then
+    ty := sy + ury - dy
+    dx := llx
+    sx := olw
+    if (olx < llx) & (ilx <= urx) then
+      Copy(pat, dst, sx, sy, pw, ty, llx, dy, mode)
+      dx := ilx
+      sx := 0
+    end
+
+    while dx + pw <= urx do
+      Copy(pat, dst, 0, sy, pw, ty, dx, dy, mode)
+      inc(dx, pw)
+    end
+
+    if dx < urx then
+      Copy(pat, dst, sx, sy, irw, ty, dx, dy, mode)
+    end
+  end
+end FillPattern
+
+// darken image while maintaining coverage *
+procedure Darken*(img: Image; factor: real)
+  var
+    s, i, j, k: int32
+    adr: AnyPtr
+    bit: int32
+    clamp: array 256 of char
+    y, x: int16
+    pix: Pixel
+begin
+  s := val(int32, abs(floor(val(real, 255) * factor + 0.5)))
+  if (s # 255) & (img.fmt.components # {alpha}) then
+    i := 256
+    j := 256 * s
+    repeat
+      dec(i)
+      dec(j, s)
+      k := obdiv(j, 255)
+      if k <= 255 then
+        clamp[i] := chr(k)
+      else
+        clamp[i] := 0FFX
+      end
+    until i = 0
+
+    y := 0
+    while y < img.height do
+      x := 0
+      adr := img.adr
+      inc(adr, y * img.bpr)
+      bit := 0
+      while x < img.width do
+        img.fmt.unpack(@img.fmt, adr, bit, @pix)
+        pix[r] := clamp[ord(pix[r])]
+        pix[g] := clamp[ord(pix[g])]
+        pix[b] := clamp[ord(pix[b])]
+        img.fmt.pack(@img.fmt, adr, bit, @pix)
+        bit := bit + img.fmt.bpp
+        inc(adr, bit)
+        bit := band(bit, 7)
+        inc(x)
+      end
+
+      inc(y)
+    end
+  end
+end Darken
+
+// fade image *
+procedure Fade*(img: Image; factor: real)
+  var
+    s, i, j, k: int32
+    adr: AnyPtr
+    bit: int32
+    clamp: array 256 of char
+    y, x: int16
+    pix: Pixel
+begin
+  s := val(int32, abs(floor(val(real, 255) * factor + 0.5)))
+  if s = 0 then
+    Clear(img)
+  elsif s # 255 then
+    i := 256
+    j := 256 * s
+    repeat
+      dec(i)
+      dec(j, s)
+      k := obdiv(j, 255)
+      if k <= 255 then
+        clamp[i] := chr(k)
+      else
+        clamp[i] := 0FFX
+      end
+    until i = 0
+
+    y := 0
+    while y < img.height do
+      x := 0
+      adr := img.adr
+      inc(adr, y * img.bpr)
+      bit := 0
+      while x < img.width do
+        img.fmt.unpack(@img.fmt, adr, bit, @pix)
+        pix[r] := clamp[ord(pix[r])]
+        pix[g] := clamp[ord(pix[g])]
+        pix[b] := clamp[ord(pix[b])]
+        pix[a] := clamp[ord(pix[a])]
+        img.fmt.pack(@img.fmt, adr, bit, @pix)
+        bit := bit + img.fmt.bpp
+        inc(adr, bit)
+        bit := band(bit, 7)
+        inc(x)
+      end
+
+      inc(y)
+    end
+  end
+end Fade
+
+// make image brighter and more transparent; Opaque(I, f) = Darken(Fade(I, f), 1/f) *
+procedure Opaque*(img: Image; factor: real)
+  var
+    s, i, j, k: int32
+    adr: AnyPtr
+    bit: int32
+    clamp: array 256 of char
+    y, x: int16
+    pix: Pixel
+begin
+  s := val(int32, abs(floor(val(real, 255) * factor + 0.5)))
+  if s = 0 then
+    Clear(img)
+  elsif s # 255 then
+    i := 256
+    j := 256 * s
+    repeat
+      dec(i)
+      dec(j, s)
+      k := obdiv(j, 255)
+      if k <= 255 then
+        clamp[i] := chr(k)
+      else
+        clamp[i] := 0FFX
+      end
+    until i = 0
+
+    y := 0
+    while y < img.height do
+      x := 0
+      adr := img.adr
+      inc(adr, y * img.bpr)
+      bit := 0
+      while x < img.width do
+        img.fmt.unpack(@img.fmt, adr, bit, @pix)
+        pix[a] := clamp[ord(pix[a])]
+        img.fmt.pack(@img.fmt, adr, bit, @pix)
+        bit := bit + img.fmt.bpp
+        inc(adr, bit)
+        bit := band(bit, 7)
+        inc(x)
+      end
+
+      inc(y)
+    end
+  end
+end Opaque
+
+// add components of two (faded) images *
+procedure Add*(i, j, res: Image)
+  var
+    y, x: int16
+    iadr: AnyPtr
+    ibit: int32
+    jadr: AnyPtr
+    jbit: int32
+    radr: AnyPtr
+    rbit, k: int32
+    ipix, jpix, rpix: Pixel
+begin
+  assert((i.width = j.width) & (i.height = j.height) & (i.width <= res.width) & (i.height <= res.height))
+  y := 0
+  while y < i.height do
+    x := 0
+    iadr := i.adr
+    inc(iadr, y * i.bpr)
+    ibit := 0
+    jadr := j.adr
+    inc(jadr, y * j.bpr)
+    jbit := 0
+    radr := res.adr
+    inc(radr, y * res.bpr)
+    rbit := 0
+    while x < i.width do
+      i.fmt.unpack(@i.fmt, iadr, ibit, @ipix)
+      j.fmt.unpack(@j.fmt, jadr, jbit, @jpix)
+      for k := 0 to 3 do
+        rpix[k] := Clamp[val(int16, ord(ipix[k])) + val(int16, ord(jpix[k]))]
+      end
+
+      res.fmt.pack(@res.fmt, radr, rbit, @rpix)
+      ibit := ibit + i.fmt.bpp
+      inc(iadr, ibit)
+      ibit := band(ibit, 7)
+      jbit := jbit + j.fmt.bpp
+      inc(jadr, jbit)
+      jbit := band(jbit, 7)
+      rbit := rbit + res.fmt.bpp
+      inc(radr, rbit)
+      rbit := band(rbit, 7)
+      inc(x)
+    end
+
+    inc(y)
+  end
+end Add
+
+// copy image to another using error diffusion dithering (Floyd-Steinberg) *
+procedure Dither*(src, dst: Image)
+
+  type
+    error = record
+      r, g, b: int16
+    end
+
+  var
+    e351: pointer to array of error
+    y, x, ex, e, e3, e5: int16
+    sadr, dadr, sa: AnyPtr
+    sb: int32
+    da: AnyPtr
+    db: int32
+    e7, e51, e1: error
+    spix, dpix: Pixel
+begin
+  assert((src.width <= dst.width) & (src.height <= dst.height))
+  newgc(e351, src.width + 2) // accumulated error for next row
+  y := 0
+  sadr := src.adr
+  dadr := dst.adr
+  while y < src.height do
+    // scan from left to right
+    e7.r := 0
+    e7.g := 0
+    e7.b := 0
+    e51.r := 0
+    e51.g := 0
+    e51.b := 0
+    e1.r := 0
+    e1.g := 0
+    e1.b := 0
+    x := 0
+    sa := sadr
+    sb := 0
+    da := dadr
+    db := 0
+    while x < src.width do
+      ex := x + 1
+      src.fmt.unpack(@src.fmt, sa, sb, @spix)
+      spix[r] := Clamp[512 + val(int16, ord(spix[r])) + e351[ex].r + e7.r]
+      spix[g] := Clamp[512 + val(int16, ord(spix[g])) + e351[ex].g + e7.g]
+      spix[b] := Clamp[512 + val(int16, ord(spix[b])) + e351[ex].b + e7.b]
+      dst.fmt.pack(@dst.fmt, da, db, @spix)
+      dst.fmt.unpack(@dst.fmt, da, db, @dpix)
+      e := val(int16, ord(spix[r])) - val(int16, ord(dpix[r]))
+      e3 := asr(3 * e, 4)
+      e5 := asr(5 * e, 4)
+      e7.r := asr(7 * e, 4)
+      e351[x].r := e3 + e51.r
+      e51.r := e5 + e1.r
+      e1.r := e - e3 - e5 - e7.r
+      e := val(int16, ord(spix[g])) - val(int16, ord(dpix[g]))
+      e3 := asr(3 * e, 4)
+      e5 := asr(5 * e, 4)
+      e7.g := asr(7 * e, 4)
+      e351[x].g := e3 + e51.g
+      e51.g := e5 + e1.g
+      e1.g := e - e3 - e5 - e7.g
+      e := val(int16, ord(spix[b])) - val(int16, ord(dpix[b]))
+      e3 := asr(3 * e, 4)
+      e5 := asr(5 * e, 4)
+      e7.b := asr(7 * e, 4)
+      e351[x].b := e3 + e51.b
+      e51.b := e5 + e1.b
+      e1.b := e - e3 - e5 - e7.b
+      sb := sb + src.fmt.bpp
+      inc(sa, asr(sb, 3))
+      sb := band(sb, 7)
+      db := db + dst.fmt.bpp
+      inc(da, asr(db, 3))
+      db := band(db, 7)
+      x := ex
+    end
+
+    inc(y)
+    inc(sadr, src.bpr)
+    inc(dadr, dst.bpr)
+    if y < src.height then
+      // scan from right to left
+      e351[x] := e51
+      e7.r := 0
+      e7.g := 0
+      e7.b := 0
+      e51.r := 0
+      e51.g := 0
+      e51.b := 0
+      e1.r := 0
+      e1.g := 0
+      e1.b := 0
+      inc(sa, src.bpr)
+      inc(da, dst.bpr)
+      while x > 0 do
+        ex := x
+        dec(x)
+        sb := sb - src.fmt.bpp
+        inc(sa, asr(sb, 3))
+        sb := band(sb, 7)
+        db := db - dst.fmt.bpp
+        inc(da, asr(db, 3))
+        db := band(db, 7)
+        src.fmt.unpack(@src.fmt, sa, sb, @spix)
+        spix[r] := Clamp[512 + val(int16, ord(spix[r])) + e351[ex].r + e7.r]
+        spix[g] := Clamp[512 + val(int16, ord(spix[g])) + e351[ex].g + e7.g]
+        spix[b] := Clamp[512 + val(int16, ord(spix[b])) + e351[ex].b + e7.b]
+        dst.fmt.pack(@dst.fmt, da, db, @spix)
+        dst.fmt.unpack(@dst.fmt, da, db, @dpix)
+        inc(ex)
+        e := val(int16, ord(spix[r])) - val(int16, ord(dpix[r]))
+        e3 := asr(3 * e, 4)
+        e5 := asr(5 * e, 4)
+        e7.r := asr(7 * e, 4)
+        e351[x].r := e3 + e51.r
+        e51.r := e5 + e1.r
+        e1.r := e - e3 - e5 - e7.r
+        e := val(int16, ord(spix[g])) - val(int16, ord(dpix[g]))
+        e3 := asr(3 * e, 4)
+        e5 := asr(5 * e, 4)
+        e7.g := asr(7 * e, 4)
+        e351[x].g := e3 + e51.g
+        e51.g := e5 + e1.g
+        e1.g := e - e3 - e5 - e7.g
+        e := val(int16, ord(spix[b])) - val(int16, ord(dpix[b]))
+        e3 := asr(3 * e, 4)
+        e5 := asr(5 * e, 4)
+        e7.b := asr(7 * e, 4)
+        e351[x].b := e3 + e51.b
+        e51.b := e5 + e1.b
+        e1.b := e - e3 - e5 - e7.b
+      end
+
+      e351[1] := e51
+      inc(y)
+      inc(sadr, src.bpr)
+      inc(dadr, dst.bpr)
+    end
+  end
+end Dither
+
+// --- Image Objects ---*
+
+// write image to file rider *
+procedure Write*(fr: pointer to Files.Rider; img: Image)
+  var
+    m: Image
+    h: int32
+    adr: AnyPtr
+    w: int32
+    aa: AnyPtr
+    len_: int32
+    buf: array 256 of char
+begin
+  if ~(img.fmt.code in {a1..bgra8888}) then
+    newgc(m)
+    if img.fmt.components = {color} then
+      Create(m, img.width, img.height, @BGR888)
+    elsif img.fmt.components = {alpha} then
+      Create(m, img.width, img.height, @A8)
+    elsif img.fmt.components = {index} then
+      Create(m, img.width, img.height, @D8)
+    else
+      Create(m, img.width, img.height, @BGRA8888)
+    end
+
+    Copy(img, m, 0, 0, img.width, img.height, 0, 0, @SrcCopy)
+    img := m
+  end
+
+  Files.WriteNum(fr, 1) // version
+  Files.WriteNum(fr, img.fmt.code)
+  Files.WriteNum(fr, img.width)
+  Files.WriteNum(fr, img.height)
+  Files.WriteNum(fr, abs(img.bpr))
+  h := img.height
+  adr := img.adr
+  while h > 0 do
+    w := abs(img.bpr)
+    aa := adr
+    while w > 0 do
+      len_ := 256
+      if len_ > w then
+        len_ := w
+      end
+      SYS.MOVE(aa, cast(AnyPtr, @buf[0]), len_)
+      Files.WriteBytes(fr, cast(BytesPtr, @buf), 256, len_)
+      dec(w, len_)
+      inc(aa, len_)
+    end
+
+    dec(h)
+    inc(adr, img.bpr)
+  end
+
+  if img.fmt.code = p8 then
+    Files.WriteInt(fr, img.fmt.pal.used)
+    len_ := 0
+    while len_ < img.fmt.pal.used do
+      Files.Write(fr, val(byte, ord(img.fmt.pal.col[len_][r])))
+      Files.Write(fr, val(byte, ord(img.fmt.pal.col[len_][g])))
+      Files.Write(fr, val(byte, ord(img.fmt.pal.col[len_][b])))
+      inc(len_)
+    end
+  end
+end Write
+
+// read image from file rider *
+procedure Read*(fr: pointer to Files.Rider; img: Image)
+  var
+    ver, code, w, h, bpr: int32
+    adr, aa: AnyPtr
+    len_: int32
+    fmt: Format
+    buf: array 256 of char
+    used: int16
+begin
+  Files.ReadNum(fr, @ver) // only know version 1, skip check
+  Files.ReadNum(fr, @code)
+  case code of
+    1 (* a1 *):
+    fmt := A1
+  | 2 (* a8 *):
+    fmt := A8
+  | 4 (* p8 *):
+    InitFormat(@fmt, p8, 8, 1, {index}, nil, PackP8, UnpackP8)
+  | 3 (* d8 *):
+    fmt := D8
+  | 5 (* bgr555 *):
+    fmt := BGR555
+  | 6 (* bgr565 *):
+    fmt := BGR565
+  | 7 (* bgr466 *):
+    fmt := BGR466
+  | 8 (* bgr888 *):
+    fmt := BGR888
+  | 9 (* bgra8888 *):
+    fmt := BGRA8888
+  end
+
+  Files.ReadNum(fr, @w)
+  Files.ReadNum(fr, @h)
+  Create(img, val(int16, w), val(int16, h), @fmt)
+  Files.ReadNum(fr, @bpr)
+  assert(bpr <= img.bpr)
+  adr := img.adr
+  while h > 0 do
+    w := bpr
+    aa := adr
+    while w > 0 do
+      len_ := 256
+      if len_ > w then
+        len_ := w
+      end
+      Files.ReadBytes(fr, cast(BytesPtr, @buf), 256, len_)
+      SYS.MOVE(cast(AnyPtr, @buf[0]), aa, len_)
+      dec(w, len_)
+      inc(aa, len_)
+    end
+
+    dec(h)
+    inc(adr, img.bpr)
+  end
+
+  if code = p8 then
+    Files.ReadInt(fr, @used)
+    len_ := 0
+    newgc(img.fmt.pal)
+    while len_ < used do
+      Files.Read(fr, cast(BytePtr, @img.fmt.pal.col[len_][r]))
+      Files.Read(fr, cast(BytePtr, @img.fmt.pal.col[len_][g]))
+      Files.Read(fr, cast(BytePtr, @img.fmt.pal.col[len_][b]))
+      img.fmt.pal.col[len_][a] := 0FFX
+      inc(len_)
+    end
+
+    InitPalette(img.fmt.pal, used, 4)
+  end
+end Read
+
+// image handler *
+procedure Handle*(obj: Objects.Object; msg: pointer to Objects.ObjMsg)
+  var
+    img, copy_: Image
+    lib: Objects.Library
+    ref: int16
+begin
+  img := obj(Image)
+  case msg of
+  | Objects.PAttrMsg:
+    if msg.id = Objects.enum then
+      msg.Enum("Width")
+      msg.Enum("Height")
+    elsif msg.id = Objects.get then
+      if msg.name = "Gen" then
+        msg.class := Objects.String
+        copy(@msg.s, "Images.New", 64)
+        msg.res := 0
+      elsif msg.name = "Width" then
+        msg.class := Objects.Int
+        msg.i := img.width
+        msg.res := 0
+      elsif msg.name = "Height" then
+        msg.class := Objects.Int
+        msg.i := img.height
+        msg.res := 0
+      end
+    end
+
+  | Objects.PCopyMsg:
+    if msg.stamp # img.stamp then
+      newgc(copy_)
+      img.dlink := copy_
+      img.stamp := msg.stamp
+      Create(copy_, img.width, img.height, @img.fmt)
+      if img.fmt.pal # nil then
+        newgc(copy_.fmt.pal)
+        copy_.fmt.pal.col := img.fmt.pal.col
+        InitPalette(copy_.fmt.pal, img.fmt.pal.used, img.fmt.pal.bits_)
+        Copy(img, copy_, 0, 0, img.width, img.height, 0, 0, @SrcCopy)
+      end
+    end
+
+    msg.obj := img.dlink
+
+  | Objects.PBindMsg:
+    lib := msg(Objects.PBindMsg).lib
+    if lib # nil then
+      if (img.lib = nil) or (img.lib.name[0] = 0X) & (img.lib # lib) then
+        lib.GenRef(lib, @ref)
+        if ref >= 0 then
+          lib.PutObj(lib, ref, img)
+        end
+      end
+    end
+
+  | Objects.PFileMsg:
+    if msg.id = Objects.store then
+      Write(@msg.R, img)
+    elsif msg.id = Objects.load then
+      Read(@msg.R, img)
+    end
+
+  end
+end Handle
+
+// image generator *
+procedure New*()
+  var
+    img: Image
+begin
+  newgc(img)
+  img.handle := Handle
+  Objects.NewObj := img
+end New
+
+// update part of an image *
+procedure Update*(img: Image; llx, lly, urx, ury: int16)
+  var
+    um: UpdateMsg
+begin
+  um.F := nil
+  um.img := img
+  um.llx := llx
+  um.lly := lly
+  um.urx := urx
+  um.ury := ury
+  Display.Broadcast(@um)
+end Update
+
+// --- Initialization ---
+
+procedure InitBitTables()
+  var
+    b, i: int32
+begin
+  for b := 0 to 255i2 do
+    for i := 0 to 7 do
+      if ((asr(b, usig(7 - i)) mod 2) # 0) then
+        Bit[b][i] := true
+        Set[b][i] := chr(b)
+        Clr[b][i] := chr(b - sigc(shl(val(int32, 1), usig(7 - i))))
+      else
+        Bit[b][i] := false
+        Set[b][i] := chr(b + sigc(shl(val(int32, 1), usig(7 - i))))
+        Clr[b][i] := chr(b)
+      end
+    end
+  end
+end InitBitTables
+
+procedure InitClamp()
+  var
+    i: int32
+begin
+  for i := 0 to 511 do
+    Clamp[i] := 0X
+  end
+  for i := 0 to 255i2 do
+    Clamp[512 + i] := chr(i)
+  end
+  for i := 768 to 1279 do
+    Clamp[i] := 0FFX
+  end
+end InitClamp
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "New" end return New end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Images", cmd_)
+  Out.String("Images 1.03/eos 22.06.2000")
+  Out.Ln()
+  InitFormat(@A1, a1, 1, 1, {alpha}, nil, PackA1, UnpackA1)
+  InitFormat(@A8, a8, 8, 1, {alpha}, nil, PackA8, UnpackA8)
+  InitFormat(@D8, d8, 8, 1, {index}, nil, PackD8, UnpackD8)
+  InitFormat(@BGR555, bgr555, 16, 2, {color}, nil, PackBGR555, UnpackBGR555)
+  InitFormat(@BGR565, bgr565, 16, 2, {color}, nil, PackBGR565, UnpackBGR565)
+  InitFormat(@BGR466, bgr466, 16, 2, {color}, nil, PackBGR466, UnpackBGR466)
+  InitFormat(@BGR888, bgr888, 24, 4, {color}, nil, PackBGR888, UnpackBGR888)
+  InitFormat(@BGRA8888, bgra8888, 32, 4, {color,alpha}, nil, PackBGRA8888, UnpackBGRA8888)
+  PixelFormat := BGRA8888
+  case Display.TransferFormat(Display.ColLeft) of
+    16 (* Display.color555 *):
+    DisplayFormat := BGR555
+  | 17 (* Display.color565 *):
+    DisplayFormat := BGR565
+  | 18 (* Display.color664 *):
+    DisplayFormat := BGR466
+  | 24 (* Display.color888 *):
+    DisplayFormat := BGR888
+  | 32 (* Display.color8888 *):
+    DisplayFormat := BGRA8888
+  else
+    DisplayFormat := D8
+  end
+
+  InitMode(@SrcCopy, srcCopy)
+  InitMode(@SrcOverDst, srcOverDst)
+  InitBitTables()
+  InitClamp()
+  Zero[0] := 0X
+  Zero[1] := 0X
+  Zero[2] := 0X
+  Zero[3] := 0X
+end Images.

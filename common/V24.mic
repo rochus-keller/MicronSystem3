@@ -1,0 +1,133 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module V24 [level=5]
+
+import Kernel, Modules
+// portable
+// pjm/ejz/me@rochus-keller.ch
+
+// V24/RS232 serial communications interface, all stubs
+
+// port aliases  (check with NumberOfPorts)
+
+const
+  COM1* = 0
+  COM2* = 1
+  COM3* = 2
+  COM4* = 3
+
+  // parity
+  ParNo* = 0
+  ParOdd* = 1
+  ParEven* = 2
+  ParMark* = 3
+  ParSpace* = 4
+  // stop bits
+  Stop1* = 1
+  Stop2* = 2
+  Stop1dot5* = 3
+  // modem control - MC
+  DTR* = 0 // output
+  RTS* = 1
+  Break* = 2 // input/output
+  DSR* = 3 // input
+  CTS* = 4
+  RI* = 5
+  DCD* = 6
+
+  Ok* = 0
+  PortInUse* = 1
+  NoSuchPort* = 2
+  WrongBPS* = 3
+  WrongData* = 4
+  WrongParity* = 5
+  WrongStop* = 6
+  Failed* = 32767
+
+// NumberOfPorts - Return the number of ports present - 0 to 4.
+
+procedure NumberOfPorts*(): int32
+begin
+  return 0
+end NumberOfPorts
+
+(** Start - Open a serial port (numbered from 0).  bps is the required bits per second.
+data is the number of bits per communication unit.  parity is the parity mode (Par
+values above).  stop is the number of stop bits (Stop values above).  res returns 0
+if ok, or error code on error.  1 means port already in use.  2 means no such port.
+3 means bad bps value.  4 means bad data/parity/stop.   DTR and RTS are enabled. *)
+
+procedure Start*(port, bps, data, parity, stop: int32; res: pointer to int32)
+begin
+  res^ := NoSuchPort // no such port
+end Start
+
+// Stop - Close the specified port.  Effect on Modem Control lines is undefined.
+
+procedure Stop*(port: int32)
+begin
+end Stop
+
+// Available - Return the number of bytes available in the specified port's buffer.
+
+procedure Available*(port: int32): int32
+begin
+  return 0
+end Available
+
+// Receive - Read one byte from the specified port.  Waits until a byte is available.  res = Ok iff ok.
+
+procedure Receive*(port: int32; x: pointer to byte; res: pointer to int32)
+begin
+  res^ := Ok
+end Receive
+
+// ReceiveBytes - Read n bytes from the specified port.  Waits until n bytes are available.  res = Ok iff ok.
+
+procedure ReceiveBytes*(port: int32; x: pointer to array of byte; n: int32; res: pointer to int32)
+begin
+end ReceiveBytes
+
+// Send - Send a byte to the specified port.  Waits until buffer space is available.  res = Ok iff ok.
+
+procedure Send*(port: int32; x: byte; res: pointer to int32)
+begin
+end Send
+
+// SendBytes - Send n bytes to the specified port.  Waits until buffer space is available.  res = Ok iff all ok.
+
+procedure SendBytes*(port: int32; x: pointer to array of byte; n: int32; res: pointer to int32)
+begin
+end SendBytes
+
+// ClearMC - Clear the specified Modem Control lines of the specified port.  s may contain DTR, RTS & Break.
+
+procedure ClearMC*(port: int32; s: set)
+begin
+end ClearMC
+
+// SetMC - Set the specified Modem Control lines of the specified port.  s may contain DTR, RTS & Break.
+
+procedure SetMC*(port: int32; s: set)
+begin
+end SetMC
+
+(** GetMC - Return the state of the specified Modem Control lines of the specified port.  s contains
+the current state of DSR, CTS, RI, DCD & Break. *)
+
+procedure GetMC*(port: int32; s: pointer to set)
+begin
+end GetMC
+
+// Attempt to detect a serial port at the specified I/O base address.
+
+procedure Present*(base: int32): boolean
+begin
+  return false
+end Present
+
+// non-portable
+begin
+  Modules.Register("V24", nil)
+end V24.

@@ -1,0 +1,353 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module ColorModels [level=5]
+
+import Display, Objects, Texts, Oberon, Strings, Modules
+// portable
+// by W. Ibl
+
+const
+  RGBtop = 255 // current RGB value maximum
+
+// a color symbol contains the color description
+
+type
+  ColorSym = pointer to ColorSymDesc
+  ColorSymDesc = record
+    name: Objects.Name // color name
+    x: real // color parameters, RGB, HSV or CMY
+    y, z: real
+    next: ColorSym // next color symbol
+  end
+
+var
+  RGBcolor: ColorSym // supported color symbols
+  HSVcolor, CMYcolor: ColorSym
+  depth: int16 // current color depth
+  dr: array 256 (* RGBtop + 1i2 *) of int16 // current color tables
+  dg, db: array 256 (* RGBtop + 1i2 *) of int16
+
+procedure LoadPalette(d: pointer to int16; r, g, b: pointer to array of int16)
+  // scan the currently loaded RGB values of the palette
+
+  var
+    i: int16
+begin
+  d^ := val(int16, sigc(shl(val(int32, 1), usig(val(int32, Display.Depth(0))))) - 1)
+  for i := 0 to d^ do
+    Display.GetColor(i, @dr[i], @dg[i], @db[i])
+  end
+end LoadPalette
+
+procedure LoadColorSymbols(sym: pointer to ColorSym; const model: pointer to array of char)
+  (* Parse Oberon.Text for color names. The chapter is "ColorSystem", model
+  specifies the section *)
+
+  var
+    system: Objects.Name
+    col, last: ColorSym
+    S: Texts.Scanner
+    x, y, z: real
+begin
+  sym^ := nil
+  last := nil
+  copy(@system, "ColorSystem.", 32)
+  Strings.Append(@system, 32, model)
+  Oberon.OpenScanner(@S, @system)
+  if S.class # Texts.Inval then
+    while ~S.eot & (S.class in {Texts.Name,Texts.String}) do
+      newgc(col)
+      copy(@col.name, @S.s, 32)
+      Texts.Scan(@S)
+      if (S.class = Texts.Char) & (S.c = "=") then
+        Texts.Scan(@S)
+      end
+      if (S.class = Texts.Char) & (S.c = "{") then
+        Texts.Scan(@S)
+      end
+      if S.class = Texts.Real then
+        x := S.x
+        Texts.Scan(@S)
+      end
+      if S.class = Texts.Real then
+        y := S.x
+        Texts.Scan(@S)
+      end
+      if S.class = Texts.Real then
+        z := S.x
+        Texts.Scan(@S)
+      end
+      if (S.class = Texts.Char) & (S.c = "}") then
+        Texts.Scan(@S)
+      end
+      col.x := x
+      col.y := y
+      col.z := z
+      col.next := nil
+      if last = nil then
+        sym^ := col
+      else
+        last.next := col
+      end
+      last := col
+    end
+  end
+end LoadColorSymbols
+
+procedure FindColorSymbol(sym: ColorSym; const s: pointer to array of char): ColorSym
+begin
+  // find the colorsymbol s in the symbol list sym, returns NIL if not found
+
+  while (sym # nil) & ~Strings.CAPCompare(@sym.name, s) do
+    sym := sym.next
+  end
+  return sym
+end FindColorSymbol
+
+(** Searches in ColorSymbols.RGB of Oberon.Text for color S and returns the associated RGB values.
+ok is set to TRUE if S has been found and to FALSE otherwise. r, g and b are left unchanged if ok is FALSE. *)
+procedure StrToRGB*(const S: pointer to array of char; r, g, b: pointer to real; ok: pointer to boolean)
+
+  var
+    sym: ColorSym
+begin
+  if RGBcolor = nil then
+    LoadColorSymbols(@RGBcolor, "RGB")
+  end
+  sym := FindColorSymbol(RGBcolor, S)
+  ok^ := sym # nil
+  if ok^ then
+    r^ := sym.x
+    g^ := sym.y
+    b^ := sym.z
+  end
+end StrToRGB
+
+(** Searches in ColorSymbols.HSV of Oberon.Text for color S and returns the associated HSV values.
+ok is set to TRUE if S has been found and to FALSE otherwise. h, s and v are left unchanged if ok is FALSE. *)
+procedure StrToHSV*(const S: pointer to array of char; h, s, v: pointer to real; ok: pointer to boolean)
+
+  var
+    sym: ColorSym
+begin
+  if HSVcolor = nil then
+    LoadColorSymbols(@HSVcolor, "HSV")
+  end
+  sym := FindColorSymbol(HSVcolor, S)
+  ok^ := sym # nil
+  if ok^ then
+    h^ := sym.x
+    s^ := sym.y
+    v^ := sym.z
+  end
+end StrToHSV
+
+(** Searches in ColorSymbols.CMY of Oberon.Text for color S and returns the associated CMY values.
+ok is set to TRUE if S has been found and to FALSE otherwise. c, m and y are left unchanged if ok is FALSE. *)
+procedure StrToCMY*(const S: pointer to array of char; c, m, y: pointer to real; ok: pointer to boolean)
+
+  var
+    sym: ColorSym
+begin
+  if CMYcolor = nil then
+    LoadColorSymbols(@CMYcolor, "CMY")
+  end
+  sym := FindColorSymbol(CMYcolor, S)
+  ok^ := sym # nil
+  if ok^ then
+    c^ := sym.x
+    m^ := sym.y
+    y^ := sym.z
+  end
+end StrToCMY
+
+// convert a RedGreenBlue color specification to HueSaturationValue
+procedure RGBToHSV*(r, g, b: real; h, s, v: pointer to real)
+
+  var
+    m, rl, gl, bl: real
+begin
+  if g > b then
+    // set v
+    if r > g then
+      v^ := r
+    else
+      v^ := g
+    end
+  else
+    if r > b then
+      v^ := r
+    else
+      v^ := b
+    end
+  end
+
+  if g < b then
+    if r < g then
+      m := r
+    else
+      m := g
+    end
+  else
+    if r < b then
+      m := r
+    else
+      m := b
+    end
+  end
+
+  if v^ # 0.0 then
+    s^ := (v^ - m) / v^ // set s
+  else
+    s^ := 0.0
+  end
+  if s^ # 0.0 then
+    rl := (v^ - r) / (v^ - m) // distance of color from red
+    gl := (v^ - g) / (v^ - m) // distance of color from green
+    bl := (v^ - b) / (v^ - m) // distance of color from blue
+    if v^ = r then
+      if m = g then
+        h^ := 5.0 + bl
+      else
+        h^ := 1.0 - gl
+      end
+    end
+    if v^ = g then
+      if m = b then
+        h^ := 1.0 + rl
+      else
+        h^ := 3.0 - bl
+      end
+    elsif m = r then
+      h^ := 3.0 + gl
+    else
+      h^ := 5.0 - rl
+    end
+
+    h^ := h^ * 60.0
+  else
+    h^ := 0.0
+  end
+end RGBToHSV
+
+// convert a HueSaturationValue color specification to RedGreenBlue
+procedure HSVToRGB*(h, s, v: real; r, g, b: pointer to real)
+
+  var
+    i: int32
+    f, p1, p2, p3: real
+begin
+  if h = 360.0 then
+    h := 0.0 // convert h to be in [0,6]
+  else
+    h := h / 60.0
+  end
+  i := val(int32, floor(h))
+  f := h - val(real, i)
+  p1 := v * (1.0 - s)
+  p2 := v * (1.0 - s * f)
+  p3 := v * (1.0 - s * (1.0 - f))
+  case i of
+    0:
+    r^ := v
+    g^ := p3
+    b^ := p1
+  | 1:
+    r^ := p2
+    g^ := v
+    b^ := p1
+  | 2:
+    r^ := p1
+    g^ := v
+    b^ := p3
+  | 3:
+    r^ := p1
+    g^ := p2
+    b^ := v
+  | 4:
+    r^ := p3
+    g^ := p1
+    b^ := v
+  | 5:
+    r^ := v
+    g^ := p1
+    b^ := p2
+  end
+end HSVToRGB
+
+// convert a RedGreenBlue color specification to CyanMagentaYellow
+procedure RGBToCMY*(r, g, b: real; c, m, y: pointer to real)
+begin
+  c^ := 1.0 - r
+  m^ := 1.0 - g
+  y^ := 1.0 - b
+end RGBToCMY
+
+// convert a CyanMagentaYellow color specification to RedGreenBlue
+procedure CMYToRGB*(c, m, y: real; r, g, b: pointer to real)
+begin
+  r^ := 1.0 - c
+  g^ := 1.0 - m
+  b^ := 1.0 - y
+end CMYToRGB
+
+(** transform a RedGreenBlue color specification to Display values,
+no color transformation is done. *)
+procedure RGBToColor*(r, g, b: real; R, G, B: pointer to int16)
+begin
+  R^ := val(int16, val(int16, floor(r * val(real, RGBtop))))
+  G^ := val(int16, val(int16, floor(g * val(real, RGBtop))))
+  B^ := val(int16, val(int16, floor(b * val(real, RGBtop))))
+end RGBToColor
+
+(** transform a RedGreenBlue color specification to a Display value, which is currently part of the palette.
+Color transformation is performed by using the euclidic distance.
+If scanpal is TRUE, the currently active palette is rescanned, otherwise the latest loaded values are used.
+With C the index of the best fitting palette entry is returned, R,G and B hold the RGB values of C *)
+procedure RGBToPalette*(r, g, b: real; C, R, G, B: pointer to int16; scanpal: boolean)
+
+  var
+    i: int16
+    d, m, x, y, z: real
+begin
+  C^ := -1
+  R^ := -1
+  G^ := -1
+  B^ := -1
+  m := val(real, 3.40282347E38)
+  if scanpal or (depth = -1) then
+    LoadPalette(@depth, @dr, @dg, @db)
+  end
+  for i := 0 to depth do
+    x := abs(r - val(real, dr[i]) / val(real, RGBtop))
+    y := abs(g - val(real, dg[i]) / val(real, RGBtop))
+    z := abs(b - val(real, db[i]) / val(real, RGBtop))
+    d := x
+    if y > d then
+      d := y
+    end
+    if z > d then
+      d := z
+    end
+    d := d * d + (x * x + y * y + z * z)
+    if d < m then
+      m := d
+      C^ := i
+    end
+  end
+
+  if C^ # -1 then
+    R^ := dr[C^]
+    G^ := dg[C^]
+    B^ := db[C^]
+  end
+end RGBToPalette
+
+begin
+  Modules.Register("ColorModels", nil)
+  RGBcolor := nil
+  HSVcolor := nil
+  CMYcolor := nil
+  depth := -1
+end ColorModels.

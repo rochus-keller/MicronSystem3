@@ -1,0 +1,2641 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module ListGadgets [level=5]
+
+import Files, Strings, Input, Display, Display3, Printer, Printer3, Objects, Links, Attributes, Fonts, Texts, Oberon, Effects, Gadgets, ListRiders, Modules
+// portable
+// ps,
+
+const
+  Version = 1
+  FoldSize = 7
+  ScrollLag = 10
+  // some char
+  LArrow = 0C4X
+  RArrow = 0C3X
+  UArrow = 0C1X
+  DArrow = 0C2X
+  CR = 0DX
+  UPage = 0A2X
+  DPage = 0A3X
+  Home = 0A8X
+  End = 0A9X
+
+  // data states
+  Pointed = 1
+
+  // frame states
+  inclpath* = 0
+  multisel* = 1
+  extendsel* = 2
+  exponpoint* = 3
+  locked* = 4
+
+type
+  Frame* = pointer to FrameDesc
+  Line* = pointer to LineDesc
+  Method* = pointer to MethodBlock
+
+  // used to identify position of line in list
+  Loc* = record
+    line*: Line // which line
+    y*: int16 // line's y relative to top of frame
+  end
+
+  LineDesc* = record
+    next*: Line // ring from top to bottom, with sentinel
+    prev*: Line
+    key*: int32 // key of represented item
+    dx*: int16 // true text metrics
+    w*, h*, dsr*, n*: int16 // N: line number / lev: ident level
+    lev*: int16
+    sel*: boolean // line is selected or not
+    folded*: boolean // line's desc. are visible (unfolded)
+    hasSub: boolean // line has desc.
+  end
+
+  MethodBlock* = record
+    GetRider*: procedure(F: Frame; new_: boolean): ListRiders.Rider
+    Format*: procedure(F: Frame; R: ListRiders.Rider; L: Line)
+    Display*: procedure(F: Frame; Q: Display3.Mask; x: int16; y: int16; w: int16; h: int16; R: ListRiders.Rider; L: Line)
+    PrintFormat*: procedure(F: Frame; R: ListRiders.Rider; L: Line)
+    Print*: procedure(F: Frame; Q: Display3.Mask; x: int16; y: int16; w: int16; h: int16; R: ListRiders.Rider; L: Line)
+  end
+
+  FrameDesc* = object (Gadgets.FrameDesc)
+    R*: ListRiders.Rider
+    state0*: set
+    time*: int32
+    left*, right*, top*, bottom*, hoff, levs, tab*, textC*, pointC*, backC*: int16
+
+    lines*: Line // sentinel
+    first, point: Line
+    vPos, vMax, hPos, hMax: Objects.Object
+
+    do_*: Method
+    fnt*: Fonts.Font
+
+    car*: boolean
+    carloc*: Loc
+    sel*: boolean
+  end
+
+  CaretMsg = object (Display.FrameMsg)
+    carY: int16
+  end
+  PCaretMsg = pointer to CaretMsg
+
+var
+  methods*: Method
+  WaitTime, mayscroll: int32
+  W: Texts.Writer
+  pointText: Texts.Text
+  saved: Oberon.CaretMsg
+
+// ------------ aux. procs ------------
+procedure P(x: int32): int16
+begin
+  return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+end P
+
+procedure TimeOk(): boolean
+begin
+  if Oberon.Time() - mayscroll <= 0 then
+    return false
+  else
+    mayscroll := Oberon.Time() + WaitTime
+    return true
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end TimeOk
+
+procedure ValueToStr(d: ListRiders.Data; str: pointer to array of char; str_len: int32)
+begin
+  if d = nil then
+    copy(str, "EMPTY", str_len)
+  else
+    case d of
+    | ListRiders.String:
+      copy(str, @d(ListRiders.String).s, str_len)
+    | ListRiders.Int:
+      Strings.IntToStr(d(ListRiders.Int).i, str, str_len)
+    | ListRiders.Real:
+      Strings.RealToStr(val(longreal, d(ListRiders.Real).x), str, str_len)
+    | ListRiders.LReal:
+      Strings.RealToStr(d(ListRiders.LReal).x, str, str_len)
+    | ListRiders.Bool:
+      Strings.BoolToStr(d(ListRiders.Bool).b, str, str_len)
+    | ListRiders.Char:
+      str[0] := d(ListRiders.Char).c
+      str[1] := 0X
+    else
+      copy(str, "UNKNOWN DATA", str_len)
+    end
+  end
+end ValueToStr
+
+procedure ClipAgainst(x, y, w, h: pointer to int16; X, Y, W, H: int16)
+  var
+    r, t: int16
+begin
+  r := x^ + w^
+  t := y^ + h^
+  if x^ < X then
+    x^ := X
+  end
+  if y^ < Y then
+    y^ := Y
+  end
+  if r > X + W then
+    r := X + W
+  end
+  if t > Y + H then
+    t := Y + H
+  end
+  w^ := r - x^
+  h^ := t - y^
+end ClipAgainst
+
+procedure DrawFold*(Q: Display3.Mask; x, y, dim, col: int16; folded: boolean)
+  var
+    h, half: int16
+begin
+  half := asr(dim, 1)
+  h := 1 + 2 * half
+  if folded then
+    inc(x, asr(dim, 2))
+    dec(y, half)
+    while h > 0 do
+      Display3.ReplConst(Q, col, x, y, 1, h, Display3.replace)
+      inc(x)
+      inc(y)
+      dec(h, 2)
+    end
+
+  else
+    inc(y, asr(dim, 2) + 1)
+    while h > 0 do
+      Display3.ReplConst(Q, col, x, y, h, 1, Display3.replace)
+      inc(x)
+      dec(y)
+      dec(h, 2)
+    end
+  end
+end DrawFold
+
+procedure PrintFold*(Q: Display3.Mask; x, y, dim, col: int16; folded: boolean)
+  var
+    h, half: int16
+begin
+  half := asr(dim, 1)
+  h := 1 + 2 * half
+  if folded then
+    dec(y, half)
+    while h > 0 do
+      Printer3.ReplConst(Q, col, x, y, 1, h, Display3.replace)
+      inc(x)
+      inc(y)
+      dec(h, 2)
+    end
+
+  else
+    inc(y, asr(dim, 2) + 1)
+    while h > 0 do
+      Printer3.ReplConst(Q, col, x, y, h, 1, Display3.replace)
+      inc(x)
+      dec(y)
+      dec(h, 2)
+    end
+  end
+end PrintFold
+
+procedure SetVPos(F: Frame; update: boolean)
+begin
+  if F.vPos # nil then
+    if (F.first = nil) or (F.first = F.lines) then
+      Attributes.SetInt(F.vPos, "Value", 0)
+    else
+      Attributes.SetInt(F.vPos, "Value", F.first.n)
+    end
+
+    Gadgets.Update(F.vPos)
+  elsif update then
+    Gadgets.Update(F)
+  end
+end SetVPos
+
+procedure SetVRange(F: Frame)
+  var
+    L: Line
+begin
+  if F.vMax # nil then
+    L := F.lines.prev
+    if L.n <= 0 then
+      Attributes.SetInt(F.vMax, "Value", 0)
+    else
+      Attributes.SetInt(F.vMax, "Value", L.n)
+    end
+
+    Gadgets.Update(F.vMax)
+  end
+end SetVRange
+
+procedure SetHPos(F: Frame)
+begin
+  if F.hPos # nil then
+    Attributes.SetInt(F.hPos, "Value", obdiv(F.hoff, F.tab))
+    Gadgets.Update(F.hPos)
+  end
+end SetHPos
+
+procedure SetHRange(F: Frame)
+begin
+  if F.hMax # nil then
+    Attributes.SetInt(F.hMax, "Value", F.levs)
+    Gadgets.Update(F.hMax)
+  end
+end SetHRange
+
+procedure FormatLevel(F: Frame; R: ListRiders.Rider; level: int16; L: Line)
+  var
+    last: Line
+    stamp: int32
+    n: int16
+begin
+  stamp := ListRiders.Stamp()
+  n := L.n
+  last := L.next
+  while ~R.eol & (R.do_.GetStamp(R) # stamp) do
+    newgc(L.next)
+    L.next.prev := L
+    L := L.next
+    inc(n)
+    L.n := n
+    L.hasSub := R.dsc
+    L.folded := true
+    L.sel := false
+    L.lev := level
+    L.key := R.do_.Key(R)
+    F.do_.Format(F, R, L)
+    R.do_.SetStamp(R, stamp)
+    R.do_.Set(R, R.do_.Pos(R) + 1)
+  end
+
+  L.next := last
+  last.prev := L
+  // renumber
+  repeat
+    L := L.next
+    inc(n)
+    L.n := n
+  until L = F.lines
+  F.lines.n := -1
+  if F.levs < level then
+    F.levs := level
+    SetHRange(F)
+  end
+end FormatLevel
+
+procedure UpdateLevel(F: Frame; R: ListRiders.Rider; L: pointer to Line; level: int16)
+  var
+    fL: Line
+    stamp, key: int32
+begin
+  R.do_.Set(R, 0)
+  stamp := ListRiders.Stamp()
+  while ~R.eol & (R.do_.GetStamp(R) # stamp) do
+    key := R.do_.Key(R)
+    if L^.key # key then
+      fL := L^
+      while (fL.lev = level) & (fL.key # key) & (fL # F.lines) do
+        fL := fL.next
+      end
+      if (fL.key = key) & (fL.lev = level) then
+        // delete lines between
+        fL.prev := L^.prev
+        L^.prev.next := fL
+        L^ := fL
+      else
+        // insert new line
+        newgc(fL)
+        fL.prev := L^.prev
+        fL.next := L^
+        L^.prev := fL
+        fL.prev.next := fL
+        L^ := fL
+        L^.key := key
+        L^.sel := false
+        L^.lev := level
+      end
+    end
+
+    L^.hasSub := R.dsc
+    L^.folded := true
+    L^.n := L^.prev.n + 1
+    L^.lev := level
+    F.do_.Format(F, R, L^)
+    R.do_.SetStamp(R, stamp)
+    L^ := L^.next
+    if L^.lev > level then
+      if R.dsc then
+        L^.prev.folded := false
+        UpdateLevel(F, R.do_.Desc(R, nil), L, level + 1)
+      else
+        // remove sublevel(s)
+        fL := L^
+        repeat
+          fL := fL.next
+        until (fL.lev = level) or (fL = F.lines)
+        fL.prev := L^.prev
+        L^.prev.next := fL
+        L^ := fL
+      end
+    end
+
+    R.do_.Set(R, R.do_.Pos(R) + 1)
+  end
+
+  if (L^ # F.lines) & (L^.lev = level) then
+    // still lines of same level -> delete them
+    fL := L^
+    repeat
+      fL := fL.next
+    until (fL.lev < level) or (fL = F.lines)
+    fL.prev := L^.prev
+    L^.prev.next := fL
+    L^ := fL
+  end
+
+  if F.levs < level then
+    F.levs := level
+  end
+end UpdateLevel
+
+procedure ReformatFrame(F: Frame)
+  var
+    L: Line
+    R: ListRiders.Rider
+    n, lev: int16
+begin
+  R := F.do_.GetRider(F, true)
+  L := F.lines.next
+  if R # nil then
+    L := F.lines.next
+    R.do_.Seek(R, L.key)
+    lev := L.lev + 1
+    n := 0
+    while L # F.lines do
+      if lev = L.lev then
+        R.do_.Set(R, R.do_.Pos(R) + 1) // step foreward
+      elsif lev > L.lev then
+        R.do_.Seek(R, L.key) // come up
+      else
+        R := R.do_.Desc(R, R) // go down
+      end
+
+      L.n := n
+      inc(n)
+      F.do_.Format(F, R, L)
+      lev := L.lev
+      L := L.next
+    end
+  end
+end ReformatFrame
+
+procedure LocateLine(F: Frame; y, Y: int16; loc: pointer to Loc; cnt: pointer to int16)
+  var
+    py: int16
+    L: Line
+begin
+  py := y + F.H - F.top
+  L := F.first
+  if Y >= py then
+    // above
+    cnt^ := obdiv(py - Y - 1, ScrollLag)
+  elsif Y < y + F.bottom then
+    // below
+    cnt^ := 1 + obdiv(y + F.bottom - Y, ScrollLag)
+    Y := y + F.bottom
+  else
+    // inside
+    cnt^ := 0
+  end
+
+  dec(py, L.h)
+  while (L.next # F.lines) & (Y < py) do
+    L := L.next
+    dec(py, L.h)
+  end
+  loc.line := L
+  loc.y := py - y - F.H
+end LocateLine
+
+procedure LocatePos(F: Frame; L: Line): int16
+  var
+    L0: Line
+    Y: int16
+begin
+  L0 := F.first
+  Y := -F.top - L0.h
+  if L0.n < L.n then
+    repeat
+      L0 := L0.next
+      dec(Y, L0.h)
+    until L0 = L
+  elsif L0.n > L.n then
+    repeat
+      inc(Y, L0.h)
+      L0 := L0.prev
+    until L0 = L
+  end
+
+  return Y
+end LocatePos
+
+procedure NextSelLine(F: Frame; L: Line): Line
+begin
+  repeat
+    L := L.next
+  until L.sel or (L = F.lines)
+  return L
+end NextSelLine
+
+procedure FindParent(F: Frame; L: Line; level: int16): Line
+  var
+    pL: Line
+begin
+  pL := L
+  repeat
+    pL := pL.prev
+  until (pL.lev = level) or (pL = F.lines)
+  return pL
+end FindParent
+
+procedure DeleteLine(F: Frame; R, linkR: ListRiders.Rider; L: Line)
+  var
+    pL: Line
+begin
+  if (linkR # nil) & ~linkR.eol then
+    if (L.lev > 0) & (R # nil) then
+      pL := FindParent(F, L, L.lev - 1)
+      R.do_.Seek(R, pL.key)
+      R.do_.DeleteLink(R, linkR)
+    else
+      R.do_.DeleteLink(nil, linkR)
+    end
+  end
+end DeleteLine
+
+procedure WritePath(F: Frame; L: Line; level: int16)
+  var
+    pR: ListRiders.Rider
+    s: array 64 of char
+begin
+  if level >= 0 then
+    while L.lev > level do
+      L := L.prev
+    end
+    WritePath(F, L, level - 1)
+    pR := F.do_.GetRider(F, false)
+    pR.do_.Seek(pR, L.key)
+    ValueToStr(pR.d, @s, 64)
+    Texts.WriteString(@W, @s)
+    Texts.Write(@W, "/")
+  end
+end WritePath
+
+procedure GetSelection(F: Frame; T: pointer to Texts.Text)
+  var
+    L: Line
+    cnt: int32
+    R: ListRiders.Rider
+    str: array 64 of char
+    incl_: boolean
+
+  procedure Space(const s: pointer to array of char): boolean
+    var
+      i: int32
+  begin
+    i := 0
+    while (s[i] # 0X) & (s[i] # " ") & (s[i] # 9X) do
+      inc(i)
+    end
+    return s[i] # 0X
+  end Space
+begin
+  newgc(T^)
+  Texts.Open(T^, "")
+  R := F.do_.GetRider(F, false)
+  if R # nil then
+    incl_ := inclpath in F.state0
+    L := NextSelLine(F, F.lines)
+    cnt := 0
+    while L # F.lines do
+      R.do_.Seek(R, L.key)
+      ValueToStr(R.d, @str, 64)
+      if incl_ or (R.d is ListRiders.String) & Space(@str) then
+        Texts.Write(@W, 22X)
+        if incl_ then
+          WritePath(F, L, L.lev - 1)
+        end
+        Texts.WriteString(@W, @str)
+        Texts.Write(@W, 22X)
+      else
+        Texts.WriteString(@W, @str)
+      end
+
+      inc(cnt)
+      L := NextSelLine(F, L)
+      if incl_ or (obmod(cnt, 10) = 0) then
+        Texts.WriteLn(@W)
+      else
+        Texts.Write(@W, " ")
+      end
+    end
+
+    if ~incl_ & (obmod(cnt, 10) > 0) then
+      Texts.WriteLn(@W)
+    end
+    Texts.Append(T^, W.buf)
+  end
+end GetSelection
+
+procedure RemoveSelection(F: Frame)
+  var
+    L: Line
+    update: boolean
+begin
+  update := false
+  L := F.lines
+  repeat
+    update := update or L.sel
+    L.sel := false
+    L := L.next
+  until L = F.lines
+  F.sel := false
+  if update then
+    Gadgets.Update(F)
+  end
+end RemoveSelection
+
+procedure InvertSelection(F: Frame; Q: Display3.Mask; x, y, Y0: int16; L0, L1: Line)
+  var
+    w, Y, cx, cy, cw, ch: int16
+begin
+  inc(x, F.left)
+  w := F.W - (F.left + F.right)
+  Y := Y0 + y + F.H
+  cx := Q.X
+  cy := Q.Y
+  cw := Q.W
+  ch := Q.H
+  Display3.AdjustMask(Q, x, y + F.bottom, w, F.H - (F.bottom + F.top))
+  repeat
+    L0.sel := ~L0.sel
+    Display3.ReplConst(Q, Display3.black, x, Y, w, L0.h, Display.invert)
+    L0 := L0.next
+    dec(Y, L0.h)
+  until L0 = L1
+
+  Q.X := cx
+  Q.Y := cy
+  Q.W := cw
+  Q.H := ch
+end InvertSelection
+
+procedure DeleteSelection(F: Frame)
+  var
+    L: Line
+    R, linkR: ListRiders.Rider
+    update: boolean
+begin
+  R := F.do_.GetRider(F, false)
+  linkR := F.do_.GetRider(F, true)
+  if (R # nil) & (linkR # nil) then
+    update := false
+    L := NextSelLine(F, F.lines)
+    while L # F.lines do
+      update := true
+      linkR.do_.Seek(linkR, L.key)
+      DeleteLine(F, R, linkR, L)
+      L := NextSelLine(F, L)
+    end
+
+    if update then
+      Gadgets.Update(F.obj)
+    end
+  end
+end DeleteSelection
+
+procedure AscSelection(F: Frame)
+  var
+    L, pL: Line
+    R, linkR, pR: ListRiders.Rider
+    update: boolean
+begin
+  linkR := F.do_.GetRider(F, false)
+  pR := F.do_.GetRider(F, true)
+  R := F.do_.GetRider(F, true)
+  if (R # nil) & (pR # nil) & (linkR # nil) then
+    L := NextSelLine(F, F.lines)
+    update := false
+    while L # F.lines do
+      if L.lev > 0 then
+        update := true
+        linkR.do_.Seek(linkR, L.key)
+        pL := FindParent(F, L, L.lev - 2)
+        if pL = F.lines then
+          R.do_.WriteLink(nil, linkR)
+        else
+          R.do_.Seek(R, pL.key)
+          R.do_.WriteLink(R, linkR)
+        end
+
+        DeleteLine(F, pR, linkR, L)
+      end
+
+      L := NextSelLine(F, L)
+    end
+
+    if update then
+      Gadgets.Update(F.obj)
+    end
+  end
+end AscSelection
+
+procedure DescSelection(F: Frame)
+  var
+    L: Line
+    R, linkR, pR: ListRiders.Rider
+    update: boolean
+begin
+  linkR := F.do_.GetRider(F, false)
+  R := F.do_.GetRider(F, true)
+  pR := F.do_.GetRider(F, true)
+  if (R # nil) & (pR # nil) & (linkR # nil) then
+    L := NextSelLine(F, F.lines)
+    if L # F.lines then
+      update := false
+      repeat
+        R.do_.Seek(R, L.key)
+        R.do_.Set(R, R.do_.Pos(R) - 1)
+        if ~R.eol then
+          update := true
+          linkR.do_.Seek(linkR, L.key)
+          if ~linkR.eol then
+            R.do_.WriteLink(R, linkR)
+            DeleteLine(F, pR, linkR, L)
+          end
+        end
+
+        L := NextSelLine(F, L)
+      until L = F.lines
+
+      if update then
+        Gadgets.Update(F.obj)
+      end
+    end
+  end
+end DescSelection
+
+procedure FlipCaret(F: Frame; Q: Display3.Mask; x, y, Y: int16)
+begin
+  Display3.ReplConst(Q, Display3.black, x + F.left, y + F.H + Y, F.W - F.left - F.right, 2, Display.invert)
+end FlipCaret
+
+procedure FlipCaretMsg(F: Frame; carY: int16)
+  var
+    M: CaretMsg
+begin
+  M.F := F
+  M.carY := carY
+  Display.Broadcast(@M)
+end FlipCaretMsg
+
+procedure RemoveCaret(F: Frame)
+begin
+  if F.car then
+    FlipCaretMsg(F, F.carloc.y)
+    F.car := false
+  end
+end RemoveCaret
+
+procedure SetCaret(F: Frame; carline: Line; carpos: int16)
+begin
+  if F.car then
+    FlipCaretMsg(F, F.carloc.y)
+  end
+  F.carloc.line := carline
+  F.carloc.y := carpos
+  F.car := true
+  FlipCaretMsg(F, carpos)
+end SetCaret
+
+procedure ScrollUpdate(F: Frame; Q: Display3.Mask; x, y, dy: int16; dlink: Objects.Object)
+  var
+    cx, cy, cw, ch, mx, my, mw, mh, w, h: int16
+    D: Display.DisplayMsg
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  if F.car then
+    FlipCaret(F, Q, x, y, F.carloc.y - dy)
+  end
+  w := F.W - (F.left + F.right)
+  h := F.H - (F.top + F.bottom)
+  if Display3.Rectangular(Q, @mx, @my, @mw, @mh) then
+    // copy as much as possible
+    cx := x + F.left
+    cy := y + F.bottom
+    cw := w
+    ch := h
+    ClipAgainst(@mx, @my, @mw, @mh, Q.X, Q.Y, Q.W, Q.H)
+    ClipAgainst(@mx, @my, @mw, @mh, cx, cy, cw, ch)
+    if dy < 0 then
+      // up; new lines come on top
+      ClipAgainst(@cx, @cy, @cw, @ch, cx, cy - dy, cw, h + dy) // clip top
+      ClipAgainst(@cx, @cy, @cw, @ch, mx, my, mw, mh) // clip source area
+      inc(cy, dy)
+      ClipAgainst(@cx, @cy, @cw, @ch, mx, my, mw, mh) // clip destination area
+      D.v := cy + ch - (y + F.H - 1)
+      D.h := -dy
+    else
+      // down; new lines come at bottom
+      ClipAgainst(@cx, @cy, @cw, @ch, cx, cy, cw, h - dy) // clip bottom
+      ClipAgainst(@cx, @cy, @cw, @ch, mx, my, mw, mh) // clip source area
+      inc(cy, dy)
+      ClipAgainst(@cx, @cy, @cw, @ch, mx, my, mw, mh) // clip destination area
+      D.v := cy - dy - (y + F.H - 1)
+      D.h := dy
+    end
+
+    if (cw > 0) & (ch > 0) then
+      Display.CopyBlock(cx, cy - dy, cw, ch, cx, cy, Display.replace)
+    end
+
+  else
+    // full update
+    D.v := F.bottom - F.H
+    D.h := h
+  end
+
+  if F.car then
+    FlipCaret(F, Q, x, y, F.carloc.y)
+  end
+  D.device := Display.screen
+  D.id := Display.area
+  D.F := F
+  D.dlink := dlink
+  D.x := x - F.X
+  D.y := y - F.Y
+  D.u := F.left
+  D.w := w
+  F.handle(F, @D)
+end ScrollUpdate
+
+procedure ScrollSilent(F: Frame; dline: int16; adjust: boolean; dy: pointer to int16)
+  var
+    L, last: Line
+    Y: int16
+begin
+  L := F.first
+  dy^ := 0
+  if dline > 0 then
+    // down
+    if adjust then
+      // scroll until last line is visible and not more
+      last := L
+      Y := F.H - F.top
+      while (last # F.lines) & (Y - last.h > 0) do
+        dec(Y, last.h)
+        last := last.next
+      end
+      while ((last # F.lines) or (Y - last.h < 0)) & (dline > 0) do
+        inc(Y, L.h)
+        inc(dy^, L.h)
+        dec(dline)
+        L := L.next
+        if last # F.lines then
+          dec(Y, last.h)
+          last := last.next
+        end
+      end
+
+    else
+      while (L.next # F.lines) & (dline > 0) do
+        L := L.next
+        inc(dy^, L.h)
+        dec(dline)
+      end
+    end
+
+  elsif dline < 0 then
+    // up
+    while (L.prev # F.lines) & (dline < 0) do
+      L := L.prev
+      dec(dy^, L.h)
+      inc(dline)
+    end
+  end
+
+  if L # F.first then
+    F.first := L
+    if F.car then
+      inc(F.carloc.y, dy^)
+    end
+  end
+end ScrollSilent
+
+procedure Scroll(F: Frame; Q: Display3.Mask; x, y, dline: int16; dlink: Objects.Object; dy: pointer to int16)
+begin
+  ScrollSilent(F, dline, true, dy)
+  if dy^ # 0 then
+    ScrollUpdate(F, Q, x, y, dy^, dlink)
+  end
+end Scroll
+
+procedure ToggleLine(F: Frame; line: Line)
+  var
+    carL, L: Line
+    R: ListRiders.Rider
+    levs, n: int16
+begin
+  if line.hasSub then
+    if line.folded then
+      // unfold lines
+      R := F.do_.GetRider(F, false)
+      R.do_.Seek(R, line.key)
+      if (R # nil) & ~R.eol then
+        R := R.do_.Desc(R, R)
+        FormatLevel(F, R, line.lev + 1, line)
+        if F.car then
+          SetCaret(F, F.carloc.line, LocatePos(F, F.carloc.line))
+        end
+      end
+
+    else
+      // fold lines
+      L := line.next
+      carL := F.carloc.line
+      while L.lev > line.lev do
+        if L = carL then
+          carL := line
+        end
+        L := L.next
+      end
+      line.next := L
+      L.prev := line
+      // renumber & calc levels
+      levs := 0
+      L := F.lines
+      repeat
+        L := L.next
+        if L.lev > levs then
+          levs := L.lev
+        end
+      until L = line
+      n := line.n
+      while L # F.lines do
+        if L.lev > levs then
+          levs := L.lev
+        end
+        L.n := n
+        inc(n)
+        L := L.next
+      end
+
+      if levs # F.levs then
+        F.levs := levs
+        SetHRange(F)
+      end
+      if F.car & ((carL # F.carloc.line) or (carL.n > line.n)) then
+        SetCaret(F, carL, LocatePos(F, carL))
+      end
+    end
+
+    line.folded := ~line.folded
+    SetVRange(F)
+  end
+end ToggleLine
+
+procedure InsertItems(F: Frame; T: Texts.Text; beg, end_: int32; L: Line)
+  var
+    R: ListRiders.Rider
+    d: ListRiders.String
+    S: Texts.Scanner
+    update: boolean
+begin
+  R := F.do_.GetRider(F, false)
+  if R # nil then
+    update := false
+    R.do_.Seek(R, L.key)
+    if L.hasSub & ~L.folded then
+      R := R.do_.Desc(R, R)
+    else
+      R.do_.Set(R, R.do_.Pos(R) + 1)
+    end
+
+    Texts.OpenScanner(@S, T, beg)
+    S.class := Texts.Inval
+    Texts.Scan(@S)
+    newgc(d)
+    while ~(S.class = Texts.Inval) do
+      case S.class of
+        2 (* Texts.String *), 1 (* Texts.Name *):
+        copy(@d.s, @S.s, 64)
+      | 3 (* Texts.Int *):
+        Strings.IntToStr(S.i, @d.s, 64)
+      | 4 (* Texts.Real *):
+        Strings.RealToStr(val(longreal, S.x), @d.s, 64)
+      | 6 (* Texts.Char *):
+        d.s[0] := S.c
+        d.s[1] := 0X
+      else
+        d.s[0] := 0X
+      end
+
+      if d.s[0] # 0X then
+        update := true
+        R.do_.Write(R, d)
+        newgc(d)
+      end
+      S.class := Texts.Inval
+      if Texts.Pos(@S) < end_ then
+        Texts.Scan(@S)
+      end
+    end
+
+    if update then
+      Gadgets.Update(F.obj)
+    end
+  end
+end InsertItems
+
+procedure InsertLink(F: Frame; L: Line)
+  var
+    R, linkR: ListRiders.Rider
+    selL: Line
+    update: boolean
+begin
+  linkR := F.do_.GetRider(F, false)
+  if linkR # nil then
+    update := false
+    if L.hasSub & ~L.folded or (L.lev > 0) then
+      R := F.do_.GetRider(F, true)
+      if ~L.hasSub or L.folded then
+        L := FindParent(F, L, L.lev - 1)
+      end
+      R.do_.Seek(R, L.key)
+    else
+      R := nil
+    end
+
+    selL := NextSelLine(F, F.lines)
+    while selL # F.lines do
+      update := true
+      linkR.do_.Seek(linkR, selL.key)
+      linkR.do_.WriteLink(R, linkR)
+      selL := NextSelLine(F, selL)
+    end
+
+    if update then
+      Gadgets.Update(F.obj)
+    end
+  end
+end InsertLink
+
+// Standard frame methods
+procedure GetStandardRider*(F: Frame; new_: boolean): ListRiders.Rider
+  var
+    M: ListRiders.ConnectMsg
+begin
+  if ((F.R = nil) or new_) & (F.obj # nil) then
+    M.R := nil
+    Objects.Stamp(@M)
+    F.obj.handle(F.obj, @M)
+    F.R := M.R
+  end
+  return F.R
+end GetStandardRider
+
+procedure FormatLine*(F: Frame; R: ListRiders.Rider; L: Line)
+  var
+    str: array 64 of char
+begin
+  ValueToStr(R.d, @str, 64)
+  Display3.StringSize(@str, F.fnt, @L.w, @L.h, @L.dsr)
+  L.dx := FoldSize + 2i1 + L.lev * F.tab
+end FormatLine
+
+procedure DisplayLine*(F: Frame; Q: Display3.Mask; x, y, w, h: int16; R: ListRiders.Rider; L: Line)
+  var
+    str: array 64 of char
+begin
+  ValueToStr(R.d, @str, 64)
+  Display3.ReplConst(Q, F.backC, x, y, w, h, Display.replace)
+  inc(x, L.lev * F.tab)
+  if L.hasSub then
+    DrawFold(Q, x, y + asr(h, 1), FoldSize, Display3.black, L.folded)
+  end
+  inc(x, FoldSize + 2i1)
+  if R.do_.State(R) = Pointed then
+    Display3.String(Q, F.pointC, x, y + L.dsr, F.fnt, @str, Display.paint)
+  else
+    Display3.String(Q, F.textC, x, y + L.dsr, F.fnt, @str, Display.paint)
+  end
+end DisplayLine
+
+procedure PrintFormatLine*(F: Frame; R: ListRiders.Rider; L: Line)
+  var
+    str: array 64 of char
+begin
+  ValueToStr(R.d, @str, 64)
+  Printer3.StringSize(@str, F.fnt, @L.w, @L.h, @L.dsr)
+  L.dx := P(FoldSize + 2i1 + L.lev * F.tab)
+end PrintFormatLine
+
+procedure PrintLine*(F: Frame; Q: Display3.Mask; x, y, w, h: int16; R: ListRiders.Rider; L: Line)
+  var
+    str: array 64 of char
+begin
+  ValueToStr(R.d, @str, 64)
+  Printer3.ReplConst(Q, F.backC, x, y, w, h, Display.replace)
+  inc(x, P(L.lev * F.tab))
+  if L.hasSub then
+    PrintFold(Q, x, y + asr(h, 1), P(FoldSize), Display3.black, L.folded)
+  end
+  inc(x, P(FoldSize + 2i1))
+  if R.do_.State(R) = Pointed then
+    Printer3.String(Q, F.pointC, x, y + L.dsr, F.fnt, @str, Display.paint)
+  else
+    Printer3.String(Q, F.textC, x, y + L.dsr, F.fnt, @str, Display.paint)
+  end
+end PrintLine
+
+// ------------ standard frame procs ------------
+procedure RestoreFrame(F: Frame; Q: Display3.Mask; x, y, w, h: int16)
+  var
+    L: Line
+    R: ListRiders.Rider
+    lev, Y, lx, lw, cx, cy, cw, ch: int16
+begin
+  Oberon.FadeCursor(@Oberon.Mouse)
+  Y := y + h - F.top
+  lx := x + F.left
+  lw := w - (F.left + F.right)
+  L := F.first
+  R := F.do_.GetRider(F, false)
+  if R # nil then
+    dec(lx, F.hoff)
+    inc(lw, F.hoff)
+    cx := Q.X
+    cy := Q.Y
+    cw := Q.W
+    ch := Q.H
+    Display3.AdjustMask(Q, lx, y + F.bottom, lw, h - (F.top - F.bottom))
+    lev := L.lev + 1
+    while (L # F.lines) & (Y > y + F.bottom) do
+      if lev = L.lev then
+        R.do_.Set(R, R.do_.Pos(R) + 1) // step foreward
+      elsif lev > L.lev then
+        R.do_.Seek(R, L.key) // come up
+      else
+        R := R.do_.Desc(R, R) // go down
+      end
+
+      dec(Y, L.h)
+      lev := L.lev
+      F.do_.Display(F, Q, lx, Y, lw, L.h, R, L)
+      if L.sel then
+        Display3.ReplConst(Q, Display3.black, lx, Y, lw, L.h, Display.invert)
+      end
+      L := L.next
+    end
+
+    inc(lx, F.hoff)
+    dec(lw, F.hoff)
+    Q.X := cx
+    Q.Y := cy
+    Q.W := cw
+    Q.H := ch
+  else
+    dec(Y, F.fnt.height)
+    Display3.ReplConst(Q, F.backC, lx, Y, lw, F.fnt.height, Display.replace)
+    Display3.String(Q, F.textC, lx, Y - F.fnt.minY, F.fnt, "NO MODEL SET", Display.paint)
+  end
+
+  dec(Y, y)
+  if Y < F.bottom then
+    Y := F.bottom
+  end
+
+  Display3.Rect3D(Q, Display3.bottomC, Display3.topC, x, y, w, h, 1, Display3.replace)
+  Display3.ReplConst(Q, F.backC, x + 1, y + 1, F.left - 1, h - 2, Display.replace)
+  Display3.ReplConst(Q, F.backC, x + w - F.right, y + 1, F.right - 1, h - 2, Display.replace)
+  Display3.ReplConst(Q, F.backC, lx, y + h - F.top, lw, F.top - 1, Display.replace)
+  Display3.ReplConst(Q, F.backC, lx, y + 1, lw, Y - 1, Display.replace)
+
+  if F.car then
+    FlipCaret(F, Q, x, y, F.carloc.y)
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(Q, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display3.paint)
+  end
+end RestoreFrame
+
+procedure PrintFrame(F: Frame; M: pointer to Display.DisplayMsg)
+  var
+    L, pL: Line
+    R: ListRiders.Rider
+    Q: Display3.Mask
+    fnt: Fonts.Font
+    x, y, w, h, top, bottom, left, right, lx, lw, Y, cx, cy, cw, ch, lev: int16
+begin
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  Gadgets.MakePrinterMask(F, x, y, M.dlink, @Q)
+  Printer3.FilledRect3D(Q, Display3.bottomC, Display3.topC, F.backC, x, y, w, h, P(1), Display3.replace)
+  top := P(F.top)
+  bottom := P(F.bottom)
+  left := P(F.left)
+  right := P(F.right)
+  Y := y + h - top
+  lx := x + left
+  lw := w - (left + right)
+  L := F.first
+  R := F.do_.GetRider(F, false)
+  if R # nil then
+    newgc(pL)
+    dec(lx, P(F.hoff))
+    inc(lw, P(F.hoff))
+    cx := Q.X
+    cy := Q.Y
+    cw := Q.W
+    ch := Q.H
+    lev := L.lev + 1
+    Display3.AdjustMask(Q, lx, y + bottom, lw, h - (top - bottom))
+    while (L # F.lines) & (Y > y + bottom) do
+      if lev = L.lev then
+        R.do_.Set(R, R.do_.Pos(R) + 1) // step foreward
+      elsif lev > L.lev then
+        R.do_.Seek(R, L.key) // come up
+      else
+        R := R.do_.Desc(R, R) // go down
+      end
+
+      lev := L.lev
+      pL^ := L^
+      F.do_.PrintFormat(F, R, pL)
+      dec(Y, pL.h)
+      F.do_.Print(F, Q, lx, Y, lw, pL.h, R, pL)
+      L := L.next
+    end
+
+    inc(lx, P(F.hoff))
+    dec(lw, P(F.hoff))
+    Q.X := cx
+    Q.Y := cy
+    Q.W := cw
+    Q.H := ch
+  else
+    fnt := Printer.GetMetric(F.fnt)
+    if fnt # nil then
+      dec(Y, fnt.height + fnt.minY)
+    else
+      dec(Y, P(F.fnt.height) - P(-F.fnt.minY))
+    end
+    Printer3.String(Q, F.textC, lx, Y, F.fnt, "NO MODEL SET", Display.paint)
+  end
+end PrintFrame
+
+procedure TrackSelection(F: Frame; x, y: int16; M: pointer to Oberon.InputMsg)
+  var
+    Q: Display3.Mask
+    first, oL, nL: Line
+    T: Texts.Text
+    keysum, keys: set
+    fy, oy, dy, cnt: int16
+    loc: Loc
+    C: Oberon.ConsumeMsg
+begin
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  Display3.Copy(Q, @Q)
+  Input.KeyState(@keys)
+  if ~(extendsel in F.state0) or ~(Input.ALT in keys) then
+    RemoveSelection(F)
+  end
+
+  LocateLine(F, y, M.Y, @loc, @cnt)
+  first := loc.line
+  oL := first
+  fy := loc.y
+  oy := fy
+  InvertSelection(F, Q, x, y, fy, first, first.next)
+  keysum := M.keys
+  repeat
+    Input.Mouse(@M.keys, @M.X, @M.Y)
+    LocateLine(F, y, M.Y, @loc, @cnt)
+    if cnt # 0 then
+      // scroll
+      if TimeOk() then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        Scroll(F, Q, x, y, cnt, M.dlink, @dy)
+        if dy # 0 then
+          if dy > 0 then
+            // down
+            (*
+            INC(loc.y, dy);
+            WHILE (loc.line.next # F.lines) & (y + F.bottom < loc.y) DO
+            loc.line := loc.line.next;
+            DEC(loc.y, loc.line.h)
+            END
+            *)
+            LocateLine(F, y, M.Y, @loc, @cnt)
+          else
+            // up
+            loc.line := F.first
+            loc.y := -F.top - loc.line.h
+          end
+
+          inc(fy, dy)
+          inc(oy, dy)
+        end
+      end
+    end
+
+    if oL # loc.line then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      if multisel in F.state0 then
+        if oL.n > loc.line.n then
+          nL := oL
+          oL := loc.line
+          oy := loc.y
+        else
+          nL := loc.line
+        end
+
+        if (oL.n < first.n) & (nL.n > first.n) then
+          InvertSelection(F, Q, x, y, fy, first, first.next)
+        end
+        if oL.n >= first.n then
+          oL := oL.next
+          dec(oy, oL.h)
+        end
+        if nL.n > first.n then
+          nL := nL.next
+        end
+        InvertSelection(F, Q, x, y, oy, oL, nL)
+        oy := loc.y
+        oL := loc.line
+      else
+        InvertSelection(F, Q, x, y, oy, oL, oL.next)
+        oy := loc.y
+        oL := loc.line
+        InvertSelection(F, Q, x, y, oy, oL, oL.next)
+      end
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+    keysum := keysum + M.keys
+  until M.keys = {}
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+
+  F.sel := true
+  F.time := Oberon.Time()
+  if ~(locked in F.state0) then
+    if keysum = {0,1} then
+      // copy over
+      if F.car then
+        InsertLink(F, loc.line)
+      else
+        GetSelection(F, @T)
+        if T.len_ > 0 then
+          C.F := nil
+          C.text := T
+          C.beg := 0
+          C.end_ := T.len_
+          Display.Broadcast(@C)
+        end
+      end
+
+    elsif keysum = {0,2} then
+      DeleteSelection(F)
+    end
+  end
+
+  SetVPos(F, true)
+  M.res := 0
+end TrackSelection
+
+procedure TrackPoint(F: Frame; x, y: int16; M: pointer to Oberon.InputMsg)
+  var
+    Q: Display3.Mask
+    R: ListRiders.Rider
+    oldorg: int32
+    keysum: set
+    left, top, w, ox, oy, ow, dy, cnt: int16
+    update: boolean
+    loc: Loc
+begin
+  update := false
+  oldorg := F.first.n
+  left := x + F.left - F.hoff
+  top := y + F.H
+  w := F.W - F.left - F.right
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  Display3.Copy(Q, @Q)
+  Display3.AdjustMask(Q, x + F.left, y + F.bottom, w, F.H - (F.top - F.bottom))
+  LocateLine(F, y, M.Y, @loc, @cnt)
+  ox := left + loc.line.dx
+  oy := loc.y
+  ow := loc.line.w
+  Display3.ReplConst(Q, F.backC, ox, top + oy, ow, 2, Display.invert)
+  keysum := M.keys
+  repeat
+    Input.Mouse(@M.keys, @M.X, @M.Y)
+    LocateLine(F, y, M.Y, @loc, @cnt)
+    if cnt # 0 then
+      // scroll
+      if TimeOk() then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        Display3.ReplConst(Q, F.backC, ox, top + oy, ow, 2, Display.invert)
+        Scroll(F, Q, x, y, cnt, M.dlink, @dy)
+        oy := 1
+        ow := 0
+      end
+
+    elsif loc.y # oy then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      Display3.ReplConst(Q, F.backC, ox, top + oy, ow, 2, Display.invert)
+      ox := left + loc.line.dx
+      oy := loc.y
+      ow := loc.line.w
+      Display3.ReplConst(Q, F.backC, ox, top + oy, ow, 2, Display.invert)
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+    keysum := keysum + M.keys
+  until M.keys = {}
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+  Display3.ReplConst(Q, F.backC, ox, top + oy, ow, 2, Display.invert)
+
+  if ((keysum = {1}) or Oberon.New & (keysum = {2})) & (cnt = 0) then
+    if (exponpoint in F.state0) or (x <= M.X) & (M.X < x + loc.line.dx) then
+      ToggleLine(F, loc.line)
+      update := true
+    end
+
+    if F.pointC # F.textC then
+      R := F.do_.GetRider(F, false)
+      if R # nil then
+        R.do_.Seek(R, loc.line.key)
+        R.do_.SetState(R, Pointed)
+        update := true
+      end
+    end
+
+    F.point := loc.line
+    if ~(exponpoint in F.state0) & (x + loc.line.dx <= M.X) or ~loc.line.hasSub then
+      Gadgets.ExecuteAttr(F, "Cmd", M.dlink, nil, nil)
+    end
+
+    F.point := nil
+  end
+
+  if update or (oldorg # F.first.n) then
+    if oldorg # F.first.n then
+      SetVPos(F, true)
+    else
+      Gadgets.Update(F)
+    end
+  end
+
+  M.res := 0
+end TrackPoint
+
+procedure TrackCaret(F: Frame; x, y: int16; M: pointer to Oberon.InputMsg)
+  var
+    Q: Display3.Mask
+    T: Texts.Text
+    keysum: set
+    oldorg, time, beg, end_: int32
+    oy, dy, cnt: int16
+    loc: Loc
+begin
+  LocateLine(F, y, M.Y, @loc, @cnt)
+  if Oberon.New & F.car & (F.carloc.line.n = loc.line.n) then
+    Oberon.Defocus()
+    if (saved.car # nil) & (saved.text # nil) then
+      saved.id := Oberon.set_
+      Display.Broadcast(@saved)
+    end
+
+    TrackPoint(F, x, y, M)
+    return
+  end
+
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  Display3.Copy(Q, @Q)
+  saved.car := nil
+  saved.text := nil
+  saved.id := Oberon.get
+  Display.Broadcast(@saved)
+  Oberon.Defocus()
+  oldorg := F.first.n
+  oy := loc.y
+  FlipCaret(F, Q, x, y, oy)
+  keysum := M.keys
+  repeat
+    Input.Mouse(@M.keys, @M.X, @M.Y)
+    LocateLine(F, y, M.Y, @loc, @cnt)
+    if (cnt > 0) or (cnt < -1) then
+      // scroll
+      if TimeOk() then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        FlipCaret(F, Q, x, y, oy)
+        Scroll(F, Q, x, y, cnt, M.dlink, @dy)
+        oy := 1
+      end
+
+    else
+      if cnt = -1 then
+        loc.line := F.first.prev
+        loc.y := -F.top
+      end
+      if loc.y # oy then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        FlipCaret(F, Q, x, y, oy)
+        oy := loc.y
+        FlipCaret(F, Q, x, y, oy)
+      end
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+    keysum := keysum + M.keys
+  until M.keys = {}
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+  FlipCaret(F, Q, x, y, oy)
+
+  if (cnt = 0) or (cnt = -1) then
+    // caret in frame
+    if ~(locked in F.state0) & (keysum = {1,2}) then
+      // copy over
+      Oberon.GetSelection(@T, @beg, @end_, @time)
+      if time # -1 then
+        if time = F.time then
+          InsertLink(F, loc.line)
+        else
+          InsertItems(F, T, beg, end_, loc.line)
+        end
+      end
+    end
+
+    SetCaret(F, loc.line, oy)
+  end
+
+  if oldorg # F.first.n then
+    SetVPos(F, true)
+  end
+  M.res := 0
+end TrackCaret
+
+procedure Consume(F: Frame; x, y: int16; M: pointer to Oberon.InputMsg)
+  var
+    Q: Display3.Mask
+    carY, Y, dy, cnt: int16
+    carL, L: Line
+    keys: set
+begin
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  if (M.ch = LArrow) & ~(locked in F.state0) then
+    AscSelection(F)
+  elsif (M.ch = RArrow) & ~(locked in F.state0) then
+    DescSelection(F)
+  elsif M.ch = UArrow then
+    if F.carloc.line # F.lines then
+      RemoveCaret(F)
+      carY := F.carloc.y
+      carL := F.carloc.line
+      Input.KeyState(@keys)
+      if Input.SHIFT in keys then
+        if carL.sel then
+          if ~((multisel in F.state0) & carL.prev.sel) & ~(extendsel in F.state0) then
+            RemoveSelection(F)
+          end
+        else
+          if ~((multisel in F.state0) & carL.next.sel) & ~(extendsel in F.state0) then
+            RemoveSelection(F)
+          end
+        end
+
+        InvertSelection(F, Q, x, y, carY, carL, carL.next)
+        if carL.sel then
+          F.sel := true
+          F.time := Oberon.Time()
+        end
+      end
+
+      inc(carY, carL.h)
+      carL := carL.prev
+      if carY >= 0 then
+        ScrollSilent(F, carL.next.n - F.first.n, true, @dy)
+        inc(carY, dy)
+      elsif carY < F.bottom - F.H then
+        L := F.first
+        Y := carY
+        cnt := 0
+        repeat
+          inc(Y, L.h)
+          L := L.next
+        until Y >= F.bottom - F.H
+        ScrollSilent(F, L.n - F.first.n, true, @dy)
+        inc(carY, dy)
+      end
+
+      SetVPos(F, true)
+      SetCaret(F, carL, carY)
+    end
+
+  elsif M.ch = DArrow then
+    if F.carloc.line.next # F.lines then
+      RemoveCaret(F)
+      carY := F.carloc.y
+      carL := F.carloc.line
+      carL := carL.next
+      dec(carY, carL.h)
+      Input.KeyState(@keys)
+      if Input.SHIFT in keys then
+        if carL.sel then
+          if ~((multisel in F.state0) & carL.next.sel) & ~(extendsel in F.state0) then
+            RemoveSelection(F)
+          end
+        else
+          if ~((multisel in F.state0) & carL.prev.sel) & ~(extendsel in F.state0) then
+            RemoveSelection(F)
+          end
+        end
+
+        InvertSelection(F, Q, x, y, carY, carL, carL.next)
+        if carL.sel then
+          F.sel := true
+          F.time := Oberon.Time()
+        end
+      end
+
+      if carY < F.bottom - F.H then
+        L := F.first
+        Y := carY
+        cnt := 0
+        repeat
+          inc(cnt)
+          inc(Y, L.h)
+          L := L.next
+        until Y >= F.bottom - F.H
+        ScrollSilent(F, L.n - F.first.n, true, @dy)
+        inc(carY, dy)
+      elsif carY >= 0 then
+        ScrollSilent(F, carL.next.n - F.first.n, true, @dy)
+        inc(carY, dy)
+      end
+
+      SetVPos(F, true)
+      SetCaret(F, carL, carY)
+    end
+
+  elsif M.ch = CR then
+    if F.carloc.line.hasSub then
+      ToggleLine(F, F.carloc.line)
+      Gadgets.Update(F)
+    else
+      F.point := F.carloc.line
+      Gadgets.ExecuteAttr(F, "Cmd", M.dlink, nil, nil)
+      F.point := nil
+    end
+
+  elsif M.ch = Home then
+    if F.first # F.lines.next then
+      ScrollSilent(F, -F.first.n, true, @dy)
+      SetVPos(F, true)
+      SetCaret(F, F.first, -F.top - F.first.h)
+    end
+
+  elsif M.ch = End then
+    L := F.lines.prev
+    dy := F.H - (F.top + F.bottom) - L.h
+    while (L.prev # F.lines) & (dy >= 0) do
+      L := L.prev
+      dec(dy, L.h)
+    end
+    if L # F.first then
+      ScrollSilent(F, L.next.n - F.first.n, true, @dy)
+      SetVPos(F, true)
+      SetCaret(F, F.first, -F.top - F.first.h)
+    end
+
+  elsif M.ch = UPage then
+    L := F.first
+    dy := F.H - (F.top + F.bottom) - L.h
+    while (L.prev # F.lines) & (dy > 0) do
+      L := L.prev
+      dec(dy, L.h)
+    end
+    if L # F.first then
+      ScrollSilent(F, L.n - F.first.n, true, @dy)
+      SetVPos(F, true)
+      SetCaret(F, F.first, -F.top - F.first.h)
+    end
+
+  elsif M.ch = DPage then
+    L := F.first
+    dy := F.H - (F.top + F.bottom) - L.h
+    while (L.next # F.lines) & (dy > 0) do
+      L := L.next
+      dec(dy, L.h)
+    end
+    if L # F.first then
+      ScrollSilent(F, L.n - F.first.n, true, @dy)
+      SetVPos(F, true)
+      SetCaret(F, F.first, -F.top - F.first.h)
+    end
+  end
+
+  M.res := 0
+end Consume
+
+procedure UpdateModel(F: Frame)
+  var
+    oldlevs, key: int32
+    L: Line
+    R: ListRiders.Rider
+begin
+  R := F.do_.GetRider(F, true) // get a new rider
+  if R # nil then
+    oldlevs := F.levs
+    F.levs := 0
+    RemoveCaret(F)
+    key := F.first.key
+    L := F.lines.next
+    UpdateLevel(F, R, @L, 0)
+    // find old first line
+    L := F.lines
+    repeat
+      L := L.next
+    until (L = F.lines) or (L.key = key)
+    if L = F.lines then
+      F.first := L.next
+    else
+      F.first := L
+    end
+    // check levels
+    if oldlevs # F.levs then
+      if obdiv(F.hoff, F.tab) > F.levs then
+        F.hoff := F.levs * F.tab
+        SetHPos(F)
+      end
+      SetHRange(F)
+    end
+  end
+end UpdateModel
+
+procedure UpdateFrame(F: Frame; M: Gadgets.UpdateMsg)
+  var
+    val_, n: int32
+    dy: int16
+    D: Display.DisplayMsg
+begin
+  if F.obj # nil then
+    F.obj.handle(F.obj, @M)
+  end
+  if F.vPos # nil then
+    F.vPos.handle(F.vPos, @M)
+  end
+  if F.vMax # nil then
+    F.vMax.handle(F.vMax, @M)
+  end
+  if F.hPos # nil then
+    F.hPos.handle(F.hPos, @M)
+  end
+  if F.hMax # nil then
+    F.hMax.handle(F.hMax, @M)
+  end
+  if M.obj = F.obj then
+    if M.stamp # F.stamp then
+      F.stamp := M.stamp
+      UpdateModel(F)
+      SetVPos(F, false)
+      SetVRange(F)
+    end
+
+    D.device := Display.screen
+    D.id := Display.full
+    D.dlink := M.dlink
+    D.F := F
+    D.x := M.x
+    D.y := M.y
+    D.res := -1
+    F.handle(F, @D)
+  elsif M.obj = F.vPos then
+    if M.stamp # F.stamp then
+      F.stamp := M.stamp
+      Attributes.GetInt(F.vPos, "Value", @val_)
+      if (F.first = nil) or (F.first = F.lines) then
+        n := 0
+      else
+        n := F.first.n
+      end
+      if val_ # n then
+        ScrollSilent(F, val(int16, val_ - n), false, @dy)
+        if dy = 0 then
+          SetVPos(F, false)
+        end
+      end
+    end
+
+    D.device := Display.screen
+    D.id := Display.full
+    D.dlink := M.dlink
+    D.F := F
+    D.x := M.x
+    D.y := M.y
+    D.res := -1
+    F.handle(F, @D)
+  elsif M.obj = F.hPos then
+    if M.stamp # F.stamp then
+      F.stamp := M.stamp
+      Attributes.GetInt(F.hPos, "Value", @val_)
+      if val_ < 0 then
+        val_ := 0
+      end
+      F.hoff := val(int16, val_ * F.tab)
+    end
+
+    D.device := Display.screen
+    D.id := Display.full
+    D.dlink := M.dlink
+    D.F := F
+    D.x := M.x
+    D.y := M.y
+    D.res := -1
+    F.handle(F, @D)
+  elsif M.obj = F.vMax then
+  // do nothing: causes recursion when models is shared between diff. frames
+  elsif M.obj = F.hMax then
+  // do nothing: (see vMax)
+  else
+    Gadgets.framehandle(F, @M)
+  end
+end UpdateFrame
+
+procedure FrameAttr(F: Frame; M: pointer to Objects.AttrMsg)
+  var
+    R: ListRiders.Rider
+    l: Line
+    B: Texts.Buffer
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "ListGadgets.NewFrame", 64)
+      M.res := 0
+    elsif M.name = "Cmd" then
+      Gadgets.framehandle(F, M)
+      if M.res < 0 then
+        M.class := Objects.String
+        copy(@M.s, "", 64)
+        M.res := 0
+      end
+    elsif M.name = "Point" then
+      M.class := Objects.String
+      copy(@M.s, "", 64)
+      M.res := 0
+      if F.point # nil then
+        R := F.do_.GetRider(F, false)
+        if R # nil then
+          Oberon.FadeCursor(@Oberon.Mouse)
+          newgc(B)
+          Texts.OpenBuf(B)
+          Texts.Recall(@B)
+          if pointText.len_ > 0 then
+            Texts.Delete(pointText, 0, pointText.len_)
+          end
+          if inclpath in F.state0 then
+            WritePath(F, F.point, F.point.lev - 1)
+          end
+          R.do_.Seek(R, F.point.key)
+          ValueToStr(R.d, @M.s, 64)
+          Texts.WriteString(@W, @M.s)
+          Texts.Append(pointText, W.buf)
+          Attributes.TxtToStr(pointText, @M.s, 64)
+          Texts.Delete(pointText, 0, pointText.len_)
+          // restore restore buffer
+          Texts.Append(pointText, B)
+          Texts.Delete(pointText, 0, pointText.len_)
+        end
+      end
+
+    elsif M.name = "PointKey" then
+      M.class := Objects.Int
+      M.i := (-2147483647-1)
+      M.res := 0
+      if F.point # nil then
+        M.i := F.point.key
+      end
+    elsif M.name = "Sel" then
+      M.class := Objects.String
+      copy(@M.s, "", 64)
+      M.res := 0
+      if F.sel then
+        l := F.first
+        while (l # F.lines) & ~l.sel do
+          l := l.next
+        end
+        if l # F.lines then
+          R := F.do_.GetRider(F, false)
+          if R # nil then
+            R.do_.Seek(R, l.key)
+            ValueToStr(R.d, @M.s, 64)
+          end
+        end
+      end
+
+    elsif M.name = "SelKey" then
+      M.class := Objects.Int
+      M.i := (-2147483647-1)
+      M.res := 0
+      if F.sel then
+        l := F.first
+        while (l # F.lines) & ~l.sel do
+          l := l.next
+        end
+        if l # F.lines then
+          M.i := l.key
+        end
+      end
+
+    elsif M.name = "Font" then
+      M.class := Objects.String
+      copy(@M.s, @F.fnt.name, 64)
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := F.H - Fonts.Default.height
+      M.res := 0
+    elsif M.name = "BackCol" then
+      M.class := Objects.Int
+      M.i := F.backC
+      M.res := 0
+    elsif M.name = "TextCol" then
+      M.class := Objects.Int
+      M.i := F.textC
+      M.res := 0
+    elsif M.name = "PointCol" then
+      M.class := Objects.Int
+      M.i := F.pointC
+      M.res := 0
+    elsif M.name = "TabSize" then
+      M.class := Objects.Int
+      M.i := F.tab
+      M.res := 0
+    elsif M.name = "InclPath" then
+      M.class := Objects.Bool
+      M.b := inclpath in F.state0
+      M.res := 0
+    elsif M.name = "MultiSel" then
+      M.class := Objects.Bool
+      M.b := multisel in F.state0
+      M.res := 0
+    elsif M.name = "ExtendSel" then
+      M.class := Objects.Bool
+      M.b := extendsel in F.state0
+      M.res := 0
+    elsif M.name = "ExpOnPoint" then
+      M.class := Objects.Bool
+      M.b := exponpoint in F.state0
+      M.res := 0
+    elsif M.name = "Locked" then
+      M.class := Objects.Bool
+      M.b := locked in F.state0
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Font" then
+      if M.class = Objects.String then
+        F.fnt := Fonts.This(@M.s)
+        ReformatFrame(F)
+        M.res := 0
+      end
+    elsif M.name = "BackCol" then
+      if M.class = Objects.Int then
+        F.backC := val(int16, M.i)
+        M.res := 0
+      end
+    elsif M.name = "TextCol" then
+      if M.class = Objects.Int then
+        F.textC := val(int16, M.i)
+        M.res := 0
+      end
+    elsif M.name = "PointCol" then
+      if M.class = Objects.Int then
+        F.pointC := val(int16, M.i)
+        M.res := 0
+      end
+    elsif M.name = "TabSize" then
+      if M.class = Objects.Int then
+        F.tab := val(int16, M.i)
+        M.res := 0
+      end
+    elsif M.name = "InclPath" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state0 := F.state0 + {inclpath}
+        else
+          F.state0 := F.state0 - {inclpath}
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "MultiSel" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state0 := F.state0 + {multisel}
+        else
+          F.state0 := F.state0 - {multisel}
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "ExtendSel" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state0 := F.state0 + {extendsel}
+        else
+          F.state0 := F.state0 - {extendsel}
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "ExpOnPoint" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state0 := F.state0 + {exponpoint}
+        else
+          F.state0 := F.state0 - {exponpoint}
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "Locked" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state0 := F.state0 + {locked}
+        else
+          F.state0 := F.state0 - {locked}
+        end
+        M.res := 0
+      end
+
+    elsif (M.name = "Point") or (M.name = "PointKey") then
+      M.res := 0
+    elsif (M.name = "Sel") or (M.name = "SelKey") then
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("TabSize")
+    M.Enum("BackCol")
+    M.Enum("TextCol")
+    M.Enum("PointCol")
+    M.Enum("InclPath")
+    M.Enum("MultiSel")
+    M.Enum("ExtendSel")
+    M.Enum("ExpOnPoint")
+    M.Enum("Locked")
+    M.Enum("Font")
+    M.Enum("Cmd")
+    // read only
+    M.Enum("Point")
+    M.Enum("Sel")
+    M.Enum("PointKey")
+    M.Enum("SelKey")
+    Gadgets.framehandle(F, M)
+  else
+    Gadgets.framehandle(F, M)
+  end
+end FrameAttr
+
+procedure FrameLink(F: Frame; M: pointer to Objects.LinkMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "VPos" then
+      M.obj := F.vPos
+      M.res := 0
+    elsif M.name = "VRange" then
+      M.obj := F.vMax
+      M.res := 0
+    elsif M.name = "HPos" then
+      M.obj := F.hPos
+      M.res := 0
+    elsif M.name = "HRange" then
+      M.obj := F.hMax
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "VPos" then
+      if M.obj # F.vPos then
+        F.vPos := M.obj
+        SetVPos(F, false)
+      end
+      M.res := 0
+    elsif M.name = "VRange" then
+      if M.obj # F.vMax then
+        F.vMax := M.obj
+        SetVRange(F)
+      end
+      M.res := 0
+    elsif M.name = "HPos" then
+      if M.obj # F.hPos then
+        F.hPos := M.obj
+        SetHPos(F)
+      end
+      M.res := 0
+    elsif M.name = "HRange" then
+      if M.obj # F.hMax then
+        F.hMax := M.obj
+        SetHRange(F)
+      end
+      M.res := 0
+    elsif M.name = "Model" then
+      if M.obj # F.obj then
+        F.obj := M.obj
+        F.lines.prev := F.lines
+        F.lines.next := F.lines
+        UpdateModel(F)
+        SetVPos(F, false) // C2
+        SetVRange(F)
+      end
+
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("VPos")
+    M.Enum("VRange")
+    M.Enum("HPos")
+    M.Enum("HRange")
+    Gadgets.framehandle(F, M)
+  else
+    Gadgets.framehandle(F, M)
+  end
+end FrameLink
+
+procedure FrameBind(F: Frame; M: pointer to Objects.BindMsg)
+begin
+  if F.vPos # nil then
+    F.vPos.handle(F.vPos, M)
+  end
+  if F.vMax # nil then
+    F.vMax.handle(F.vMax, M)
+  end
+  if F.hPos # nil then
+    F.hPos.handle(F.vPos, M)
+  end
+  if F.hMax # nil then
+    F.hMax.handle(F.vMax, M)
+  end
+  Gadgets.framehandle(F, M)
+end FrameBind
+
+// Standard procedures
+procedure CopyFrame*(M: pointer to Objects.CopyMsg; from, to_: Frame)
+  var
+    L, nL: Line
+begin
+  to_.do_ := from.do_
+  to_.sel := false
+  to_.car := false
+  to_.state0 := from.state0
+  to_.tab := from.tab
+  to_.fnt := from.fnt
+  to_.textC := from.textC
+  to_.pointC := from.pointC
+  to_.backC := from.backC
+  to_.left := from.left
+  to_.top := from.top
+  to_.right := from.right
+  to_.bottom := from.bottom
+  to_.R := nil
+  newgc(nL)
+  nL.key := (-2147483647-1)
+  nL.n := -1
+  nL.lev := 0
+  nL.hasSub := false
+  to_.lines := nL
+  L := from.lines.next
+  while L # from.lines do
+    newgc(nL.next)
+    nL.next^ := L^
+    nL.next.prev := nL
+    nL := nL.next
+    nL.sel := false
+    L := L.next
+  end
+
+  nL.next := to_.lines
+  to_.lines.prev := nL
+  to_.first := to_.lines.next
+  to_.vPos := Gadgets.CopyPtr(M, from.vPos)
+  to_.vMax := Gadgets.CopyPtr(M, from.vMax)
+  to_.hPos := Gadgets.CopyPtr(M, from.hPos)
+  to_.hMax := Gadgets.CopyPtr(M, from.hMax)
+  Gadgets.CopyFrame(M, from, to_)
+end CopyFrame
+
+procedure StoreFrame(F: Frame; M: pointer to Objects.FileMsg)
+  var
+    L: Line
+begin
+  Gadgets.framehandle(F, M)
+  Files.WriteNum(@M.R, Version)
+  Files.WriteSet(@M.R, F.state0)
+  Files.WriteInt(@M.R, F.backC)
+  Files.WriteInt(@M.R, F.textC)
+  Files.WriteInt(@M.R, F.pointC)
+  Files.WriteInt(@M.R, F.tab)
+  Files.WriteInt(@M.R, F.hoff)
+  Files.WriteInt(@M.R, F.levs)
+  Files.WriteString(@M.R, @F.fnt.name, 32)
+  Files.WriteInt(@M.R, F.top)
+  Files.WriteInt(@M.R, F.bottom)
+  Files.WriteInt(@M.R, F.left)
+  Files.WriteInt(@M.R, F.right)
+  L := F.lines.next
+  while L # F.lines do
+    Files.WriteInt(@M.R, L.n)
+    Files.WriteInt(@M.R, L.lev)
+    Files.WriteLInt(@M.R, L.key)
+    Files.WriteBool(@M.R, L.hasSub)
+    Files.WriteBool(@M.R, L.folded)
+    L := L.next
+  end
+
+  Files.WriteInt(@M.R, -1)
+  Files.WriteInt(@M.R, F.first.n)
+  Gadgets.WriteRef(@M.R, F.lib, F.vPos)
+  Gadgets.WriteRef(@M.R, F.lib, F.vMax)
+  Gadgets.WriteRef(@M.R, F.lib, F.hPos)
+  Gadgets.WriteRef(@M.R, F.lib, F.hMax)
+end StoreFrame
+
+procedure LoadFrame(F: Frame; M: pointer to Objects.FileMsg)
+  var
+    L: Line
+    ver: int32
+    n: int16
+    fntname: array 32 of char
+begin
+  Gadgets.framehandle(F, M)
+  Files.ReadNum(@M.R, @ver)
+  if ver >= 1 then
+    Files.ReadSet(@M.R, @F.state0)
+    Files.ReadInt(@M.R, @F.backC)
+    Files.ReadInt(@M.R, @F.textC)
+    Files.ReadInt(@M.R, @F.pointC)
+    Files.ReadInt(@M.R, @F.tab)
+    Files.ReadInt(@M.R, @F.hoff)
+    Files.ReadInt(@M.R, @F.levs)
+    Files.ReadString(@M.R, @fntname, 32)
+    F.fnt := Fonts.This(@fntname)
+    Files.ReadInt(@M.R, @F.top)
+    Files.ReadInt(@M.R, @F.bottom)
+    Files.ReadInt(@M.R, @F.left)
+    Files.ReadInt(@M.R, @F.right)
+    Files.ReadInt(@M.R, @n)
+    L := F.lines
+    while n # -1 do
+      newgc(L.next)
+      L.next.prev := L
+      L := L.next
+      L.n := n
+      Files.ReadInt(@M.R, @L.lev)
+      Files.ReadLInt(@M.R, @L.key)
+      Files.ReadBool(@M.R, @L.hasSub)
+      Files.ReadBool(@M.R, @L.folded)
+      Files.ReadInt(@M.R, @n)
+    end
+
+    F.lines.prev := L
+    L.next := F.lines
+    Files.ReadInt(@M.R, @n)
+    L := F.lines
+    repeat
+      L := L.next
+    until (L.n = n) or (L = F.lines)
+    F.first := L
+    Gadgets.ReadRef(@M.R, F.lib, @F.vPos)
+    Gadgets.ReadRef(@M.R, F.lib, @F.vMax)
+    Gadgets.ReadRef(@M.R, F.lib, @F.hPos)
+    Gadgets.ReadRef(@M.R, F.lib, @F.hMax)
+  end
+end LoadFrame
+
+procedure FrameHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    F0: Frame
+    Q: Display3.Mask
+    T: Texts.Text
+    x, y, w, h: int16
+begin
+  case F of
+  | Frame:
+    case M of
+    | Display.PFrameMsg:
+      if (M.F = nil) or (M.F = F) then
+        // message addressed to box
+        x := M.x + F.X
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        M1 := M
+        case M1 of
+        | Display.PDisplayMsg:
+          if M1.device = Display.screen then
+            if (M1.id = Display.full) or (M1.F = nil) then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+              RestoreFrame(F, Q, x, y, w, h)
+            elsif M1.id = Display.area then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+              Display3.AdjustMask(Q, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+              RestoreFrame(F, Q, x, y, w, h)
+            end
+
+          elsif M1.device = Display.printer then
+            PrintFrame(F, M1)
+          end
+
+        | Oberon.PInputMsg:
+          if M1.id = Oberon.track then
+            if (M1.keys # {}) & Gadgets.InActiveArea(F, M1) then
+              Oberon.RemoveMarks(x, y, w, h)
+              if M1.keys = {0} then
+                TrackSelection(F, x, y, M1)
+              elsif M1.keys = {1} then
+                TrackPoint(F, x, y, M1)
+              elsif M1.keys = {2} then
+                if Oberon.New & (locked in F.state0) then
+                  TrackPoint(F, x, y, M1)
+                else
+                  TrackCaret(F, x, y, M1)
+                end
+              end
+
+            else
+              Gadgets.framehandle(F, M1)
+            end
+
+          elsif (M1.id = Oberon.consume) & F.car then
+            Consume(F, x, y, M1)
+          end
+
+        | Oberon.PControlMsg:
+          if M1.id = Oberon.neutralize then
+            RemoveCaret(F)
+            RemoveSelection(F)
+          elsif M1.id = Oberon.defocus then
+            RemoveCaret(F)
+          end
+
+        | Display.PControlMsg:
+          if M1.id = Display.restore then
+            RemoveSelection(F)
+            UpdateModel(F)
+            F.car := false
+          else
+            Gadgets.framehandle(F, M1)
+          end
+
+        | PCaretMsg:
+          Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+          FlipCaret(F, Q, x, y, M1.carY)
+
+        | Gadgets.PUpdateMsg:
+          UpdateFrame(F, M1(Gadgets.PUpdateMsg)^)
+        | Oberon.PSelectMsg:
+          if M1.id = Oberon.get then
+            if F.sel & (M1.time - F.time < 0) then
+              GetSelection(F, @T)
+              if T.len_ > 0 then
+                M1.sel := F
+                M1.text := T
+                M1.beg := 0
+                M1.end_ := T.len_
+                M1.time := F.time
+              end
+            end
+
+          else
+            Gadgets.framehandle(F, M1)
+          end
+
+        | Oberon.PConsumeMsg:
+          if F.car & ~(locked in F.state0) then
+            InsertItems(F, M1.text, M1.beg, M1.end_, F.carloc.line)
+            SetCaret(F, F.carloc.line, LocatePos(F, F.carloc.line))
+          end
+
+        | Display.PConsumeMsg:
+          Gadgets.framehandle(F, M1)
+        else
+          Gadgets.framehandle(F, M1)
+        end
+      end
+
+    | Objects.PAttrMsg:
+      FrameAttr(F, M(Objects.PAttrMsg))
+    | Objects.PLinkMsg:
+      FrameLink(F, M(Objects.PLinkMsg))
+    | Objects.PBindMsg:
+      FrameBind(F, M(Objects.PBindMsg))
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        StoreFrame(F, M)
+      elsif M.id = Objects.load then
+        LoadFrame(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyFrame(M, F, F0)
+        M.obj := F0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end FrameHandler
+
+procedure InitFrame*(F: Frame)
+  var
+    L: Line
+begin
+  F.W := 100
+  F.H := 100
+  F.handle := FrameHandler
+  F.do_ := methods
+  newgc(L)
+  L.next := L
+  L.prev := L
+  L.hasSub := false
+  L.lev := 0
+  L.n := -1
+  L.key := (-2147483647-1)
+  F.lines := L
+  F.first := L
+  F.state0 := {multisel,exponpoint}
+  F.R := nil
+  F.car := false
+  F.sel := false
+  F.left := 4
+  F.top := 4
+  F.right := 2
+  F.bottom := 2
+  F.backC := Display3.textbackC
+  F.textC := Display3.textC
+  F.pointC := F.textC
+  F.hoff := 0
+  F.levs := 0
+  F.tab := 10
+  F.fnt := Fonts.Default
+end InitFrame
+
+procedure NewFrame*()
+  var
+    F: Frame
+begin
+  newgc(F)
+  InitFrame(F)
+  Objects.NewObj := F
+end NewFrame
+
+// ------------ Commands to create list with scrollbar(s) ------------
+procedure MakeSimpleList(const frame, model: pointer to array of char; P: pointer to Display.Frame; F: pointer to Frame; vBar: pointer to Display.Frame)
+  var
+    obj: Objects.Object
+begin
+  F^ := nil
+  P^ := nil
+  vBar^ := nil
+  obj := Gadgets.CreateObject(frame)
+  if (obj # nil) & (obj is Frame) then
+    F^ := obj(Frame)
+    obj := Gadgets.CreateObject("Organizer")
+    if obj # nil then
+      P^ := obj(Display.Frame)
+      Attributes.SetBool(P^, "Flat", true)
+      Attributes.SetInt(P^, "Border", 0)
+
+      Links.SetLink(F^, "Model", Gadgets.CreateObject(model))
+      F^.X := 0
+      F^.Y := 0
+      P^.W := F^.W
+      P^.H := F^.H
+
+      obj := Gadgets.CreateObject("Scrollbars.New")
+      if obj # nil then
+        Links.SetLink(F^, "VPos", Gadgets.CreateObject("Integer"))
+        Links.SetLink(F^, "VRange", Gadgets.CreateObject("Integer"))
+        vBar^ := obj(Display.Frame)
+        Links.SetLink(vBar^, "Min", F^.vMax)
+        Links.SetLink(vBar^, "Model", F^.vPos)
+        vBar^.X := P^.W
+        vBar^.Y := 0
+        vBar^.H := F^.H
+        inc(P^.W, vBar^.W)
+        Attributes.SetInt(vBar^, "Max", 0)
+        Attributes.SetBool(vBar^, "HeavyDrag", true)
+      end
+
+      F^.slink := vBar^
+    end
+  end
+end MakeSimpleList
+
+procedure Integrate(P, F: Display.Frame)
+  var
+    C: Display.ConsumeMsg
+begin
+  C.id := Display.drop
+  C.x := 0
+  C.y := 0
+  C.obj := F
+  C.u := 0
+  C.v := -P.H
+  C.res := -1
+  P.handle(P, @C)
+  Attributes.SetBool(P, "Locked", true)
+  Gadgets.Integrate(P)
+end Integrate
+
+(** Integrates a list with a vert. scrollbar at caret position
+Usage: ListGadgets.InsertVScrollList <frame> <model> ~
+*)
+procedure InsertVScrollList*()
+  var
+    P, vBar: Display.Frame
+    F: Frame
+    str, wStr: array 16 of char
+    fName: array 32 of char
+    S: Attributes.Scanner
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if S.class = Attributes.Name then
+    copy(@fName, @S.s, 32)
+    Attributes.Scan(@S)
+  else
+    copy(@fName, "", 32)
+  end
+
+  if S.class = Attributes.Name then
+    MakeSimpleList(@fName, @S.s, @P, @F, @vBar)
+    if vBar # nil then
+      Strings.IntToStr(-vBar.W, @wStr, 16)
+      copy(@str, "", 16)
+      Strings.Append(@str, 16, @wStr)
+      Strings.Append(@str, 16, " 0 0 0")
+      Attributes.SetString(vBar, "Constraints", @str)
+    end
+
+    if F # nil then
+      Strings.IntToStr(P.W - F.W, @wStr, 16)
+      copy(@str, "0 0 ", 16)
+      Strings.Append(@str, 16, @wStr)
+      Strings.Append(@str, 16, " 0")
+      Attributes.SetString(F, "Constraints", @str)
+      Integrate(P, F)
+    end
+  end
+end InsertVScrollList
+
+(** Integrates a list with a horiz. and vert. scrollbar at caret position
+Usage: ListGadgets.InsertHVScrollList <frame> <model> ~
+*)
+procedure InsertHVScrollList*()
+  var
+    P, hBar, vBar: Display.Frame
+    F: Frame
+    obj: Objects.Object
+    str, wStr: array 16 of char
+    fName: array 32 of char
+    S: Attributes.Scanner
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if S.class = Attributes.Name then
+    copy(@fName, @S.s, 32)
+    Attributes.Scan(@S)
+  else
+    copy(@fName, "", 32)
+  end
+
+  if S.class = Attributes.Name then
+    MakeSimpleList(@fName, @S.s, @P, @F, @vBar)
+    if F # nil then
+      obj := Gadgets.CreateObject("Scrollbars.New")
+      if obj # nil then
+        Links.SetLink(F, "HPos", Gadgets.CreateObject("Integer"))
+        Links.SetLink(F, "HRange", Gadgets.CreateObject("Integer"))
+
+        hBar := obj(Display.Frame)
+        Attributes.SetInt(hBar, "Min", 0)
+        Attributes.SetBool(hBar, "HeavyDrag", true)
+        Attributes.SetBool(hBar, "Vertical", false)
+        Links.SetLink(hBar, "Max", F.hMax)
+        Links.SetLink(hBar, "Model", F.hPos)
+        hBar.X := -hBar.H
+        hBar.Y := 0
+        hBar.W := F.W
+        inc(P.H, hBar.H)
+        // constrinat
+        copy(@str, "0 ", 16)
+        Strings.IntToStr(-hBar.H, @wStr, 16)
+        Strings.Append(@str, 16, @wStr)
+        Strings.AppendCh(@str, 16, " ")
+        Strings.IntToStr(P.W - hBar.W, @wStr, 16)
+        Strings.Append(@str, 16, @wStr)
+        Strings.Append(@str, 16, " 0")
+        Attributes.SetString(hBar, "Constraints", @str)
+        hBar.slink := vBar
+        F.slink := hBar
+      end
+
+      if vBar # nil then
+        Strings.IntToStr(-vBar.W, @wStr, 16)
+        copy(@str, "", 16)
+        Strings.Append(@str, 16, @wStr)
+        Strings.Append(@str, 16, " 0 0 ")
+        Strings.IntToStr(P.H - vBar.H, @wStr, 16)
+        Strings.Append(@str, 16, @wStr)
+        Attributes.SetString(vBar, "Constraints", @str)
+      end
+
+      Strings.IntToStr(P.W - F.W, @wStr, 16)
+      copy(@str, "0 0 ", 16)
+      Strings.Append(@str, 16, @wStr)
+      Strings.AppendCh(@str, 16, " ")
+      Strings.IntToStr(P.H - F.H, @wStr, 16)
+      Strings.Append(@str, 16, @wStr)
+      Attributes.SetString(F, "Constraints", @str)
+      Integrate(P, F)
+    end
+  end
+end InsertHVScrollList
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewFrame" end return NewFrame end
+  if i = 1 then if name # nil then name^ := "InsertVScrollList" end return InsertVScrollList end
+  if i = 2 then if name # nil then name^ := "InsertHVScrollList" end return InsertHVScrollList end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("ListGadgets", cmd_)
+  Texts.OpenWriter(@W)
+  newgc(pointText)
+  Texts.Open(pointText, "")
+
+  WaitTime := 75i2 * Input.TimeUnit div 1000i2
+  mayscroll := Oberon.Time()
+
+  newgc(methods)
+  methods.GetRider := GetStandardRider
+  methods.Format := FormatLine
+  methods.Display := DisplayLine
+  methods.PrintFormat := PrintFormatLine
+  methods.Print := PrintLine
+end ListGadgets.

@@ -1,0 +1,882 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Pictures [level=5]
+
+import Texts, Oberon, Files, Display, Objects, Bitmaps, Modules, Out, Kernel
+// portable, except where noted
+// tn, 1992
+
+(** Module Pictures implement an abstract data type (and object type) for manipulating colored bitmaps of various color depths.
+*)
+
+const
+  TryAll = true // try all converters if first one fails
+
+  redraw* = 4 // UpdateMsg id.
+  resize* = 5
+  PictFileId* = -4093 // First two bytes of a .Pict file (0F0H, 3H).
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  BytesPtr = pointer to array of byte // helper type for VAR ARRAY OF SYSTEM.BYTE parameters
+  CharPtr = pointer to char // helper type for a variable reinterpreted by SYSTEM.VAL
+
+  Picture* = pointer to PictureDesc
+  UpdateMsg* = object (Display.FrameMsg)
+    id*, u*, v*, w*, h*: int16
+    pict*: Picture
+  end
+  PUpdateMsg* = pointer to UpdateMsg
+
+
+  ColorTableDesc = array 256 of record
+    red, green, blue: int16
+  end
+  ColorTable = pointer to ColorTableDesc
+
+  PictureDesc* = object (Objects.ObjDesc)
+    width*: int16 // Width, height in pixels, and depth in bits per pixel (1, 4, or 8).
+    height*, depth*: int16
+    wth: int32
+    bitmap: Bitmaps.Bitmap
+    address*: AnyPtr // non-portable
+    // Pointer to bitmap data.
+    ct: ColorTable
+    refr: BytesPtr
+  end
+
+var
+  dots*: AnyPtr
+  colorD*: int16 // Default bitmap color depth.
+  grey: array 4 of AnyPtr
+  greyPat: array 4 of array 5 of int32
+  handler: Objects.Handler
+  cRes: int16
+  cName: array 128 of char
+  cP: Picture
+  first: boolean
+
+(*
+PROCEDURE InBoundaries(x, y, w, h: INTEGER): BOOLEAN;
+CODE {SYSTEM.i386}
+MOV AX, x[EBP]
+MOV BX, y[EBP]
+CMP AX, 0
+JL false
+CMP BX, 0
+JL false
+CMP w[EBP], AX
+JLE false
+CMP h[EBP], BX
+JLE false
+MOV EAX, 1
+LEAVE
+RET 16
+false:
+XOR EAX, EAX
+LEAVE
+RET 16
+END InBoundaries;
+*)
+
+procedure InBoundaries(x, y, w, h: int16): boolean
+begin
+  return (x >= 0) & (y >= 0) & (x < w) & (y < h)
+end InBoundaries
+
+// Get the color index of the bitmap pixel at X, Y.
+procedure Get*(P: Picture; X, Y: int16): int16
+begin
+  if InBoundaries(X, Y, P.width, P.height) then
+    return Bitmaps.Get(P.bitmap, X, Y)
+  else
+    return Display.BG
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Get
+
+// Put a pixel of color col at x, y using mode.
+procedure Dot*(P: Picture; col, X, Y, mode: int16)
+begin
+  if InBoundaries(X, Y, P.width, P.height) then
+    Bitmaps.Dot(P.bitmap, col, ptroff(AnyPtr{0}, X), Y, mode)
+  end
+end Dot
+
+// Starting at position x, y, determine the longest run of the same colored pixels (col) on the same scanline. Afterwards x indicates the first pixel of a different color thatn col.
+procedure GetRun*(P: Picture; col, X: pointer to int16; Y: int16)
+begin
+  if InBoundaries(X^, Y, P.width, P.height) then
+    col^ := Get(P, X^, Y)
+    inc(X^)
+    while (Get(P, X^, Y) = col^) & (X^ < P.width) do
+      inc(X^)
+    end
+  end
+end GetRun
+
+// Copy a the block sx, sy, w, h from picture sP to position dx, dy in destination picture dP. Source and destination picture may be the same.
+procedure CopyBlock*(sP, dP: Picture; SX, SY, W, H, DX, DY, mode: int16)
+begin
+  if InBoundaries(SX, SY, sP.width, sP.height) then
+    assert((W >= 0) & (H >= 0))
+    if InBoundaries(DX, DY, dP.width, dP.height) then
+      if SX + W > sP.width then
+        W := sP.width - SX
+      end
+      if DX + W > dP.width then
+        W := dP.width - DX
+      end
+      if SY + H > sP.height then
+        H := sP.height - SY
+      end
+      if DY + H > dP.height then
+        H := dP.height - DY
+      end
+      Bitmaps.CopyBlock(sP.bitmap, dP.bitmap, SX, SY, W, H, DX, DY, mode)
+    end
+  end
+end CopyBlock
+
+// Copy the pattern pat in color col to position x, y using mode.
+procedure CopyPattern*(P: Picture; col: int16; pat: AnyPtr; X, Y, mode: int16)
+  var
+    w, h: int16
+begin
+  if InBoundaries(X, Y, P.width, P.height) then
+    w := 0
+    h := 0
+    cast(CharPtr, @w)^ := cast(CharPtr, pat)^
+    cast(CharPtr, @h)^ := cast(CharPtr, ptroff(pat, 1))^
+    if InBoundaries(X + w - 1, Y + h - 1, P.width, P.height) then
+      Bitmaps.CopyPattern(P.bitmap, col, pat, X, Y, mode)
+    end
+  end
+end CopyPattern
+
+// Block fill area x, y, w, h in color col using mode.
+procedure ReplConst*(P: Picture; col, X, Y, W, H, mode: int16)
+begin
+  if InBoundaries(X, Y, P.width, P.height) then
+    assert((W >= 0) & (H >= 0))
+    if X + W > P.width then
+      W := P.width - X
+    end
+    if Y + H > P.height then
+      H := P.height - Y
+    end
+    Bitmaps.ReplConst(P.bitmap, col, X, Y, W, H, mode)
+  end
+end ReplConst
+
+// Pattern fill pattern pat in the area x, y, w, h in color col using mode.
+procedure ReplPattern*(P: Picture; col: int16; pat: AnyPtr; X, Y, W, H, mode: int16)
+begin
+  if InBoundaries(X, Y, P.width, P.height) then
+    assert((W >= 0) & (H >= 0))
+    if X + W > P.width then
+      W := P.width - X
+    end
+    if Y + H > P.height then
+      H := P.height - Y
+    end
+    Bitmaps.ReplPattern(P.bitmap, col, pat, X, Y, W, H, mode)
+  end
+end ReplPattern
+
+// Copy area SX, SY, SW, SH of source picture sP to area DX, DY, DW, DH of destination picture dP. Appropriate scaling is done.
+procedure Copy*(sP, dP: Picture; SX, SY, SW, SH, DX, DY, DW, DH, mode: int16)
+begin
+  Bitmaps.Copy(sP.bitmap, dP.bitmap, SX, SY, SW, SH, DX, DY, DW, DH, mode)
+end Copy
+
+(*
+PROCEDURE Copy*(sP,dP:Picture;SX,SY,SW,SH,DX,DY,DW,DH,mode:INTEGER);
+VAR hx, hy,DW2,SW2: LONGINT;
+dx, dy, SXo, DXo: INTEGER;
+BEGIN
+IF (SW> 0) &(SH >0) &(DW >0 ) &(DH > 0) THEN
+dy := DY + DH; dx := DX + DW; SXo := SX; DXo := DX; DW2 := 2 * DW; SW2 := 2 * SW;
+hy := 2*SH - DH;
+WHILE DY < dy DO
+hx := 2* SW - DW; DX := DXo; SX := SXo;
+WHILE DX < dx DO
+Dot(dP,Get(sP,SX,SY),DX,DY,mode);
+WHILE hx > 0 DO INC(SX); DEC(hx,DW2) END;
+INC(DX); INC(hx,SW2)
+END;
+WHILE hy > 0 DO INC(SY); hy := hy - 2 * DH END;
+INC(DY); hy := hy + 2* SH
+END
+END
+END Copy;
+*)
+
+// ==================================================================================
+
+// Define the color palette for color index col.
+procedure SetColor*(P: Picture; col, red, green, blue: int16)
+begin
+  P.ct[col].red := red
+  P.ct[col].green := green
+  P.ct[col].blue := blue
+end SetColor
+
+// Retrieve the color palette entry for color index col.
+procedure GetColor*(P: Picture; col: int16; red, green, blue: pointer to int16)
+begin
+  red^ := P.ct[col].red
+  green^ := P.ct[col].green
+  blue^ := P.ct[col].blue
+end GetColor
+
+procedure StoreCT(R: pointer to Files.Rider; ct: ColorTable; depth: int16)
+  var
+    i: int16
+begin
+  Files.WriteBytes(R, cast(BytesPtr, @depth), 2, 2)
+  depth := abs(depth)
+  i := 0
+  while i < sigc(shl(val(int32, 1), usig(val(int32, depth)))) do
+    Files.WriteBytes(R, cast(BytesPtr, @ct[i].red), 1, 1)
+    Files.WriteBytes(R, cast(BytesPtr, @ct[i].green), 1, 1)
+    Files.WriteBytes(R, cast(BytesPtr, @ct[i].blue), 1, 1)
+    inc(i)
+  end
+end StoreCT
+
+procedure LoadCT(R: pointer to Files.Rider; ct: ColorTable; depth: int16)
+  var
+    i: int16
+begin
+  i := 0
+  while i < sigc(shl(val(int32, 1), usig(val(int32, depth)))) do
+    ct[i].red := 0
+    ct[i].green := 0
+    ct[i].blue := 0
+    Files.ReadBytes(R, cast(BytesPtr, @ct[i].red), 1, 1)
+    Files.ReadBytes(R, cast(BytesPtr, @ct[i].green), 1, 1)
+    Files.ReadBytes(R, cast(BytesPtr, @ct[i].blue), 1, 1)
+    inc(i)
+  end
+end LoadCT
+
+// Indicate that a change has been made to the area X, Y, W, H of P. This results in an UpdateMsg with id = redraw to be broadcasted into the display space.
+procedure Update*(P: Picture; X, Y, W, H: int16)
+  var
+    msg: UpdateMsg
+begin
+  msg.u := X
+  msg.v := Y
+  msg.w := W
+  msg.h := H
+  msg.id := redraw
+  msg.pict := P
+  msg.res := -1
+  msg.F := nil
+  Display.Broadcast(@msg)
+end Update
+
+// Copy the area x, y, w, h of picture P to position dx, dy on the display.
+procedure DisplayBlock*(P: Picture; X, Y, W, H, DX, DY, mode: int16)
+  var
+    screen: Picture
+    L, B, R, T, cw, ch: int16
+begin
+  Display.GetClip(@L, @B, @cw, @ch)
+  R := L + cw
+  T := B + ch
+  if DX + W < R then
+    R := DX + W
+  end
+  if DY + H < T then
+    T := DY + H
+  end
+  if DX > L then
+    L := DX
+  end
+  if DY > B then
+    B := DY
+  end
+  inc(X, L - DX)
+  inc(Y, B - DY)
+  W := R - L
+  H := T - B
+  if (R > L) & (T > B) then
+    if InBoundaries(X, Y, P.width, P.height) then
+      if X + W > P.width then
+        W := P.width - X
+      end
+      if Y + H > P.height then
+        H := P.height - Y
+      end
+      Bitmaps.DisplayBlock(P.bitmap, X, Y, W, H, L, B, mode)
+    end
+  end
+end DisplayBlock
+
+procedure New(P: pointer to Picture; width, height, depth: int16; addr: AnyPtr)
+  var
+    H: int32
+begin
+  P^.handle := handler
+  P^.depth := 8
+  P^.width := width
+  P^.height := height
+  P^.wth := width
+  if addr = nil then
+    H := P^.wth * P^.height + 10
+    newgc(P^.refr, H)
+    P^.address := cast(AnyPtr, @P^.refr[0])
+  else
+    P^.address := addr
+  end
+  newgc(P^.bitmap)
+  Bitmaps.Define(P^.bitmap, P^.width, P^.height, 8, P^.address)
+  newgc(P^.ct)
+end New
+
+procedure Clear(P: Picture)
+begin
+  Bitmaps.Clear(P.bitmap)
+end Clear
+
+// Create a picture of size width x height with depth bits per pixel. The picture palette is initialized to a default state. If not enough memory is available to allocate the bitmap data, the width, height, and depth of the picture is set to zero.
+procedure Create*(P: Picture; width, height, depth: int16)
+  var
+    i, r, g, b: int16
+begin
+  if depth > 8 then
+    halt(99) // number too large
+  end
+  New(@P, width, height, depth, nil)
+  Clear(P)
+  i := 0
+  while i < 256 do
+    Display.GetColor(i, @r, @g, @b)
+    SetColor(P, i, r, g, b)
+    inc(i)
+  end
+end Create
+
+// Like Dot, for a line of pixels.
+
+procedure PutLine*(P: Picture; data: pointer to array of int16; data_len: int32; x, y, w: int16)
+begin
+  Bitmaps.PutLine(P.bitmap, data, data_len, x, y, w)
+end PutLine
+
+(*
+PROCEDURE PutLine*(P: Picture; VAR data: ARRAY OF INTEGER; x, y, w: INTEGER);
+VAR i: INTEGER;
+BEGIN
+i := 0;
+WHILE i < w DO
+Dot(P, data[i], x, y, Display.replace);
+INC(i);  INC(x)
+END
+END PutLine;
+*)
+
+// Like Get, for a line of pixels.
+
+procedure GetLine*(P: Picture; data: pointer to array of int16; data_len: int32; x, y, w: int16)
+begin
+  Bitmaps.GetLine(P.bitmap, data, data_len, x, y, w)
+end GetLine
+
+(*
+PROCEDURE GetLine*(P: Picture; VAR data: ARRAY OF INTEGER; x, y, w: INTEGER);
+VAR i: INTEGER;
+BEGIN
+i := 0;
+WHILE i < w DO
+data[i] := Get(P, x, y);
+INC(i);  INC(x)
+END
+END GetLine;
+*)
+
+// Stores picture run length encoded to file F (including tag).
+procedure Store*(P: Picture; F: Files.File; pos: int32; len_: pointer to int32)
+  // stores picture to run length encoded file F  (including tag
+  var
+    j, i, a, b, d, wth: int16
+    adr, OldAdr: AnyPtr
+    size_: int32
+    h: int8
+    buf: array 129 of int8
+    R: Files.Rider
+    ch: char
+    help: boolean
+begin
+  Files.Set(@R, F, pos)
+  j := PictFileId
+  Files.WriteBytes(@R, cast(BytesPtr, @j), 2, 2)
+  Files.WriteBytes(@R, cast(BytesPtr, @P.width), 2, 2)
+  Files.WriteBytes(@R, cast(BytesPtr, @P.height), 2, 2)
+  StoreCT(@R, P.ct, P.depth)
+  d := P.depth
+  wth := val(int16, P.wth)
+  if d = 1 then
+    wth := val(int16, asr(P.wth + 7, 3))
+  elsif d = 4 then
+    wth := val(int16, asr(P.wth + 1, 1))
+  end
+  size_ := P.wth * P.height
+  size_ := size_ - P.wth
+  adr := P.address
+  inc(adr, size_)
+  i := 0
+  while i < P.height do
+    OldAdr := adr
+    a := 0
+    j := 1
+    buf[0] := 0
+    Bitmaps.GetPix(@adr, cast(BytePtr, @buf[j]), d)
+    b := a + 1
+    while b < wth do
+      Bitmaps.GetPix(@adr, cast(BytePtr, @h), d)
+      help := (h = buf[j]) & (j = 1)
+      if (b - a < 127) & ((buf[0] = 0) or help or (h # buf[j]) & (j > 1)) then
+        // same run
+        if h # buf[j] then
+          inc(buf[0])
+          inc(j)
+          buf[j] := h
+        else
+          dec(buf[0])
+        end
+      else
+        // new run
+        if (buf[j] = h) & (b - a # 127) then
+          dec(buf[0])
+          Files.WriteBytes(@R, cast(BytesPtr, @buf), 129, j)
+          buf[0] := -1
+        else
+          Files.WriteBytes(@R, cast(BytesPtr, @buf), 129, j + 1)
+          buf[0] := 0
+        end
+        j := 1
+        buf[j] := h
+        a := b
+      end
+
+      b := b + 1
+    end
+
+    adr := OldAdr
+    dec(adr, P.wth)
+    Files.WriteBytes(@R, cast(BytesPtr, @buf), 129, j + 1)
+    inc(i)
+  end
+
+  len_^ := Files.Pos(@R) - pos
+end Store
+
+procedure LoadRLE(P: Picture; R: pointer to Files.Rider; rv: boolean)
+  // load run length encoded picture
+  var
+    ch: char
+    k, d, h: int16
+    a, bp: AnyPtr
+    b, c, ce: int32
+    cL, cH: char
+begin
+  a := P.address
+  c := P.wth
+  b := P.height
+  c := c * (b - 1)
+  b := val(int32, ord(a)) + c
+  a := ptroff(AnyPtr{0}, b)
+  ce := b + P.wth
+  c := P.height
+  d := P.depth
+  while c > 0 do
+    Files.Read(R, cast(BytePtr, @ch))
+    k := val(int16, ord(ch))
+    if k < 128 then
+      repeat
+        Files.Read(R, cast(BytePtr, @ch))
+        bp := ptroff(AnyPtr{0}, b)
+        Bitmaps.PutPix(@bp, ce, val(byte, ord(ch)), d)
+        b := val(int32, ord(bp))
+        if b >= ce then
+          ce := ce - P.wth
+          b := val(int32, ord(a)) - P.wth
+          a := ptroff(AnyPtr{0}, b)
+          c := c - 1
+        end
+        k := k - 1
+      until k < 0
+
+    elsif k >= 128 then
+      k := 257 - k
+      Files.Read(R, cast(BytePtr, @ch))
+      repeat
+        bp := ptroff(AnyPtr{0}, b)
+        Bitmaps.PutPix(@bp, ce, val(byte, ord(ch)), d)
+        b := val(int32, ord(bp))
+        if b >= ce then
+          ce := ce - P.wth
+          b := val(int32, ord(a)) - P.wth
+          a := ptroff(AnyPtr{0}, b)
+          c := c - 1
+        end
+        k := k - 1
+      until k < 1
+    end
+  end
+end LoadRLE
+
+// Load a run length encoded picture from position pos from file F. Pos should be AFTER the two byte picture identification of a picture file.
+procedure Load*(P: Picture; F: Files.File; pos: int32; len_: pointer to int32)
+  var
+    R: Files.Rider
+    h, i, orient, id, d: int16
+    // buf: ARRAY MaxWth OF CHAR;
+    err: array 32 of char
+    size_, p, adr, n: int32
+    rle: boolean
+begin
+  Files.Set(@R, F, pos - 2)
+  Files.ReadBytes(@R, cast(BytesPtr, @id), 2, 2)
+  if id = PictFileId then
+    Files.ReadBytes(@R, cast(BytesPtr, @P.width), 2, 2)
+    Files.ReadBytes(@R, cast(BytesPtr, @P.height), 2, 2)
+    Files.ReadBytes(@R, cast(BytesPtr, @P.depth), 2, 2)
+    newgc(P.ct)
+    LoadCT(@R, P.ct, P.depth)
+    P.wth := P.width
+    size_ := P.wth * P.height
+    newgc(P.refr, size_ + 10)
+    P.address := cast(AnyPtr, @P.refr[0])
+    newgc(P.bitmap)
+    Bitmaps.Define(P.bitmap, P.width, P.height, P.depth, P.address)
+    LoadRLE(P, @R, P.depth = 1)
+  else
+    copy(@err, "This file is not a picture ", 32)
+    halt(42)
+  end
+  P.handle := handler
+  len_^ := Files.Pos(@R) - pos
+end Load
+
+procedure SplitName(name, MName, PName: pointer to array of char)
+  var
+    i, j: int16
+begin
+  i := 0
+  while name[i] # "." do
+    MName[i] := name[i]
+    inc(i)
+  end
+  MName[i] := 0X
+  inc(i)
+  j := 0
+  while name[i] # 0X do
+    PName[j] := name[i]
+    inc(i)
+    inc(j)
+  end
+  PName[j] := 0X
+end SplitName
+
+procedure GetExt(name, ext: pointer to array of char)
+  var
+    i, j: int16
+begin
+  i := 0
+  j := 0
+  while name[i] # 0X do
+    if name[i] = "." then
+      j := i + 1
+    end
+    inc(i)
+  end
+  i := 0
+  while name[j] # 0X do
+    ext[i] := name[j]
+    inc(i)
+    inc(j)
+  end
+  ext[i] := 0X
+end GetExt
+
+procedure TryConverter(const newproc: pointer to array of char)
+  var
+    mname, pname: array 32 of char
+    mod_: Modules.Module
+    cmd: Modules.Command
+    FM: Objects.FileMsg
+    F: Files.File
+begin
+  SplitName(newproc, @mname, @pname)
+  (*Kernel.WriteString("Pictures ");  Kernel.WriteString(mname);
+  Kernel.WriteChar(".");  Kernel.WriteString(pname);*)
+  mod_ := Modules.ThisMod(@mname)
+  if Modules.res = 0 then
+    cmd := Modules.ThisCommand(mod_, @pname)
+    if Modules.res = 0 then
+      Objects.NewObj := cP
+      cmd()
+      F := Files.Old(@cName)
+      FM.id := Objects.load
+      Files.Set(@FM.R, F, 0)
+      cP.handle(cP, @FM)
+      if FM.len_ = 0 then
+        cRes := 1
+      else
+        cRes := 0
+      end
+    else
+      cRes := 1
+    end
+
+  else
+    cRes := 1
+  end
+
+  // Kernel.WriteInt(FM.len, 8);  Kernel.WriteInt(cRes, 5);  Kernel.WriteLn
+end TryConverter
+
+procedure ConverterOpen()
+  var
+    ext: array 32 of char
+    newproc: array 64 of char
+    s: Texts.Scanner
+begin
+  cRes := 0
+  GetExt(@cName, @ext)
+  Oberon.OpenScanner(@s, "PictureConverters")
+  copy(@newproc, "", 64)
+  if first & (s.class = Texts.Inval) then
+    first := false
+    Out.String("Oberon.Text - PictureConverters not found")
+    Out.Ln()
+  end
+
+  while s.class = Texts.Name do
+    if s.s = ext then
+      Texts.Scan(@s)
+      Texts.Scan(@s)
+      if s.class = Texts.Name then
+        copy(@newproc, @s.s, 64)
+        s.class := Texts.Inval
+      end
+
+    else
+      Texts.Scan(@s)
+      Texts.Scan(@s)
+      Texts.Scan(@s)
+    end
+  end
+
+  if newproc # "" then
+    TryConverter(@newproc)
+  else
+    cRes := 1
+  end
+  if TryAll & (cRes # 0) then
+    Oberon.OpenScanner(@s, "PictureConverters")
+    while (cRes # 0) & (s.class = Texts.Name) do
+      Texts.Scan(@s)
+      Texts.Scan(@s)
+      if (s.class = Texts.Name) & (s.s # newproc) then
+        TryConverter(@s.s)
+      end
+      Texts.Scan(@s)
+    end
+  end
+end ConverterOpen
+
+// Open the picture file with name from disk. Any graphic file format listed in the PictureConverters section of Oberon.Text can be loaded (e.g. GIF, JPEG, XBM, BMP).
+procedure Open*(P: Picture; const name: pointer to array of char; color: boolean)
+  var
+    F: Files.File
+    R: Files.Rider
+    len_: int32
+    x, depth: int16
+    P2: Picture
+    dname: array 64 of char // << jm
+    d: int16
+begin
+  F := Files.Old(name)
+  if color then
+    depth := 8
+  else
+    depth := 1
+  end
+  if F # nil then
+    Files.Set(@R, F, 0)
+    x := 0
+    Files.ReadInt(@R, @x)
+    if x = 2039 then
+      // << document
+      Files.ReadString(@R, @dname, 64)
+      Files.ReadInt(@R, @d)
+      Files.ReadInt(@R, @d)
+      Files.ReadInt(@R, @d)
+      Files.ReadInt(@R, @d)
+      Files.ReadInt(@R, @x)
+    end
+
+    if x = PictFileId then
+      Load(P, F, Files.Pos(@R), @len_)
+      P.handle := handler
+    else
+      cP := P
+      copy(@cName, name, 128)
+      ConverterOpen()
+      if cRes # 0 then
+        P.width := 0
+        P.height := 0
+        P.depth := 0
+      end
+      cP := nil
+      P.handle := handler
+    end
+
+    if P.depth < depth then
+      newgc(P2)
+      Create(P2, P.width, P.height, depth)
+      CopyBlock(P, P2, 0, 0, P.width, P.height, 0, 0, Display.replace)
+      P^ := P2^
+    end
+
+  else
+    P.width := 0
+    P.height := 0
+    P.depth := 0
+  end
+end Open
+
+// Returns the address of the bitmap data of a picture.
+procedure Address*(P: Picture): int32
+  // non-portable
+  var
+    val_, x, i, j: int16
+    w: int32
+begin
+  halt(99) // should not be used
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Address
+
+// Default picture object handler.
+
+procedure Handle*(obj: Objects.Object; msg: pointer to Objects.ObjMsg)
+  var
+    len_: int32
+    P2: Picture
+    ref: int16
+begin
+  case obj of
+  | Picture:
+    case msg of
+    | Objects.PAttrMsg:
+      if (msg.id = Objects.get) & (msg.name = "Gen") then
+        msg.class := Objects.String
+        copy(@msg.s, "Pictures.NewPicture", 64)
+        msg.res := 0
+      end
+
+    | Objects.PFileMsg:
+      if msg.id = Objects.store then
+        Store(obj, Files.Base(@msg.R), Files.Pos(@msg.R), @len_)
+        Files.Set(@msg.R, Files.Base(@msg.R), Files.Pos(@msg.R) + len_)
+      elsif msg.id = Objects.load then
+        Load(obj, Files.Base(@msg.R), Files.Pos(@msg.R) + 2, @len_)
+        Files.Set(@msg.R, Files.Base(@msg.R), Files.Pos(@msg.R) + 2 + len_)
+      end
+
+    | Objects.PCopyMsg:
+      if msg.stamp = obj.stamp then
+        msg.obj := obj.dlink // non-first arrival
+      else
+        newgc(P2)
+        obj.stamp := msg.stamp
+        obj.dlink := P2
+        Create(P2, obj.width, obj.height, obj.depth)
+        CopyBlock(obj, P2, 0, 0, obj.width, obj.height, 0, 0, Display.replace)
+        P2.ct := obj.ct
+        msg.obj := P2
+      end
+
+    | Objects.PBindMsg:
+      if (obj.lib = nil) or (obj.lib.name = "") & (obj.lib # msg.lib) then
+        msg.lib.GenRef(msg.lib, @ref)
+        msg.lib.PutObj(msg.lib, ref, obj)
+      end
+
+    end
+  end
+end Handle
+
+// Generator for a picture object.
+procedure NewPicture*()
+  var
+    P: Picture
+begin
+  newgc(P)
+  Create(P, 1, 1, 1)
+  Objects.NewObj := P
+end NewPicture
+
+procedure Init()
+  var
+    i: int16
+    s: array 8 of set
+begin
+  handler := Handle
+  colorD := 8
+  first := true
+
+  s[0] := {}
+  s[1] := {1..7,9..15,17..23,25..31}
+  s[2] := s[1]
+  s[3] := s[1]
+  s[4] := s[1]
+  s[5] := s[1]
+  s[6] := s[1]
+  s[7] := s[1]
+  dots := Display.NewPattern(32, 8, @s)
+  greyPat[0][0] := 34603008
+  greyPat[0][1] := val(int32, val(int32, 2863311530))
+  greyPat[0][2] := 0
+  greyPat[1][0] := 68157440
+  greyPat[1][1] := 286331153
+  greyPat[1][2] := 0
+  greyPat[1][3] := 0
+  greyPat[1][4] := 0
+  greyPat[2][0] := 34603008
+  greyPat[2][1] := val(int32, val(int32, 2863311530))
+  greyPat[2][2] := val(int32, val(int32, 4294967295))
+  greyPat[3][0] := 68157440
+  greyPat[3][1] := 286331153
+  greyPat[3][2] := 0
+  greyPat[3][3] := 1145324612
+  greyPat[3][4] := 0
+
+  grey[0] := cast(AnyPtr, @greyPat[1])
+  inc(grey[0], 2)
+  grey[1] := cast(AnyPtr, @greyPat[3])
+  inc(grey[1], 2)
+  grey[2] := cast(AnyPtr, @greyPat[0])
+  inc(grey[2], 2)
+  grey[3] := Display.grey1
+end Init
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewPicture" end return NewPicture end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Pictures", cmd_)
+  Init()
+end Pictures.

@@ -1,0 +1,104 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module ListRiders [level=5]
+
+import Objects, Gadgets, Modules
+// portable
+// ps, based on Rider by rv,
+
+// id for UpdateMsg
+
+const
+  insert* = 0
+  delete* = 1
+  state* = 2
+
+type
+  Data* = pointer to DataDesc
+  DataDesc* = object
+  end
+
+  Bool* = pointer to BoolDesc
+  BoolDesc* = object (DataDesc)
+    b*: boolean
+  end
+
+  Char* = pointer to CharDesc
+  CharDesc* = object (DataDesc)
+    c*: char
+  end
+
+  String* = pointer to StringDesc
+  StringDesc* = object (DataDesc)
+    s*: array 64 of char
+  end
+
+  Int* = pointer to IntDesc
+  IntDesc* = object (DataDesc)
+    i*: int32
+  end
+
+  Real* = pointer to RealDesc
+  RealDesc* = object (DataDesc)
+    x*: real
+  end
+
+  LReal* = pointer to LRealDesc
+  LRealDesc* = object (DataDesc)
+    x*: longreal
+  end
+
+  Method* = pointer to MethodDesc
+
+  Rider* = pointer to RiderDesc
+  RiderDesc* = object
+    d*: Data // Data of the current item
+    do_*: Method // Method block
+    base*: Objects.Object // Model object on which the rider is working
+    dsc*: boolean // Has-descendant, End-of-list
+    eol*: boolean
+  end
+
+  MethodDesc* = record
+    Key*: procedure(R: Rider): int32 // Get the current item's key
+    Seek*: procedure(R: Rider; key: int32) // Position rider R on the item having the given key
+    Pos*: procedure(R: Rider): int32 // Get current position of the rider
+    Set*: procedure(R: Rider; pos: int32) // Position rider R on the item having the given pos
+    Write*: procedure(R: Rider; d: Data) // Insert data at the current position of R
+    WriteLink*: procedure(R: Rider; linkR: Rider) // Link the item at the position of linkR to the current position of R
+    DeleteLink*: procedure(R: Rider; linkR: Rider) // Delete link from R to linkR
+    State*: procedure(R: Rider): int32 // Get the state of the current item
+    SetState*: procedure(R: Rider; s: int32) // Set the state of the current item
+    (** Get a rider working on the descendants of the item on the position of R. If old is NIL, then a new rider
+    is allocated. old is recycled if not NIL *)
+    Desc*: procedure(R: Rider; old: Rider): Rider
+    GetStamp*: procedure(R: Rider): int32 // Get stamp value of the item at the current position of R
+    SetStamp*: procedure(R: Rider; stamp: int32) // Set stamp value of the item at the current position of R
+  end
+
+  // Get a new initialized rider from a model gadget. Sent by a client to a model gadget.
+  ConnectMsg* = object (Objects.ObjMsg)
+    R*: Rider
+  end
+  PConnectMsg* = pointer to ConnectMsg
+
+  // Message broadcast to indicate that a model object changed
+  UpdateMsg* = object (Gadgets.UpdateMsg)
+    id*: int16 // insert, delete or state
+  end
+  PUpdateMsg* = pointer to UpdateMsg
+
+var
+  stamp: int32
+
+procedure Stamp*(): int32
+begin
+  inc(stamp)
+  return stamp
+end Stamp
+
+begin
+  Modules.Register("ListRiders", nil)
+  stamp := (-2147483647-1)
+end ListRiders.

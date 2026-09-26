@@ -5,7 +5,7 @@ and running natively on RISC-V (and later also x86 and ARMv7).
 It is a consequence of the successful migration of the [Project Oberon System to Micron](https://github.com/rochus-keller/OberonSystem/tree/micron-rv32)
 and uses the same virtual machine (extended by a color frame buffer).
 
-This is work in progress. Check back later.
+This is work in progress. 
 
 
 ### Status on Sept. 11, 2026
@@ -42,3 +42,17 @@ Micron Oberon System 3
 Here is the screen output:
 
 ![Micron System 3 Screenshot](http://software.rochus-keller.ch/micronsystem3_outer.png)
+
+### Status on Sept. 26, 2026
+
+Added a decent set of gadget modules and added throttling to machine.c to increase the overall performance.
+It turned out that 75% of emulated cycles were used for screen update. Updates are now throttled to one per 16ms
+which seems to have doubled the performance. There is still a lag of ~10 seconds up front because all
+modules are statically loaded and their initializers run. But then the system is decently responsive.
+Maybe it's time to start with the ARMv7 migration to QEMU where we have a JIT producing much better performance.
+
+Here is the screen output:
+
+![Micron System 3 Screenshot](http://software.rochus-keller.ch/micronsystem3_gadgets.png)
+
+

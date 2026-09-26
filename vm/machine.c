@@ -572,6 +572,17 @@ static void readElf(const char* path, uint32_t* entry, uint32_t* memEnd, uint32_
     *dataOrg &= ~3u;
 }
 
+/* the screen is looked at at most every FRAME_MS milliseconds; checking it
+   after every rv_step costs more time than the emulation itself */
+enum { FRAME_MS = 16, STEPS_PER_CHECK = 512 };
+
+static uint32_t nowMs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+}
+
 static volatile int interrupted = 0;
 
 static void onInterrupt(int sig)
@@ -603,6 +614,7 @@ int main(int argc, char** argv)
     int noScreen = 0;
     int elfMode = 0;
     uint32_t entry, memEnd = 0, dataOrg = 0, ramWanted = RAM_SIZE;
+    uint32_t steps, lastFrame;
     char elfFile[256];
     vm_attr_t attr;
     riscv_io_t io;
@@ -749,6 +761,8 @@ int main(int argc, char** argv)
 
     signal(SIGINT, onInterrupt);
 
+    steps = 0;
+    lastFrame = nowMs();
     while( !halted && !rv_has_halted(rv) )
     {
         rv_step(rv);
@@ -761,6 +775,15 @@ int main(int argc, char** argv)
 
         if( !noScreen )
         {
+            uint32_t now;
+            if( ++steps < STEPS_PER_CHECK )
+                continue;
+            steps = 0;
+            now = nowMs();
+            if( now - lastFrame < FRAME_MS )
+                continue;
+            lastFrame = now;
+
             if( dirtyHi >= dirtyLo )
             {
                 /* Wirth's frame buffer is bottom up, the screen adapter counts

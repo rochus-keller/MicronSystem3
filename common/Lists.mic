@@ -1,0 +1,1975 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Lists [level=5]
+
+import Files, Fonts, Display, Display3, Printer, Printer3, Effects, Objects, Gadgets, Oberon, Input, Texts, Attributes, FileDir, Modules
+// portable
+// jm 18.4.95
+
+(** Implementation of scrollable lists.
+*)
+(*
+6.5.94 - No more duplicates are allowed in the lists
+4.11.94 - added support for LinkMsg, name = Model
+7.11.94 - allow setting of the Sel attribute
+6.12.94 added sorted attribute (ejz)
+17.1.95 - added support for strange diskette file names
+9.2.95 - Improved InsertItem
+18.4.94 - changed scrolling behaviour
+15.5.95 - changed scrolling behaviour back
+9.5.95 - changed copy over, now works even when focus ist alredy set (ps - 9.5.96)
+*)
+
+// , Floppy := Diskette
+
+const
+  barw = 18
+
+type
+  Bar = record
+    bg, box: int16
+    range, size_, pos: int32
+  end
+
+  Item* = pointer to ItemDesc
+  ItemDesc* = object
+    sel*: boolean // Is the list item selected ?
+    s*: array 64 of char // Item value.
+    prev*, next*: Item
+  end
+
+  List* = pointer to ListDesc
+  ListDesc* = object (Gadgets.FrameDesc)
+    items*: Item // First and last element of list of items.
+    last*, beg*: Item // First item displayed in list.
+    pointed*: Item // Item pointed at last with the middle mouse button.
+    time*: int32 // Selection time.
+    focus*: boolean // Is the list focused ?
+    sorted*: boolean // Are list entries sorted ?
+    noitems*: int16 // Number of entries in the list.
+    cmd*: array 64 of char // Cmd command attribute.
+    scrollbar*: boolean // Does the list have a scrollbar ?
+    bar: Bar
+  end
+
+var
+  W: Texts.Writer
+  mayscroll, waittime: int32
+  pat, ss: array 32 of char
+  pos: int16
+
+// ---------------------- SLIDER -------------------------
+
+procedure Dot(R: Display3.Mask; x, y: int16)
+  var
+    c: int16
+
+  procedure D(col: int16; R: pointer to Display3.Mask; c: pointer to int16; x: pointer to int16; y: pointer to int16)
+  begin
+    Display3.Dot(R^, col, x^, y^, Display.replace)
+    inc(c^)
+    inc(x^)
+    if band(c^, 3) = 0 then
+      inc(y^)
+      dec(x^, 4)
+    end
+  end D
+begin
+  c := 0
+  D(14, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(12, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(12, @R, @c, @x, @y)
+  D(0, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(0, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+end Dot
+
+procedure Knob(M: Display3.Mask; x, y, w, h: int16)
+begin
+  Display3.FilledRect3D(M, Display3.topC, Display3.bottomC, Display3.groupC, x, y, w, h, 1, Display.replace)
+  Dot(M, x + asr(w, 1) - 2, y + asr(h, 1) - 2)
+end Knob
+
+procedure DrawSlider(M: Display3.Mask; bar: pointer to Bar; x, y, w, h: int16)
+  var
+    barlen, min_, max_, pos: int32
+    i: int16
+begin
+  // border
+  Oberon.RemoveMarks(x, y, w, h)
+  Display3.Rect3D(M, Display3.bottomC, Display3.topC, x, y, w, h, 1, Display.replace)
+  if w > h then
+    barlen := obdiv((w - bar.box * 2) * bar.size_, bar.range) // length of bar
+    if barlen < 6 then
+      barlen := 6
+    end
+    // min & max
+    min_ := x + bar.box
+    max_ := x + w - bar.box - barlen
+
+    // The following tests are due to rounding problems at the end of the range
+    if bar.pos <= 0 then
+      pos := min_
+    elsif bar.pos >= bar.range - 1 then
+      pos := max_
+    else
+      pos := min_ + obdiv((max_ - min_ + 1) * bar.pos, bar.range)
+    end
+
+    Display3.FilledRect3D(M, Display3.topC, Display3.bottomC, Display3.groupC, x + 1, y + 1, bar.box - 2, h - 2, 1, Display.replace) // box inside
+    Display3.ReplConst(M, Display3.FG, x + bar.box - 1, y + 1, 1, h - 2, Display.replace) // box border
+
+    Display3.FilledRect3D(M, Display3.topC, Display3.bottomC, Display3.groupC, x + w - bar.box + 1, y + 1, bar.box - 2, h - 2, 1, Display.replace) // box inside
+    Display3.ReplConst(M, Display3.FG, x + w - bar.box, y + 1, 1, h - 2, Display.replace) // box border
+
+    // Triangles
+    for i := -4 to 1 do
+      Display3.ReplConst(M, Display3.FG, x + obdiv(bar.box, 3) - i, y + asr(h, 1) + i, 1, -(i * 2), Display.replace)
+      Display3.ReplConst(M, Display3.FG, x + w - obdiv(bar.box, 3) + i, y + asr(h, 1) + i, 1, -(i * 2), Display.replace)
+    end
+
+    // inside
+    Display3.ReplConst(M, bar.bg, x + bar.box, y + 1, w - bar.box * 2, h - 2, Display.replace)
+
+    // draw bar
+    Knob(M, val(int16, pos), y + 1, val(int16, barlen), h - 2)
+  else
+    barlen := obdiv((h - bar.box * 2) * bar.size_, bar.range) // length of bar
+    if barlen < 6 then
+      barlen := 6
+    end
+    // min & max
+    min_ := y + bar.box
+    max_ := y + h - bar.box - barlen
+
+    // The following tests are due to rounding problems at the end of the range
+    if bar.pos <= 0 then
+      pos := max_
+    elsif bar.pos >= bar.range - 1 then
+      pos := min_
+    else
+      pos := min_ + obdiv((max_ - min_ + 1) * (bar.range - 1 - bar.pos), bar.range)
+    end
+
+    Display3.FilledRect3D(M, Display3.topC, Display3.bottomC, Display3.groupC, x + 1, y + 1, w - 2, bar.box - 2, 1, Display.replace) // box inside
+    Display3.ReplConst(M, Display3.FG, x + 1, y + bar.box - 1, w - 2, 1, Display.replace) // box border
+
+    Display3.FilledRect3D(M, Display3.topC, Display3.bottomC, Display3.groupC, x + 1, y + h - bar.box + 1, w - 2, bar.box - 2, 1, Display.replace) // box inside
+    Display3.ReplConst(M, Display3.FG, x + 1, y + h - bar.box, w - 2, 1, Display.replace) // box border
+
+    // Triangles
+    for i := -4 to 1 do
+      Display3.ReplConst(M, Display3.FG, x + asr(w, 1) + i, y + obdiv(bar.box, 3) - i, -(i * 2), 1, Display.replace)
+      Display3.ReplConst(M, Display3.FG, x + asr(w, 1) + i, y + h - obdiv(bar.box, 3) + i, -(i * 2), 1, Display.replace)
+    end
+
+    // inside
+    Display3.ReplConst(M, bar.bg, x + 1, y + bar.box, w - 2, h - bar.box * 2, Display.replace)
+
+    // draw bar
+    Knob(M, x + 1, val(int16, pos), w - 2, val(int16, barlen))
+  end
+end DrawSlider
+
+procedure TrackSlider(M: Display3.Mask; bar: pointer to Bar; x, y, w, h: int16)
+  var
+    keys: set
+    X, Y: int16
+    barlen, min_, max_, pos, npos, oldpos: int32
+    keysum: set
+
+  procedure Pushed(x, y, w, h: int16; M: pointer to Display3.Mask; X: pointer to int16; Y: pointer to int16; keys: pointer to set; keysum: pointer to set): boolean
+    var
+      on, newstate: boolean
+
+    procedure On(X: pointer to int16; Y: pointer to int16; h: pointer to int16; w: pointer to int16; x: pointer to int16; y: pointer to int16): boolean
+    begin
+      return Effects.Inside(X^, Y^, x^, y^, w^, h^)
+    end On
+
+    procedure Highlight(M: pointer to Display3.Mask; h: pointer to int16; w: pointer to int16; x: pointer to int16; y: pointer to int16)
+    begin
+      Oberon.FadeCursor(@Oberon.Mouse)
+      Display3.ReplConst(M^, Display.FG, x^, y^, w^, h^, Display.invert)
+    end Highlight
+  begin
+    Input.Mouse(keys, X, Y)
+    on := On(X, Y, @h, @w, @x, @y)
+    if on then
+      Highlight(M, @h, @w, @x, @y)
+    end
+    keysum^ := keys^
+    while keys^ # {} do
+      newstate := On(X, Y, @h, @w, @x, @y)
+      if newstate # on then
+        on := newstate
+        Highlight(M, @h, @w, @x, @y)
+      end
+      Input.Mouse(keys, X, Y)
+      keysum^ := keysum^ + keys^
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.PointHand, X^, Y^)
+    end
+
+    if on then
+      Highlight(M, @h, @w, @x, @y)
+    end
+    return on & (keysum^ # {0,1,2})
+  end Pushed
+begin
+  oldpos := bar.pos // backup
+  if w > h then
+    barlen := obdiv((w - bar.box * 2) * bar.size_, bar.range) // length of bar
+    if barlen < 6 then
+      barlen := 6
+    end
+    min_ := x + bar.box
+    max_ := x + w - bar.box - barlen
+
+    // The following tests are due to rounding problems at the end of the range
+    if bar.pos <= 0 then
+      pos := min_
+    elsif bar.pos >= bar.range - 1 then
+      pos := max_
+    else
+      pos := min_ + obdiv((max_ - min_ + 1) * bar.pos, bar.range)
+    end
+
+  else
+    barlen := obdiv((h - bar.box * 2) * bar.size_, bar.range) // length of bar
+    if barlen < 6 then
+      barlen := 6
+    end
+    min_ := y + bar.box
+    max_ := y + h - bar.box - barlen
+
+    // The following tests are due to rounding problems at the end of the range
+    if bar.pos <= 0 then
+      pos := max_
+    elsif bar.pos >= bar.range - 1 then
+      pos := min_
+    else
+      pos := min_ + obdiv((max_ - min_ + 1) * (bar.range - 1 - bar.pos), bar.range)
+    end
+  end
+
+  Input.Mouse(@keys, @X, @Y)
+  if (w > h) & (X < x + bar.box) then
+    // scroll left
+    if Pushed(x + 1, y + 1, bar.box - 2, h - 2, @M, @X, @Y, @keys, @keysum) then
+      dec(bar.pos, bar.size_)
+      if bar.pos < 0 then
+        bar.pos := 0
+      elsif bar.pos >= bar.range then
+        bar.pos := bar.range - 1
+      end
+      DrawSlider(M, bar, x, y, w, h)
+    end
+
+  elsif (w > h) & (X > x + w - bar.box) then
+    // scroll right
+    if Pushed(x + w - bar.box + 1, y + 1, bar.box - 2, h - 2, @M, @X, @Y, @keys, @keysum) then
+      inc(bar.pos, bar.size_)
+      if bar.pos < 0 then
+        bar.pos := 0
+      elsif bar.pos >= bar.range then
+        bar.pos := bar.range - 1
+      end
+      DrawSlider(M, bar, x, y, w, h)
+    end
+
+  elsif (w <= h) & (Y < y + bar.box) then
+    // scroll down
+    if Pushed(x + 1, y + 1, w - 2, bar.box - 2, @M, @X, @Y, @keys, @keysum) then
+      inc(bar.pos, bar.size_)
+      if bar.pos < 0 then
+        bar.pos := 0
+      elsif bar.pos >= bar.range then
+        bar.pos := bar.range - 1
+      end
+      DrawSlider(M, bar, x, y, w, h)
+    end
+
+  elsif (w <= h) & (Y > y + h - bar.box) then
+    // scroll up
+    if Pushed(x + 1, y + h - bar.box + 1, w - 2, bar.box - 2, @M, @X, @Y, @keys, @keysum) then
+      dec(bar.pos, bar.size_)
+      if bar.pos < 0 then
+        bar.pos := 0
+      elsif bar.pos >= bar.range then
+        bar.pos := bar.range - 1
+      end
+      DrawSlider(M, bar, x, y, w, h)
+    end
+
+  else
+    // absolute scroll
+    keysum := keys
+    while keys # {} do
+      if w > h then
+        npos := X - asr(barlen, 1)
+      else
+        npos := Y - asr(barlen, 1)
+      end
+
+      if npos < min_ then
+        npos := min_
+      end
+      if npos > max_ then
+        npos := max_
+      end
+
+      if npos # pos then
+        // new position
+        Oberon.FadeCursor(@Oberon.Mouse)
+        if w > h then
+          // horizontal
+          if npos > pos then
+            // move right
+            Display3.ReplConst(M, bar.bg, val(int16, pos), y + 1, val(int16, npos - pos), h - 2, Display.replace)
+          else
+            // move left
+            Display3.ReplConst(M, bar.bg, val(int16, npos + barlen), y + 1, val(int16, pos - npos), h - 2, Display.replace)
+          end
+
+          pos := npos
+          Knob(M, val(int16, pos), y + 1, val(int16, barlen), h - 2)
+          bar.pos := obdiv((pos - min_ + 1) * bar.range, max_ - min_ + 1)
+          if bar.pos < 0 then
+            bar.pos := 0
+          end
+          if bar.pos > bar.range - 1 then
+            bar.pos := bar.range - 1
+          end
+        else
+          // vertical
+          if npos > pos then
+            // move up
+            Display3.ReplConst(M, bar.bg, x + 1, val(int16, pos), w - 2, val(int16, npos - pos), Display.replace)
+          else
+            // move down
+            Display3.ReplConst(M, bar.bg, x + 1, val(int16, npos + barlen), w - 2, val(int16, pos - npos), Display.replace)
+          end
+
+          pos := npos
+          Knob(M, x + 1, val(int16, pos), w - 2, val(int16, barlen))
+          bar.pos := obdiv((max_ - pos) * bar.range, max_ - min_ + 1)
+          if bar.pos < 0 then
+            bar.pos := 0
+          end
+          if bar.pos > bar.range - 1 then
+            bar.pos := bar.range - 1
+          end
+        end
+      end
+
+      Input.Mouse(@keys, @X, @Y)
+      keysum := keysum + keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, X, Y)
+    end
+
+    if keysum = {0,1,2} then
+      bar.pos := oldpos
+      DrawSlider(M, bar, x, y, w, h)
+    end
+  end
+end TrackSlider
+
+// --------------------- CHOOSER -------------------
+
+procedure Updatebar(F: List; H: int16)
+  var
+    space: int32
+begin
+  space := obdiv(H, Fonts.Default.height + 2)
+  if F.noitems <= space then
+    F.bar.range := 1000
+    F.bar.size_ := 1000
+  else
+    F.bar.range := F.noitems
+    F.bar.size_ := space
+    (*
+    F.bar.range := F.noitems;
+    F.bar.size := H DIV (Fonts.Default.height + 2);
+    IF F.bar.range >= F.bar.size THEN
+    old := F.bar.range;
+    DEC(F.bar.range, F.bar.size - 1);
+    DEC(F.bar.size,  F.bar.size * F.bar.range DIV old);
+    ELSE F.bar.range := 1;
+    END;
+    IF F.bar.size > F.bar.range THEN F.bar.size := F.bar.range END;
+    *)
+  end
+end Updatebar
+
+// Insert an item into the list. Entry comes at the end if the list is unsorted.
+procedure InsertItem*(F: List; const s: pointer to array of char)
+  var
+    p, i, j: Item
+begin
+  if F.sorted then
+    i := F.items
+    p := nil
+    if i = nil then
+      newgc(j)
+      copy(@j.s, s, 64)
+      j.sel := false
+      F.items := j
+    else
+      while (i # nil) & (s^ > i.s) do
+        p := i
+        i := i.next
+      end
+      if (i # nil) & (i.s = s^) then
+        return // already in list
+      end
+      newgc(j)
+      copy(@j.s, s, 64)
+      j.sel := false
+      if p = nil then
+        j.next := F.items
+        if F.items # nil then
+          F.items.prev := j
+        end
+        F.items := j
+      else
+        j.next := i
+        p.next := j
+        j.prev := p
+        if i # nil then
+          i.prev := j
+        end
+      end
+    end
+
+    inc(F.noitems)
+  else
+    i := F.items
+    p := nil
+    while i # nil do
+      p := i
+      i := i.next
+    end
+    newgc(j)
+    copy(@j.s, s, 64)
+    j.sel := false
+    j.next := nil
+    j.prev := p
+    if p = nil then
+      F.items := j
+    else
+      p.next := j
+    end
+
+    inc(F.noitems)
+  end
+
+  if (F.beg = nil) & (F.items # nil) then
+    F.beg := F.items
+  end
+end InsertItem
+
+// Inserts the stretch [beg, end) of text T into the list as entries.
+procedure InsertItems*(F: List; T: Texts.Text; beg, end_: int32)
+  var
+    S: Attributes.Scanner
+begin
+  Attributes.OpenScanner(@S, T, beg)
+  Attributes.Scan(@S)
+  while (S.class = Attributes.Name) or (S.class = Attributes.String) do
+    InsertItem(F, @S.s)
+    if (S.R.text = T) & (Attributes.Pos(@S.R) >= end_) then
+      // base text + beyond end of selection
+      S.class := Attributes.Inval
+    else
+      Attributes.Scan(@S)
+    end
+  end
+
+  F.beg := F.items // Updatebar(F, F.H);
+  F.bar.pos := 0
+  Gadgets.Update(F)
+end InsertItems
+
+procedure Sort(F: List)
+  var
+    new_, i, j, p, n: Item
+    items: int16
+begin
+  items := 0
+  new_ := nil
+  i := F.items
+  while i # nil do
+    j := new_
+    p := nil
+    while (j # nil) & (j.s < i.s) do
+      p := j
+      j := j.next
+    end
+
+    if (j = nil) or (j.s # i.s) then
+      inc(items)
+      newgc(n)
+      n^ := i^
+      n.prev := p
+      if p = nil then
+        n.next := new_
+        if new_ # nil then
+          new_.prev := n
+        end
+
+        new_ := n
+      else
+        n.next := j
+        p.next := n
+        if j # nil then
+          j.prev := n
+        end
+      end
+    end
+
+    i := i.next
+  end
+
+  F.noitems := items
+  F.items := new_
+  F.beg := F.items
+  F.pointed := nil
+end Sort
+
+procedure ListAttr(F: List; M: pointer to Objects.AttrMsg)
+  var
+    i: Item
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "Lists.NewList", 64)
+      M.res := 0
+    elsif M.name = "ScrollBar" then
+      M.class := Objects.Bool
+      M.b := F.scrollbar
+      M.res := 0
+    elsif M.name = "Cmd" then
+      M.class := Objects.String
+      copy(@M.s, @F.cmd, 64)
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := F.H - Fonts.Default.height
+      M.res := 0
+    elsif M.name = "Point" then
+      M.class := Objects.String
+      if F.pointed # nil then
+        copy(@M.s, @F.pointed.s, 64)
+      else
+        copy(@M.s, "", 64)
+      end
+      M.res := 0
+    elsif M.name = "Sel" then
+      M.class := Objects.String
+      copy(@M.s, "", 64)
+      i := F.beg
+      while (i # nil) & (M.s = "") do
+        if i.sel then
+          copy(@M.s, @i.s, 64)
+        end
+        i := i.next
+      end
+
+      M.res := 0
+    elsif M.name = "Sorted" then
+      M.class := Objects.Bool
+      M.b := F.sorted
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "ScrollBar" then
+      if M.class = Objects.Bool then
+        F.scrollbar := M.b
+        M.res := 0
+      end
+    elsif M.name = "Sel" then
+      if M.class = Objects.String then
+        i := F.beg
+        while (i # nil) & (M.s # i.s) do
+          i.sel := false
+          i := i.next
+        end
+        if i # nil then
+          i.sel := true
+          i := i.next
+          while i # nil do
+            i.sel := false
+            i := i.next
+          end
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "Point" then
+      M.res := 0
+    elsif M.name = "Cmd" then
+      if M.class = Objects.String then
+        copy(@F.cmd, @M.s, 64)
+        M.res := 0
+      end
+    elsif M.name = "Sorted" then
+      if M.class = Objects.Bool then
+        if M.b # F.sorted then
+          F.sorted := M.b
+          if F.sorted then
+            Sort(F)
+          end
+        end
+
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("ScrollBar")
+    M.Enum("Sorted")
+    M.Enum("Sel")
+    M.Enum("Point")
+    M.Enum("Cmd")
+    Gadgets.framehandle(F, M)
+  end
+end ListAttr
+
+procedure RestoreList(F: List; M: Display3.Mask; x, y, w, h: int16)
+  var
+    Y: int16
+    item: Item
+    cx, cy, cw, ch, barW: int16
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  if F.scrollbar then
+    barW := barw
+  else
+    barW := 0
+  end
+
+  Display3.Rect3D(M, Display3.bottomC, Display3.topC, x, y, w - barW, h, 1, Display.replace)
+  if barW > 0 then
+    Updatebar(F, h)
+    DrawSlider(M, @F.bar, x + w - barW, y, barW, h)
+  end
+
+  // draw contents
+  cx := M.X
+  cy := M.Y
+  cw := M.W
+  ch := M.H
+  Display3.AdjustMask(M, x + 1, y + 1, w - barW - 2, h - 2)
+
+  Y := y + h - 1
+  item := F.beg
+  while (item # nil) & (Y > y + 2) do
+    dec(Y, Fonts.Default.height + 2)
+    if item.sel then
+      Display3.ReplConst(M, Display3.white, x + 1, Y, w - barW - 2, Fonts.Default.height + 2, Display.replace)
+      Display3.String(M, Display3.black, x + 6, Y + 3, Fonts.Default, @item.s, Display3.textmode)
+    else
+      Display3.ReplConst(M, Display3.textbackC, x + 1, Y, w - barW - 2, Fonts.Default.height + 2, Display.replace)
+      Display3.String(M, Display3.textC, x + 6, Y + 3, Fonts.Default, @item.s, Display3.textmode)
+    end
+
+    if F.focus then
+      Display3.ReplConst(M, Display3.FG, x + 2, Y, 1, Fonts.Default.height + 2, Display.replace)
+    end
+
+    item := item.next
+  end
+
+  if Y > y then
+    Display3.ReplConst(M, Display3.textbackC, x + 1, y, w - barW - 2, Y - y, Display.replace)
+    if F.focus then
+      Display3.ReplConst(M, Display3.FG, x + 2, y, 1, Y - y, Display.replace)
+    end
+  end
+
+  M.X := cx
+  M.Y := cy
+  M.W := cw
+  M.H := ch
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(M, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreList
+
+procedure PrintList(F: List; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask
+    x, y, w, h, cx, cy, cw, ch, Y, barW: int16
+    item: Item
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+
+  procedure PrintSlider(M: Display3.Mask; bar: pointer to Bar; x, y, w, h: int16)
+    var
+      barlen, min_, max_, pos: int32
+      i: int16
+
+    procedure Dot(R: Display3.Mask; x, y: int16)
+      var
+        c: int16
+
+      procedure D(col: int16; R: pointer to Display3.Mask; c: pointer to int16; x: pointer to int16; y: pointer to int16)
+      begin
+        Printer3.ReplConst(R^, col, x^, y^, P(1), P(1), Display.replace)
+        inc(c^)
+        inc(x^, P(1))
+        if band(c^, 3) = 0 then
+          inc(y^, P(1))
+          dec(x^, P(4))
+        end
+      end D
+    begin
+      c := 0
+      D(14, @R, @c, @x, @y)
+      D(13, @R, @c, @x, @y)
+      D(12, @R, @c, @x, @y)
+      D(13, @R, @c, @x, @y)
+      D(14, @R, @c, @x, @y)
+      D(14, @R, @c, @x, @y)
+      D(13, @R, @c, @x, @y)
+      D(12, @R, @c, @x, @y)
+      D(0, @R, @c, @x, @y)
+      D(14, @R, @c, @x, @y)
+      D(14, @R, @c, @x, @y)
+      D(13, @R, @c, @x, @y)
+      D(13, @R, @c, @x, @y)
+      D(0, @R, @c, @x, @y)
+      D(14, @R, @c, @x, @y)
+      D(14, @R, @c, @x, @y)
+    end Dot
+
+    procedure Knob(M: Display3.Mask; x, y, w, h: int16)
+    begin
+      Printer3.FilledRect3D(M, Display3.topC, Display3.bottomC, Display3.groupC, x, y, w, h, 1, Display.replace)
+      Dot(M, x + asr(w, 1) - 2, y + asr(h, 1) - 2)
+    end Knob
+  begin
+    Printer3.FilledRect3D(M, Display3.bottomC, Display3.topC, Display3.groupC, x, y, w, h, P(1), Display.replace)
+    barlen := obdiv((h - P(bar.box * 2)) * bar.size_, bar.range) // length of bar
+    if barlen < 6 then
+      barlen := 6
+    end
+    // min & max
+    min_ := y + P(bar.box)
+    max_ := y + h - P(bar.box) - barlen
+
+    // The following tests are due to rounding problems at the end of the range
+    if bar.pos <= 0 then
+      pos := max_
+    elsif bar.pos >= bar.range - 1 then
+      pos := min_
+    else
+      pos := min_ + obdiv((max_ - min_ + 1) * (bar.range - 1 - bar.pos), bar.range)
+    end
+
+    Printer3.FilledRect3D(M, Display3.topC, Display3.bottomC, Display3.groupC, x + 1, y + 1, w - 2, P(bar.box) - 2, 1, Display.replace) // box inside
+    Printer3.ReplConst(M, Display3.FG, x + 1, y + P(bar.box) - 1, w - 2, 1, Display.replace) // box border
+
+    Printer3.FilledRect3D(M, Display3.topC, Display3.bottomC, Display3.groupC, x + 1, y + h - P(bar.box) + 1, w - 2, P(bar.box) - 2, 1, Display.replace) // box inside
+    Printer3.ReplConst(M, Display3.FG, x + 1, y + h - P(bar.box), w - 2, 1, Display.replace) // box border
+
+    // Triangles
+    for i := P(-4) to P(1) do
+      Printer3.ReplConst(M, Display3.FG, x + asr(w, 1) + i, y + obdiv(P(bar.box), 3) - i, -(i * 2), P(1), Display.replace)
+      Printer3.ReplConst(M, Display3.FG, x + asr(w, 1) + i, y + h - obdiv(P(bar.box), 3) + i, -(i * 2), P(1), Display.replace)
+    end
+
+    // inside
+    Printer3.ReplConst(M, bar.bg, x + 1, y + P(bar.box), w - 2, h - P(bar.box) * 2, Display.replace)
+
+    // draw bar
+    Knob(M, x + 1, val(int16, pos), w - 2, val(int16, barlen))
+  end PrintSlider
+begin
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  if F.scrollbar then
+    barW := P(barw)
+  else
+    barW := 0
+  end
+
+  Printer3.Rect3D(R, Display3.bottomC, Display3.topC, x, y, w - barW, h, P(1), Display.replace)
+  if barW > 0 then
+    PrintSlider(R, @F.bar, x + w - barW, y, barW, h)
+  end
+
+  cx := R.X
+  cy := R.Y
+  cw := R.W
+  ch := R.H
+  Display3.AdjustMask(R, x + P(1), y + P(1), w - barW - P(2), h - P(2))
+
+  Y := y + h - P(1)
+  item := F.beg
+  while (item # nil) & (Y > y + P(2)) do
+    dec(Y, P(Fonts.Default.height + 2))
+    if item.sel then
+      Printer3.ReplConst(R, Display3.white, x + P(1), Y, w - barW - P(2), Fonts.Default.height + P(2), Display.replace)
+      Printer3.String(R, Display3.black, x + P(6), Y + P(3), Fonts.Default, @item.s, Display3.textmode)
+    else
+      Printer3.ReplConst(R, Display3.textbackC, x + P(1), Y, w - barW - P(2), P(Fonts.Default.height + 2), Display.replace)
+      Printer3.String(R, Display3.textC, x + P(6), Y + P(3), Fonts.Default, @item.s, Display3.textmode)
+    end
+
+    item := item.next
+  end
+
+  R.X := cx
+  R.Y := cy
+  R.W := cw
+  R.H := ch
+
+  if Y > y then
+    Printer3.ReplConst(R, Display3.textbackC, x + P(1), y, w - barW - P(2), Y - y, Display.replace)
+  end
+
+  if F.focus then
+    Printer3.ReplConst(R, Display3.FG, x + P(2), y, 1, h, Display.replace)
+  end
+end PrintList
+
+procedure Update(F: List)
+  var
+    item: Item
+    i: int16
+begin
+  item := F.items
+  i := 0
+  while (item # nil) & (i # F.bar.pos) do
+    inc(i)
+    item := item.next
+  end
+  F.beg := item
+  Gadgets.Update(F)
+end Update
+
+procedure CopyList*(M: pointer to Objects.CopyMsg; from, to_: List)
+  var
+    i: Item
+begin
+  to_.bar := from.bar
+  copy(@to_.cmd, @from.cmd, 64)
+  to_.scrollbar := from.scrollbar
+  to_.sorted := from.sorted
+  to_.items := nil
+  i := from.items
+  while i # nil do
+    InsertItem(to_, @i.s)
+    i := i.next
+  end
+  to_.beg := to_.items
+  Gadgets.CopyFrame(M, from, to_)
+end CopyList
+
+procedure LocateItem(F: List; x, y, MX, MY: int16; item: pointer to Item; Y: pointer to int16)
+  var
+    i: Item
+begin
+  item^ := nil
+  if MY >= y + F.H then
+    Y^ := 1
+  elsif MY < y then
+    Y^ := -1
+  else
+    Y^ := y + F.H - 1
+    i := F.beg
+    while i # nil do
+      dec(Y^, Fonts.Default.height + 2)
+      if Effects.Inside(MX, MY, x, Y^, F.W, Fonts.Default.height + 2) then
+        item^ := i
+        return
+      end
+      i := i.next
+    end
+  end
+end LocateItem
+
+procedure InvertItem(F: List; M: Display3.Mask; x, y: int16; item: pointer to Item; Y: pointer to int16)
+  var
+    barW: int16
+begin
+  if item^ # nil then
+    Oberon.FadeCursor(@Oberon.Mouse)
+    if F.scrollbar then
+      barW := barw
+    else
+      barW := 0
+    end
+    Display3.ReplConst(M, Display3.invertC, x + 4, Y^, F.W - barW - 6, Fonts.Default.height + 2, Display.invert)
+  end
+end InvertItem
+
+procedure SelectItem(F: List; M: Display3.Mask; x, y: int16; item: pointer to Item; Y: pointer to int16)
+  var
+    cx, cy, cw, ch, barW: int16
+begin
+  if (item^ # nil) & ~item^.sel then
+    if F.scrollbar then
+      barW := barw
+    else
+      barW := 0
+    end
+    cx := M.X
+    cy := M.Y
+    cw := M.W
+    ch := M.H
+    Display3.AdjustMask(M, x + 1, y + 1, F.W - barW - 2, F.H - 2)
+    Oberon.FadeCursor(@Oberon.Mouse)
+    Display3.ReplConst(M, Display3.white, x + 1, Y^, F.W - barW - 2, Fonts.Default.height + 2, Display.replace)
+    Display3.String(M, Display3.black, x + 6, Y^ + 3, Fonts.Default, @item^.s, Display3.textmode)
+    if F.focus then
+      Display3.ReplConst(M, Display3.FG, x + 2, Y^, 1, Fonts.Default.height + 2, Display.replace)
+    end
+
+    M.X := cx
+    M.Y := cy
+    M.W := cw
+    M.H := ch
+    item^.sel := true
+  end
+end SelectItem
+
+procedure TimeOk(): boolean
+begin
+  if Oberon.Time() - mayscroll <= 0 then
+    return false
+  else
+    mayscroll := Oberon.Time() + waittime
+    return true
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end TimeOk
+
+procedure Check(F: List; R: Display3.Mask; x, y, w, h: int16; item: Item; Y: int16; scroll: pointer to boolean)
+  var
+    t, lineh: int16
+    i: Item
+begin
+  scroll^ := false
+  if (item = nil) & (F.beg # nil) then
+    if TimeOk() then
+      if Y = 1 then
+        // one item previous
+        if F.beg.prev # nil then
+          F.beg := F.beg.prev
+          dec(F.bar.pos)
+          RestoreList(F, R, x, y, w, h)
+          scroll^ := true
+        end
+
+      elsif Y = -1 then
+        // one item more
+        t := y + h - 1
+        lineh := Fonts.Default.height + 2
+        i := F.beg
+        while (i # nil) & (t - lineh > y) do
+          dec(t, lineh)
+          i := i.next
+        end
+        if (F.beg.next # nil) & (i # nil) & ((i.next # nil) or (t > y)) then
+          F.beg := F.beg.next
+          inc(F.bar.pos)
+          RestoreList(F, R, x, y, w, h)
+          scroll^ := true
+        end
+      end
+    end
+  end
+end Check
+
+// during selection
+procedure Check2(F: List; R: Display3.Mask; x, y, w, h: int16; item: Item; Y: int16; scroll: pointer to boolean)
+  var
+    t, lineh: int16
+    i: Item
+begin
+  scroll^ := false
+  if (item = nil) & (F.beg # nil) then
+    if TimeOk() then
+      if Y = 1 then
+        // one item previous
+        if F.beg.prev # nil then
+          F.beg := F.beg.prev
+          dec(F.bar.pos)
+          i := F.beg
+          while (i # nil) & ~i.sel do
+            i.sel := true
+            i := i.next
+          end
+          RestoreList(F, R, x, y, w, h)
+          scroll^ := true
+        end
+
+      elsif Y = -1 then
+        // one item more
+        t := y + h - 1
+        lineh := Fonts.Default.height + 2
+        i := F.beg
+        while (i # nil) & (t - lineh > y) do
+          dec(t, lineh)
+          i := i.next
+        end
+        if (F.beg.next # nil) & (i # nil) & ((i.next # nil) or (t > y)) then
+          while (i # nil) & ~i.sel do
+            i.sel := true
+            i := i.prev
+          end
+
+          F.beg := F.beg.next
+          inc(F.bar.pos)
+          RestoreList(F, R, x, y, w, h)
+          scroll^ := true
+        end
+      end
+    end
+  end
+end Check2
+
+// Deselect all entries in the list. redraw indicates if the list has to be redrawn (only set if items were selected).
+procedure DeselectList*(F: List; redraw: pointer to boolean)
+  var
+    i: Item
+begin
+  i := F.items
+  redraw^ := false
+  while i # nil do
+    if i.sel # false then
+      i.sel := false
+      redraw^ := true
+    end
+    i := i.next
+  end
+end DeselectList
+
+// Delete all selected entries the list.
+procedure DeleteSelection*(F: List)
+  var
+    i: Item
+begin
+  i := F.items
+  F.items := nil
+  F.noitems := 0
+  while i # nil do
+    if ~i.sel then
+      InsertItem(F, @i.s)
+    end
+    i := i.next
+  end
+
+  F.beg := F.items
+end DeleteSelection
+
+// Returns all selected entries as a text. Entries that contain spaces are quoted.
+procedure GetSelection*(F: List; T: pointer to Texts.Text)
+  var
+    W: Texts.Writer
+    i: Item
+    count: int16
+
+  procedure WriteString(W: pointer to Texts.Writer; const s: pointer to array of char)
+    var
+      i: int16
+  begin
+    i := 0
+    while (s[i] >= " ") or (s[i] = 9X) do
+      Texts.Write(W, s[i]) // << jm
+      inc(i)
+    end
+  end WriteString
+
+  procedure Space(s: pointer to array of char): boolean
+    var
+      i: int16
+  begin
+    i := 0
+    while s[i] # 0X do
+      if s[i] = " " then
+        return true
+      end
+      inc(i)
+    end
+
+    return false
+  end Space
+begin
+  Texts.OpenWriter(@W)
+  i := F.items
+  newgc(T^)
+  Texts.Open(T^, "")
+  count := 0
+  while i # nil do
+    if i.sel then
+      if Space(@i.s) then
+        Texts.Write(@W, 22X)
+        WriteString(@W, @i.s)
+        Texts.Write(@W, 22X)
+      else
+        Texts.WriteString(@W, @i.s)
+      end
+
+      inc(count)
+      if obmod(count, 10) = 0 then
+        Texts.WriteLn(@W)
+      else
+        Texts.Write(@W, " ")
+      end
+    end
+
+    i := i.next
+  end
+
+  Texts.Append(T^, W.buf)
+end GetSelection
+
+procedure TrackList(F: List; R: Display3.Mask; x, y, w, h: int16; M: pointer to Oberon.InputMsg)
+  var
+    item, i: Item
+    Y, nY: int16
+    keysum: set
+    pos: int32
+    redraw, scroll, scrolled: boolean
+    C: Oberon.ConsumeMsg
+    T: Texts.Text
+    beg, end_, time: int32
+begin
+  keysum := M.keys
+  if (M.keys = {1}) & F.scrollbar & (M.X > x + w - barw) then
+    pos := F.bar.pos
+    TrackSlider(R, @F.bar, x + w - barw, y, barw, h)
+    if F.bar.pos # pos then
+      Update(F)
+    end
+    M.res := 0
+  elsif M.keys = {1} then
+    // point
+    scrolled := false
+    LocateItem(F, x, y, M.X, M.Y, @item, @Y)
+    Check(F, R, x, y, w, h, item, Y, @scroll)
+    scrolled := scrolled or scroll
+    InvertItem(F, R, x, y, @item, @Y)
+    while M.keys # {} do
+      LocateItem(F, x, y, M.X, M.Y, @i, @nY)
+      Check(F, R, x, y, w, h, i, nY, @scroll)
+      scrolled := scrolled or scroll
+      if i # item then
+        if ~scroll then
+          InvertItem(F, R, x, y, @item, @Y)
+        end
+        item := i
+        Y := nY
+        InvertItem(F, R, x, y, @item, @Y)
+      end
+
+      Input.Mouse(@M.keys, @M.X, @M.Y)
+      keysum := keysum + M.keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+    end
+
+    InvertItem(F, R, x, y, @item, @Y)
+    if scrolled then
+      Gadgets.Update(F)
+    end
+    if (F.cmd # "") & (keysum # {0,1,2}) & (item # nil) then
+      F.pointed := item
+      Gadgets.Execute(@F.cmd, F, M.dlink, nil, nil)
+    end
+
+    M.res := 0
+  elsif M.keys = {0} then
+    // select
+    DeselectList(F, @redraw)
+    if redraw then
+      RestoreList(F, R, x, y, w, h)
+    end
+    LocateItem(F, x, y, M.X, M.Y, @item, @Y)
+    Check2(F, R, x, y, w, h, item, Y, @scroll)
+    SelectItem(F, R, x, y, @item, @Y)
+    while M.keys # {} do
+      LocateItem(F, x, y, M.X, M.Y, @i, @nY)
+      Check2(F, R, x, y, w, h, i, nY, @scroll)
+      if i # item then
+        if ~scroll then
+          if i # nil then
+            if nY < Y then
+              // down
+              while (item # nil) & (item # i) do
+                SelectItem(F, R, x, y, @item, @Y)
+                dec(Y, Fonts.Default.height + 2)
+                item := item.next
+              end
+
+            else
+              while (item # nil) & (item # i) do
+                SelectItem(F, R, x, y, @item, @Y)
+                inc(Y, Fonts.Default.height + 2)
+                item := item.prev
+              end
+            end
+          end
+
+          SelectItem(F, R, x, y, @i, @nY)
+        end
+
+        item := i
+        Y := nY
+      end
+
+      Input.Mouse(@M.keys, @M.X, @M.Y)
+      keysum := keysum + M.keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+    end
+
+    F.time := Oberon.Time()
+    if keysum = {0,2} then
+      // delete
+      DeleteSelection(F)
+      if F.bar.pos >= F.noitems then
+        F.bar.pos := 0
+      end
+      // Updatebar(F, h);
+      Update(F)
+      F.time := -1
+    elsif keysum = {0,1} then
+      // copy over
+      GetSelection(F, @T)
+      C.F := nil
+      C.text := T
+      C.beg := 0
+      C.end_ := T.len_
+      Display.Broadcast(@C)
+      Gadgets.Update(F)
+    else
+      Gadgets.Update(F)
+    end
+
+    M.res := 0
+  elsif M.keys = {2} then
+    // focus
+    if ~F.focus then
+      Oberon.Defocus()
+      F.focus := true
+      Gadgets.Update(F)
+      keysum := {}
+      repeat
+        Effects.TrackMouse(@M.keys, @M.X, @M.Y, Effects.Arrow) // copy over
+        keysum := keysum + M.keys
+      until M.keys = {}
+      if keysum = {2,1} then
+        Oberon.GetSelection(@T, @beg, @end_, @time)
+        if time # -1 then
+          InsertItems(F, T, beg, end_)
+        end
+      end
+
+    else
+      keysum := {}
+      repeat
+        Effects.TrackMouse(@M.keys, @M.X, @M.Y, Effects.Arrow)
+        keysum := keysum + M.keys
+      until M.keys = {}
+      if keysum = {2,1} then
+        // copy over
+        Oberon.GetSelection(@T, @beg, @end_, @time)
+        if time # -1 then
+          InsertItems(F, T, beg, end_)
+        end
+      end
+    end
+
+    M.res := 0
+  else
+    Gadgets.framehandle(F, M)
+  end
+end TrackList
+
+procedure Search(F: List; ch: char)
+  var
+    i: Item
+    j: int16
+    pos: int32
+begin
+  if ch = 0X then
+    ss[0] := 0X
+  elsif (ch >= " ") & (ch < 86X) or (ch = 9X) then
+    j := 0
+    while (j < 32) & (ss[j] # 0X) do
+      inc(j)
+    end
+    if j < 31 then
+      ss[j] := ch
+      ss[j + 1] := 0X
+    end
+    i := F.items
+    pos := 0
+    while (i # nil) & (ss > i.s) do
+      inc(pos)
+      i := i.next
+    end
+    if (i # nil) & (F.beg # i) then
+      F.bar.pos := pos
+      Update(F)
+    end
+
+  elsif ch = 0DX then
+    ss[0] := 0X
+  end
+end Search
+
+procedure ListHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h: int16
+    F0: List
+    R: Display3.Mask
+    redraw: boolean
+    T: Texts.Text
+    ver, noitems: int32
+    l, new_: Item
+begin
+  case F of
+  | List:
+    case M of
+    | Display.PFrameMsg:
+      if (M.F = nil) or (M.F = F) then
+        // message addressed to this frame
+        x := M.x + F.X // calculate display coordinates
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        M1 := M
+        case M1 of
+        | Display.PDisplayMsg:
+          if M1.device = Display.screen then
+            if (M1.id = Display.full) or (M1.F = nil) then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+              RestoreList(F, R, x, y, w, h)
+            elsif M1.id = Display.area then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+              Display3.AdjustMask(R, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+              RestoreList(F, R, x, y, w, h)
+            end
+
+          elsif M1.device = Display.printer then
+            PrintList(F, M1)
+          end
+
+        | Oberon.PInputMsg:
+          if (M1.id = Oberon.track) & ~(Gadgets.selected in F.state) & Gadgets.InActiveArea(F, M1) & (M1.keys # {}) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            TrackList(F, R, x, y, w, h, M1)
+          elsif (M1.id = Oberon.consume) & F.focus then
+            Search(F, M1.ch)
+            M1.res := 0
+          else
+            Gadgets.framehandle(F, M1)
+          end
+
+        | Display.PModifyMsg:
+          if (M1.F = F) & (M1.dH # 0) then
+            F.beg := F.items // Updatebar(F, M1.H)
+            F.bar.pos := 0
+          end
+          Gadgets.framehandle(F, M1)
+
+        | Oberon.PControlMsg:
+          if M1.id = Oberon.defocus then
+            Search(F, 0X)
+            if F.focus then
+              F.focus := false
+              Gadgets.Update(F)
+            end
+          end
+
+          if M1.id = Oberon.neutralize then
+            DeselectList(F, @redraw)
+            F.time := -1
+            Search(F, 0X)
+            if redraw or F.focus then
+              F.focus := false
+              Gadgets.Update(F)
+            end
+          end
+
+        | Oberon.PConsumeMsg:
+          if F.focus then
+            InsertItems(F, M1.text, M1.beg, M1.end_)
+            M1.res := 0
+          elsif M1.F = F then
+            InsertItems(F, M1.text, M1.beg, M1.end_)
+            M1.res := 0
+          end
+
+        | Oberon.PSelectMsg:
+          if ((M1.time - F.time < 0) or (M1.time = -1)) & (M1.stamp # F.stamp) then
+            F.stamp := F.time
+            GetSelection(F, @T)
+            if T.len_ # 0 then
+              M1.text := T
+              M1.sel := F
+              M1.beg := 0
+              M1.end_ := T.len_
+              M1.time := F.time
+            end
+          end
+
+        | Display.PConsumeMsg:
+          Gadgets.framehandle(F, M1)
+        else
+          Gadgets.framehandle(F, M1)
+        end
+      end
+
+    // Object messages
+
+    | Objects.PAttrMsg:
+      ListAttr(F, M(Objects.PAttrMsg))
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        // store private data here
+        Files.WriteNum(@M.R, 4)
+        Files.WriteString(@M.R, @F.cmd, 64)
+        // paranoia count
+        l := F.items
+        F.noitems := 0
+        while l # nil do
+          l := l.next
+          inc(F.noitems)
+        end
+        Files.WriteNum(@M.R, F.noitems)
+
+        l := F.items
+        while l # nil do
+          Files.WriteString(@M.R, @l.s, 64)
+          l := l.next
+        end
+        Files.WriteBool(@M.R, F.scrollbar)
+        Files.WriteBool(@M.R, F.sorted)
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        // load private data here
+        Files.ReadNum(@M.R, @ver)
+        if (1 <= ver) & (ver <= 4) then
+          Files.ReadString(@M.R, @F.cmd, 64)
+          F.noitems := 0
+          l := nil
+          if ver < 4 then
+            newgc(new_)
+            Files.ReadString(@M.R, @new_.s, 64)
+            while new_.s # "" do
+              if l = nil then
+                F.items := new_
+              else
+                l.next := new_
+                new_.prev := l
+              end
+              inc(F.noitems)
+              l := new_
+              newgc(new_)
+              Files.ReadString(@M.R, @new_.s, 64)
+            end
+
+          else
+            Files.ReadNum(@M.R, @noitems)
+            while F.noitems < noitems do
+              newgc(new_)
+              Files.ReadString(@M.R, @new_.s, 64)
+              if l = nil then
+                F.items := new_
+              else
+                l.next := new_
+                new_.prev := l
+              end
+              inc(F.noitems)
+              l := new_
+            end
+          end
+
+          if ver >= 2 then
+            Files.ReadBool(@M.R, @F.scrollbar)
+          else
+            F.scrollbar := false
+          end
+          if ver >= 3 then
+            Files.ReadBool(@M.R, @F.sorted)
+          end
+        else
+          halt(99)
+        end
+
+        Gadgets.framehandle(F, M)
+        F.beg := F.items
+        F.bar.pos := 0
+        Updatebar(F, F.H)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink // copy msg arrives again
+      else
+        // first time copy message arrives
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyList(M, F, F0)
+        M.obj := F0
+      end
+
+    | Objects.PLinkMsg:
+      if (M.id = Objects.set_) & (M.name = "Model") & (M.obj is Texts.Text) then
+        T := M.obj(Texts.Text)
+        F.beg := nil
+        F.items := nil
+        F.noitems := 0
+        InsertItems(F, T, 0, T.len_)
+        M.res := 0
+      elsif (M.id = Objects.get) & (M.name = "Model") then
+        newgc(T)
+        Texts.Open(T, "")
+        l := F.items
+        while l # nil do
+          Texts.WriteString(@W, @l.s)
+          Texts.WriteLn(@W)
+          l := l.next
+        end
+
+        Texts.Append(T, W.buf)
+        M.obj := T
+        M.res := 0
+      else
+        Gadgets.framehandle(F, M)
+      end
+
+    else
+      // unknown msg, framehandler might know it
+      Gadgets.framehandle(F, M)
+    end
+  end
+end ListHandler
+
+procedure InitList*(F: List)
+begin
+  F.W := 100
+  F.H := 100
+  F.handle := ListHandler
+  F.noitems := 0
+  F.scrollbar := true
+  F.bar.range := 1000
+  F.bar.size_ := 1000
+  F.bar.pos := 0
+  F.bar.box := 20
+  F.bar.bg := Display3.textbackC
+  F.beg := F.items
+  F.sorted := true
+  F.last := F.items
+  if F.last # nil then
+    while F.last.next # nil do
+      F.last := F.last
+    end
+  end
+end InitList
+
+procedure NewList*()
+  var
+    F: List
+begin
+  newgc(F)
+  InitList(F)
+  Objects.NewObj := F
+end NewList
+
+// --- tools for lists ---
+
+// Native-Oberon version
+procedure ListFiles(const name: pointer to array of char; time, date, size_: int32; cont: pointer to boolean)
+  var
+    i0, i1_, j0, j1: int16
+    f: boolean
+begin
+  i0 := pos
+  j0 := pos
+  f := true
+  loop
+    if pat[i0] = "*" then
+      inc(i0)
+      if pat[i0] = 0X then
+        exit
+      end
+    else
+      if name[j0] # 0X then
+        f := false
+      end
+      exit
+    end
+
+    f := false
+    loop
+      if name[j0] = 0X then
+        exit
+      end
+      i1_ := i0
+      j1 := j0
+      loop
+        if (pat[i1_] = 0X) or (pat[i1_] = "*") then
+          f := true
+          exit
+        end
+        if pat[i1_] # name[j1] then
+          exit
+        end
+        inc(i1_)
+        inc(j1)
+      end
+
+      if f then
+        j0 := j1
+        i0 := i1_
+        exit
+      end
+      inc(j0)
+    end
+
+    if ~f then
+      exit
+    end
+  end
+
+  if f then
+    Texts.WriteString(@W, name)
+    Texts.WriteLn(@W)
+  end
+end ListFiles
+
+procedure GetDir(const mask: pointer to array of char; text: Texts.Text)
+  var
+    pre: array 32 of char
+    i: int16
+begin
+  i := 0
+  while (mask[i] > " ") & (mask[i] # "/") do
+    pat[i] := mask[i]
+    inc(i)
+  end
+  pat[i] := 0X
+  i := 0
+  while pat[i] > "*" do
+    pre[i] := pat[i]
+    inc(i)
+  end
+  pre[i] := 0X
+  pos := i
+  FileDir.Enumerate(@pre, false, ListFiles)
+  Texts.Append(text, W.buf)
+end GetDir
+
+procedure Copy(const source: pointer to array of char; dest: pointer to array of char)
+  var
+    i, j: int16
+begin
+  j := 0
+  while source[j] = " " do
+    inc(j)
+  end
+  i := 0
+  dest[i] := source[j]
+  while (source[j] # 0X) & (source[j] # " ") do
+    inc(i)
+    inc(j)
+    dest[i] := source[j]
+  end
+  dest[i] := 0X
+end Copy
+
+(** Used in the form:
+
+Lists.Directory "<pattern>" <Objname> ~
+
+Determines all the filenames that match pattern and inserts them into the list named <Objname> in the current context.
+*)
+procedure Directory*()
+  // "mask" "objname"
+  var
+    S: Attributes.Scanner
+    mask: array 32 of char
+    o: Objects.Object
+    text: Texts.Text
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if (S.class = Attributes.Name) or (S.class = Attributes.String) then
+    Copy(@S.s, @mask)
+    Attributes.Scan(@S)
+    if (S.class = Attributes.Name) or (S.class = Attributes.String) then
+      Copy(@S.s, @S.s)
+      o := Gadgets.FindObj(Gadgets.context, @S.s)
+      if (o # nil) & (o is List) then
+        case o of
+        | List:
+          newgc(text)
+          Texts.Open(text, "")
+          GetDir(@mask, text)
+          o.beg := nil
+          o.items := nil
+          o.noitems := 0
+          InsertItems(o, text, 0, text.len_)
+        end
+      end
+    end
+  end
+end Directory
+
+procedure Match(const name, pat: pointer to array of char): boolean
+  var
+    i0, i1_, j0, j1, pos: int16
+    f: boolean
+begin
+  pos := 0
+  pos := 0
+  while (pat[pos] # "*") & (pat[pos] # 0X) & (pat[pos] = name[pos]) do
+    inc(pos)
+  end
+  if name[pos] = 0X then
+    return true
+  end
+  i0 := pos
+  j0 := pos
+  f := true
+  loop
+    if pat[i0] = "*" then
+      inc(i0)
+      if pat[i0] = 0X then
+        exit
+      end
+    else
+      if name[j0] # 0X then
+        f := false
+      end
+      exit
+    end
+
+    f := false
+    loop
+      if name[j0] = 0X then
+        exit
+      end
+      i1_ := i0
+      j1 := j0
+      loop
+        if (pat[i1_] = 0X) or (pat[i1_] = "*") then
+          f := true
+          exit
+        end
+        if pat[i1_] # name[j1] then
+          exit
+        end
+        inc(i1_)
+        inc(j1)
+      end
+
+      if f then
+        j0 := j1
+        i0 := i1_
+        exit
+      end
+      inc(j0)
+    end
+
+    if ~f then
+      exit
+    end
+  end
+
+  return f
+end Match
+
+procedure EntryHandler(const name: pointer to array of char; date, time, size_: int32)
+begin
+  if (name[0] > " ") & (val(int32, ord(name[0])) < 7FH) & Match(name, @pat) then
+    Texts.WriteString(@W, name)
+    Texts.WriteLn(@W)
+  end
+end EntryHandler
+
+(*
+PROCEDURE GetDiskette(mask: ARRAY OF CHAR; text: Texts.Text);
+VAR i, a, b: INTEGER;
+BEGIN
+i := 0;
+WHILE (mask[i] > " ") & (mask[i] # "/") DO pat[i] := mask[i]; INC(i);  END;
+pat[i] := 0X;
+Floppy.OpenVol(a, b);
+Floppy.Enumerate(EntryHandler);
+Floppy.CloseVol();
+Texts.Append(text,W.buf);
+END GetDiskette;
+*)
+
+(* Windows version
+PROCEDURE GetDiskette(mask: ARRAY OF CHAR; text: Texts.Text);
+VAR  i : INTEGER;
+BEGIN
+i := 0;
+WHILE (mask[i] > " ") & (mask[i] # "/") DO pat[i] := mask[i]; INC(i);  END;
+pat[i] := 0X;
+Texts.Append(text,W.buf);
+END GetDiskette;
+*)
+
+(*
+(** Same as Directory, except the files on Diskette are searched. This command is not functional on all platforms. *)
+PROCEDURE Diskette*; (* "mask" "objname" *)
+VAR S: Attributes.Scanner; mask: ARRAY 32 OF CHAR; o: Objects.Object;
+text: Texts.Text;
+BEGIN
+Attributes.OpenScanner(S,Oberon.Par.text,Oberon.Par.pos); Attributes.Scan(S);
+IF (S.class = Attributes.Name) OR (S.class  = Attributes.String)  THEN Copy(S.s, mask);
+Attributes.Scan(S);
+IF (S.class = Attributes.Name) OR (S.class = Attributes.String) THEN
+Copy(S.s, S.s); o := Gadgets.FindObj(Gadgets.context, S.s);
+IF (o # NIL) & (o IS List) THEN
+WITH o: List DO
+NEW(text); Texts.Open(text, "");
+GetDiskette(mask, text); o.beg := NIL; o.items := NIL; o.noitems := 0;
+InsertItems(o, text, 0, text.len);
+END
+END
+END
+END
+END Diskette;
+*)
+
+procedure LibDir(const name: pointer to array of char; text: Texts.Text)
+  var
+    L: Objects.Library
+    ref, i: int16
+    libName, objName: array 32 of char
+begin
+  i := 0
+  while (name[i] # 0X) & (name[i] # ".") do
+    inc(i)
+  end
+  name[i] := 0X
+  copy(@libName, name, 32)
+  name[i] := "."
+  name[i + 1] := "L"
+  name[i + 2] := "i"
+  name[i + 3] := "b"
+  name[i + 4] := 0X
+
+  L := Objects.ThisLibrary(name)
+  if L # nil then
+    ref := 0
+    repeat
+      Objects.GetName(@L.dict, ref, @objName, 32)
+      if (objName[0] # 0X) & (objName[0] >= "A") & (objName[0] <= "Z") then
+        Texts.WriteString(@W, @libName)
+        Texts.Write(@W, ".")
+        Texts.WriteString(@W, @objName)
+        Texts.WriteLn(@W)
+      end
+
+      inc(ref)
+    until ref = L.maxref
+  end
+
+  Texts.Append(text, W.buf)
+end LibDir
+
+(** Used in the form:
+
+Lists.Library <Libname> <ObjName>
+
+Inserts a list of all object names in <Libname> into the list named <ObjName> in the current context. <Libname> must not include the ".Lib" extension.
+*)
+procedure Library*()
+  // "lib" "objname"
+  var
+    S: Attributes.Scanner
+    name: array 32 of char
+    o: Objects.Object
+    text: Texts.Text
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if (S.class = Attributes.Name) or (S.class = Attributes.String) then
+    Copy(@S.s, @name)
+    Attributes.Scan(@S)
+    if (S.class = Attributes.Name) or (S.class = Attributes.String) then
+      Copy(@S.s, @S.s)
+      o := Gadgets.FindObj(Gadgets.context, @S.s)
+      if (o # nil) & (o is List) then
+        case o of
+        | List:
+          newgc(text)
+          Texts.Open(text, "")
+          LibDir(@name, text)
+          o.beg := nil
+          o.items := nil
+          o.noitems := 0
+          InsertItems(o, text, 0, text.len_)
+        end
+      end
+    end
+  end
+end Library
+
+procedure Init()
+  var
+    s: Texts.Scanner
+begin
+  Oberon.OpenScanner(@s, "Gadgets.ListScrollDelay")
+  if (s.class = Texts.Int) & (s.i > 0) then
+    waittime := s.i
+  else
+    waittime := 100
+  end
+
+  waittime := obdiv(waittime * Input.TimeUnit, 1000)
+end Init
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewList" end return NewList end
+  if i = 1 then if name # nil then name^ := "Directory" end return Directory end
+  if i = 2 then if name # nil then name^ := "Library" end return Library end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Lists", cmd_)
+  Texts.OpenWriter(@W)
+  Init()
+end Lists.

@@ -1,0 +1,3208 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Desktops [level=5]
+
+import Input, Objects, Display, Viewers, Oberon, Gadgets, Attributes, Files, Documents, Texts, Display3, Views, Printer, Printer3, Effects, Fonts, Pictures, Strings, Modules
+// portable
+// , jm 1.2.95
+
+(** Implementation of the Oberon Desktop, with Viewers for displaying documents in the tiled and overlapping windowing systems of Oberon.
+*)
+(*
+25.3.94 - Added support for Documents.LocateMsg
+5.4.94 - fixed the size of the grab area on top of the Viewer to 6 pixels
+6.4.94 - changed from jg style modifyMsg's to gadget style messages for Viewers
+19.4.94 - left key in DocGadget Menu bar takes it to behind, left + middle to the front
+20.4.94 - left key in document prints it to front
+22.4.94 - Send restore msg on ShowDoc
+27.4.94 - improved to front
+2.5.94 - Added copy over for docgadgets\
+24.5.94 - Remove dynamic buttons in the menu-bars
+30.5.94 - added "loading failed" messages
+27.7.94 - improved document placement
+12.10.94 - improved opening of non desktop tjings
+12.10.94 - fixed button on opening new desktop
+19.10.94 - Added Recall.
+this module is very much an hack now. Compatibility with classic Oberon and old gadgets
+applications makes it difficult to change. The whole flag business should be fixed (difficult when everything
+is not a gadget).
+8.11.94 - Viewers now respond on Locked attribute. used together with Gadgets.IsLocked
+8.11.94 - flag business simplified drastically. 31 flag not used any more.
+- removed OpenView plus modified signature of ShowDoc
+30.11.94 - renamed Viewer to DocViewer
+21.12.94 - added alias support for Document generators
+3.1.95 - simplified MakeIcon, renamed from MakeIcons
+24.1.95 - fixed cursor in DocViewer menubar
+19.4.95 - increased the height where the DocViewer can be grabbed with the left key
+15.5.95 - LoadDoc now checks on a NIL dsc
+21.6.95 - Removed setting of Views.View border
+7.6.96 - fixed parsing of menustring (* ps - 7.6.96 *)
+21.9.96 - bugfix in ModifyFrame (* ps - 21.9.96 *)
+11.12.96 - changed Grow
+12.12.96 - added Copy, changed Init, newMenu
+7.1.97 - default width on desktop (set to 250) introduced
+*)
+
+const
+  leftBorder = 0
+  frameColor = 12
+  extend = Display.extend
+  reduce = Display.reduce
+  AvoidLostViewer = true
+  PopupButton = false
+  CutoffWidth = 1000
+
+// Viewer for displaying documents in a desktop.
+
+type
+  DocGadget* = pointer to DocGadgetDesc
+  DocGadgetDesc* = object (Gadgets.FrameDesc)
+    time: int32
+  end
+
+  // Viewers.Viewer for displaying documents in the tiled viewer system.
+  DocViewer* = pointer to DocViewerDesc
+  DocViewerDesc* = object (Viewers.ViewerDesc)
+    menuH*: int16 // Menubar height.
+    time: int32
+  end
+
+  Dummy = pointer to DummyDesc
+
+  UpdateNameMsg* = object (Display.FrameMsg)
+    obj*: Objects.Object
+  end
+  PUpdateNameMsg* = pointer to UpdateNameMsg
+
+  ParentMsg = object (Display.FrameMsg)
+    parent: Objects.Object
+  end
+  PParentMsg = pointer to ParentMsg
+
+  DummyDesc = object (Display.FrameDesc)
+  end
+
+var
+  menuH*: int16 // Default menubar heigth of DocGadget and DocViewer
+  menuC*: int16 // Default menubar panel color
+  menuButtonW*: int16 // Default menu button width
+  namePlateW*: int16 // Default nameplate width
+  recDocWidth*: int16 // recommended minimal document width
+  W: Texts.Writer
+  recall: Display.Frame
+
+procedure ^ NewDummy(): Dummy
+procedure ^ Init*(F: DocGadget; menu, main: Gadgets.Frame; adjust: boolean)
+procedure ^ NewMenu*(const menubar: pointer to array of char): Display.Frame
+procedure ^ ViewerDoc(V: DocViewer): Documents.Document
+procedure ^ AllocateDocGadget(V: DocViewer; w, h: int16; F: pointer to Display.Frame; u, v: pointer to int16)
+
+// ===================== Own Viewer code ================
+
+procedure DummyHandler(F: Objects.Object; M: pointer to Objects.ObjMsg)
+begin
+  case M of
+  | Objects.PCopyMsg:
+    M(Objects.PCopyMsg).obj := NewDummy()
+  end
+end DummyHandler
+
+procedure NewDummy(): Dummy
+  var
+    F: Dummy
+begin
+  newgc(F)
+  F.handle := DummyHandler
+  return F
+end NewDummy
+
+// Does the DocViewer have a menubar? Only the desktops are DocViewers without menubars.
+procedure HasMenu*(V: DocViewer): boolean
+begin
+  return ~(V.dsc is Dummy)
+end HasMenu
+
+procedure CopyDocViewer(V: DocViewer; V1: pointer to DocViewer)
+  var
+    Menu, Main: Display.Frame
+    M: Objects.CopyMsg
+begin
+  Menu := V.dsc
+  Main := V.dsc.next
+  newgc(V1^)
+  V1^^ := V^
+  V1^.state := 0
+  M.id := Objects.shallow
+  Objects.Stamp(@M)
+  Menu.handle(Menu, @M)
+  V1^.dsc := M.obj(Display.Frame)
+  Main.handle(Main, @M)
+  V1^.dsc.next := M.obj(Display.Frame)
+end CopyDocViewer
+
+procedure ModifyFrame(V: DocViewer; F: Display.Frame; id, Y, H: int16)
+  var
+    M: Display.ModifyMsg
+begin
+  M.F := F
+  M.id := id
+  M.dlink := V
+  V.dlink := nil
+  if (F.Y + F.H # Y + H) & (F.H # H) then
+    // move main first and then resize
+    // ps - 21.9.96
+    if H < F.H then
+      // reduce
+      M.X := F.X
+      M.Y := F.Y + (F.H - H)
+      M.W := F.W
+      M.H := H
+      M.dX := 0
+      M.dY := M.Y - F.Y
+      M.dW := 0
+      M.dH := M.H - F.H
+      M.mode := Display.state
+      M.res := (-32768i2)
+      M.x := 0
+      M.y := 0
+      Objects.Stamp(@M)
+      F.handle(F, @M)
+      F.Y := M.Y
+    else
+      // extend
+      M.X := F.X
+      M.Y := Y + H - F.H
+      M.W := F.W
+      M.H := F.H
+      M.dX := 0
+      M.dY := M.Y - F.Y
+      M.dW := 0
+      M.dH := 0
+      M.mode := Display.display
+      M.res := (-32768i2)
+      M.x := 0
+      M.y := 0
+      Objects.Stamp(@M)
+      F.handle(F, @M)
+      F.Y := M.Y
+    end
+  end
+
+  M.X := F.X
+  M.Y := Y
+  M.W := F.W
+  M.H := H
+  M.dX := 0
+  M.dY := M.Y - F.Y
+  M.dW := 0
+  M.dH := M.H - F.H
+  M.mode := Display.display
+  M.res := (-32768i2)
+  M.x := 0
+  M.y := 0
+  Objects.Stamp(@M)
+  F.handle(F, @M)
+  F.Y := Y
+  F.H := H
+end ModifyFrame
+
+procedure Restore(V: DocViewer)
+  var
+    Menu, Main: Display.Frame
+    M: Display.ControlMsg
+begin
+  Menu := V.dsc
+  Main := V.dsc.next
+  Oberon.RemoveMarks(V.X, V.Y, V.W, V.H)
+  Menu.X := V.X
+  Menu.Y := V.Y + V.H
+  Menu.W := V.W
+  Menu.H := 0
+  Main.X := V.X
+  Main.Y := V.Y + V.H - V.menuH
+  Main.W := V.W
+  Main.H := 0
+  M.F := nil
+  M.id := Display.restore
+  M.res := -1
+  Objects.Stamp(@M)
+  M.dlink := V
+  V.dlink := nil
+  M.x := 0
+  M.y := 0
+  Menu.handle(Menu, @M)
+  Main.handle(Main, @M)
+  if V.H > V.menuH + 1 then
+    ModifyFrame(V, Menu, extend, V.Y + V.H - V.menuH, V.menuH)
+    ModifyFrame(V, Main, extend, V.Y, V.H - V.menuH)
+  else
+    ModifyFrame(V, Menu, extend, V.Y, V.H)
+  end
+end Restore
+
+procedure ModifyDocViewer(V: DocViewer; id, Y, H: int16)
+  var
+    Menu, Main: Display.Frame
+begin
+  Menu := V.dsc
+  Main := V.dsc.next
+  if id = extend then
+    Oberon.RemoveMarks(V.X, Y, V.W, V.Y - Y)
+    if H > V.menuH + 1 then
+      ModifyFrame(V, Menu, extend, Y + H - V.menuH, V.menuH)
+      ModifyFrame(V, Main, extend, Y, H - V.menuH)
+    else
+      ModifyFrame(V, Menu, extend, Y, H)
+      ModifyFrame(V, Main, extend, Y + H - V.menuH, 0)
+    end
+
+  elsif id = reduce then
+    Oberon.RemoveMarks(V.X, Y, V.W, Y - V.Y)
+    if H > V.menuH + 1 then
+      ModifyFrame(V, Main, reduce, Y, H - V.menuH)
+      ModifyFrame(V, Menu, reduce, Y + H - V.menuH, V.menuH)
+    else
+      ModifyFrame(V, Main, reduce, Y + H - V.menuH, 0)
+      ModifyFrame(V, Menu, reduce, Y, H)
+    end
+  end
+end ModifyDocViewer
+
+procedure Change(V: DocViewer; X, Y: int16; Keys: set)
+  var
+    Menu, Main: Display.Frame
+    V1: Viewers.Viewer
+    keysum: set
+    Y0, dY, H: int16
+begin
+  // Keys # {}
+  Menu := V.dsc
+  Main := V.dsc.next
+  case Menu of
+  | Dummy:
+    V.dsc.H := 5
+  end
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+
+  Display.ReplConst(3, V.X, V.Y + V.H - V.dsc.H, V.W, V.dsc.H, Display.invert)
+  Y0 := Y
+  keysum := Keys
+  loop
+    Input.Mouse(@Keys, @X, @Y)
+    if Keys = {} then
+      exit
+    end
+    keysum := keysum + Keys
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, X, Y)
+  end
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+  Display.ReplConst(3, V.X, V.Y + V.H - V.dsc.H, V.W, V.dsc.H, Display.invert)
+  case Menu of
+  | Dummy:
+    V.dsc.H := 0
+  end
+  if ~(0 in keysum) or Oberon.New then
+    if (1 in keysum) or Oberon.New & (0 in keysum) then
+      V1 := Viewers.This(X, Y)
+      if (V1 # nil) & ((V1 is DocViewer) & (Y > V1.Y + V1.H - V1(DocViewer).menuH)) then
+        Y := V1.Y + V1.H
+      end
+
+      Viewers.Close(V)
+      Viewers.Open(V, X, Y)
+      Restore(V)
+    else
+      if Y > Y0 then
+        // extend
+        dY := Y - Y0
+        V1 := Viewers.Next(V)
+        if V1.state > 1 then
+          if V1 is DocViewer then
+            if V1(DocViewer).H < V1(DocViewer).menuH + 2 then
+              dY := 0
+            elsif V1(DocViewer).H < V1(DocViewer).menuH + 2 + dY then
+              dY := V1(DocViewer).H - V1(DocViewer).menuH - 2
+            end
+
+          elsif V1.H < 1 + dY then
+            dY := V1.H - 1
+          end
+
+        elsif V1.H < dY then
+          dY := V1.H
+        end
+
+        Viewers.Change(V, V.Y + V.H + dY)
+        Oberon.RemoveMarks(V.X, V.Y, V.W, V.H)
+        if V.H > V.menuH + 1 then
+          ModifyFrame(V, Menu, extend, V.Y + V.H - V.menuH, V.menuH)
+          ModifyFrame(V, Main, extend, V.Y, V.H - V.menuH)
+        else
+          // V.H > 1
+          ModifyFrame(V, Menu, extend, V.Y, V.H)
+          ModifyFrame(V, Main, extend, V.Y + V.H - V.menuH, 0)
+        end
+
+      elsif Y < Y0 then
+        // reduce
+        dY := Y0 - Y
+        if V.H >= V.menuH + 2 then
+          if V.H < V.menuH + 2 + dY then
+            dY := V.H - V.menuH - 2
+          end
+          Oberon.RemoveMarks(V.X, V.Y, V.W, V.H)
+          H := V.H - dY
+          ModifyFrame(V, Main, reduce, V.Y, H - V.menuH)
+          ModifyFrame(V, Menu, reduce, V.Y + H - V.menuH, V.menuH)
+          Viewers.Change(V, V.Y + H)
+        end
+      end
+    end
+  end
+
+  if AvoidLostViewer & (V.Y + V.H < 20) then
+    Viewers.Change(V, 20)
+    Restore(V)
+  end
+end Change
+
+procedure Suspend(V: DocViewer)
+  var
+    Menu, Main: Display.Frame
+begin
+  Menu := V.dsc
+  Main := V.dsc.next
+  ModifyFrame(V, Main, reduce, V.Y + V.H - V.menuH, 0)
+  ModifyFrame(V, Menu, reduce, V.Y + V.H, 0) // ps - 1
+end Suspend
+
+procedure DocViewerNeutralize(F: DocViewer)
+  var
+    main: Gadgets.Frame
+    S: Display.SelectMsg
+begin
+  main := F.dsc.next(Gadgets.Frame)
+  if Gadgets.selected in main.state then
+    S.F := main
+    S.res := -1
+    S.x := 0
+    S.y := 0
+    S.id := Display.reset
+    S.time := -1
+    F.time := -1
+    main.handle(main, @S)
+    Gadgets.Update(main)
+  end
+end DocViewerNeutralize
+
+procedure DocViewerHandleSelect(F: DocViewer; M: pointer to Oberon.InputMsg)
+  var
+    main: Gadgets.Frame
+    S: Display.SelectMsg
+    keysum: set
+    C: Objects.CopyMsg
+begin
+  main := F.dsc.next(Gadgets.Frame)
+  S.F := main
+  S.res := -1
+  S.x := 0
+  S.y := 0
+  S.time := -1
+  if Gadgets.selected in main.state then
+    S.id := Display.reset
+    F.time := -1
+  else
+    S.id := Display.set_
+    F.time := Oberon.Time()
+  end
+
+  main.handle(main, @S)
+  Gadgets.Update(main)
+  keysum := M.keys
+  repeat
+    Effects.TrackMouse(@M.keys, @M.X, @M.Y, Effects.Arrow)
+    keysum := keysum + M.keys
+  until M.keys = {}
+  M.res := 0
+  if (keysum = {0,2}) & (S.id = Display.set_) then
+  // RL delete selection
+  // nothing
+  elsif (keysum = {0,1}) & (S.id = Display.set_) then
+    // RM copy to focus
+    C.id := Objects.deep
+    C.obj := nil
+    Objects.Stamp(@C)
+    main.handle(main, @C)
+    if C.obj # nil then
+      Gadgets.Integrate(C.obj)
+    end
+  end
+end DocViewerHandleSelect
+
+procedure DocViewerHandle*(V: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    Menu, Main: Display.Frame
+    V1: DocViewer
+begin
+  case V of
+  | DocViewer:
+    Menu := V.dsc
+    Main := V.dsc.next
+    M.dlink := V
+    V.dlink := nil
+    case M of
+    | Oberon.PInputMsg:
+      if M.id = Oberon.track then
+        if (M.Y > V.Y + V.H - 5) & (Menu is Dummy) & (2 in M.keys) then
+          Change(V, M.X, M.Y, M.keys)
+        elsif M.Y < V.Y + V.H - V.menuH then
+          Main.handle(Main, M)
+          if (M.res < 0) & (M.keys = {0}) & Effects.InBorder(M.X, M.Y, V.X, V.Y, V.W, V.H - V.menuH) then
+            DocViewerHandleSelect(V, M)
+          end
+
+        elsif M.Y < V.Y + V.H - 1 then
+          Menu.handle(Menu, M)
+          if (M.res < 0) & (2 in M.keys) then
+            Change(V, M.X, M.Y, M.keys)
+          end
+        end
+
+        if M.res < 0 then
+          Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+        end
+      else
+        Menu.handle(Menu, M)
+        Main.handle(Main, M)
+      end
+
+    | Oberon.PControlMsg:
+      if M.id = Oberon.mark then
+        if (M.X >= V.X) & (M.X < V.X + V.W) & (M.Y >= V.Y) & (M.Y < V.Y + V.H) then
+          Oberon.FadeCursor(@Oberon.Mouse)
+          Oberon.DrawCursor(@Oberon.Pointer, @Oberon.Star, M.X, M.Y)
+          Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+        end
+
+      else
+        Menu.handle(Menu, M)
+        Main.handle(Main, M)
+      end
+
+      if M.id = Oberon.neutralize then
+        DocViewerNeutralize(V)
+      end
+
+    | Display.PSelectMsg:
+      if M.id = Display.get then
+        if ((M.time - V.time < 0) or (M.time = -1)) & (Gadgets.selected in Main(Gadgets.Frame).state) then
+          M.time := V.time
+          M.sel := V
+          M.obj := Main
+        end
+      end
+
+      Menu.handle(Menu, M)
+      Main.handle(Main, M)
+
+    | Display.PLocateMsg:
+      if M.F = nil then
+        Menu.handle(Menu, M)
+        Main.handle(Main, M)
+      end
+
+    | Display.PModifyMsg:
+      if M.F = V then
+        ModifyDocViewer(V, M.id, M.Y, M.H)
+      else
+        if M.F # Menu then
+          Menu.handle(Menu, M)
+        end
+        if M.F # Main then
+          Main.handle(Main, M)
+        end
+      end
+
+    | Objects.PCopyMsg:
+      CopyDocViewer(V(DocViewer), @V1)
+      M.obj := V1
+
+    | Objects.PLinkMsg:
+      if (M.id = Objects.get) & (M.name = "Model") then
+        M.obj := V.dsc.next
+        M.res := 0
+      end
+
+    | Objects.PAttrMsg:
+      if M.id = Objects.get then
+        if M.name = "Locked" then
+          M.res := 0
+          M.class := Objects.Bool
+          M.b := true
+        elsif M.name = "Absolute" then
+          M.res := 0
+          M.class := Objects.Bool
+          M.b := true
+        end
+      end
+
+    | Display.PControlMsg:
+      if M.id = Display.restore then
+        Restore(V)
+      elsif M.id = Display.suspend then
+        Suspend(V)
+      else
+        Menu.handle(Menu, M)
+        Main.handle(Main, M)
+      end
+
+    | Documents.PLocateMsg:
+      // added 25.3.94
+      Main.handle(Main, M)
+      if (M.doc = nil) & Effects.Inside(M.X, M.Y, V.X, V.Y, V.W, V.H) then
+        M.doc := ViewerDoc(V)
+      end
+
+    else
+      Menu.handle(Menu, M)
+      Main.handle(Main, M)
+    end
+  end
+end DocViewerHandle
+
+// Create and open a new DocViewer. Analogue to  old-fashioned MenuViewers.New. X, Y indicate the opening position.
+procedure NewDocViewer*(Menu, Main: Display.Frame; menuH, X, Y: int16): DocViewer
+  var
+    V: DocViewer
+begin
+  newgc(V)
+  if Menu = nil then
+    menuH := 0
+    Menu := NewDummy()
+  end
+  V.handle := DocViewerHandle
+  V.dsc := Menu
+  V.dsc.next := Main
+  V.menuH := menuH
+  Viewers.Open(V, X, Y)
+  Restore(V)
+  return V
+end NewDocViewer
+
+// ===================== default handler for document frames ================
+
+// Returns the menubar of a DocGadget.
+procedure Menu*(F: DocGadget): Gadgets.Frame
+begin
+  if F.dsc # nil then
+    return F.dsc(Gadgets.Frame)
+  else
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end Menu
+
+// Returns the contents of a DocGadget.
+procedure Main*(F: DocGadget): Gadgets.Frame
+begin
+  if F.dsc.next # nil then
+    return F.dsc.next(Gadgets.Frame)
+  else
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end Main
+
+procedure SetMask(F: Gadgets.Frame; M: Display3.Mask)
+  var
+    O: Display3.OverlapMsg
+begin
+  O.M := M
+  O.x := 0
+  O.y := 0
+  O.F := F
+  O.dlink := nil
+  O.res := -1
+  F.handle(F, @O)
+end SetMask
+
+procedure SetMainMask(F: DocGadget)
+  var
+    main: Gadgets.Frame
+    R: Display3.Mask
+begin
+  main := Main(F)
+  if main # nil then
+    if F.mask = nil then
+      SetMask(main, nil)
+    else
+      Display3.Copy(F.mask, @R)
+      R.x := 0
+      R.y := 0
+      Display3.Intersect(R, main.X, main.Y, main.W, main.H)
+      R.x := -main.X
+      R.y := -(main.Y + main.H - 1)
+      Display3.Shift(R)
+      SetMask(main, R)
+    end
+  end
+end SetMainMask
+
+procedure SetMenuMask(F: DocGadget)
+  var
+    menu: Gadgets.Frame
+    R: Display3.Mask
+begin
+  menu := Menu(F)
+  if menu # nil then
+    if F.mask = nil then
+      SetMask(menu, nil)
+    else
+      Display3.Copy(F.mask, @R)
+      R.x := 0
+      R.y := 0
+      Display3.Intersect(R, menu.X, menu.Y, menu.W, menu.H)
+      R.x := -menu.X
+      R.y := -(menu.Y + menu.H - 1)
+      Display3.Shift(R)
+      SetMask(menu, R)
+    end
+  end
+end SetMenuMask
+
+procedure ToMain(F: DocGadget; x, y: int16; M: pointer to Display.FrameMsg)
+  var
+    main: Gadgets.Frame
+    Mdlink, Fdlink: Objects.Object
+    tx, ty: int16
+begin
+  main := Main(F)
+  if main # nil then
+    tx := M.x
+    ty := M.y
+    M.x := x
+    M.y := y + F.H - 1
+    Fdlink := F.dlink
+    Mdlink := M.dlink
+    F.dlink := M.dlink
+    M.dlink := F
+    main.handle(main, M)
+    F.dlink := Fdlink
+    M.dlink := Mdlink
+    M.x := tx
+    M.y := ty
+  end
+end ToMain
+
+procedure ToMenu(F: DocGadget; x, y: int16; M: pointer to Display.FrameMsg)
+  var
+    menu: Gadgets.Frame
+    Mdlink, Fdlink: Objects.Object
+    tx, ty: int16
+begin
+  menu := Menu(F)
+  if menu # nil then
+    tx := M.x
+    ty := M.y
+    M.x := x
+    M.y := y + F.H - 1
+    Fdlink := F.dlink
+    Mdlink := M.dlink
+    F.dlink := M.dlink
+    M.dlink := F
+    menu.handle(menu, M)
+    F.dlink := Fdlink
+    M.dlink := Mdlink
+    M.x := tx
+    M.y := ty
+  end
+end ToMenu
+
+procedure PositionMain(F: DocGadget; X, Y, W, H: pointer to int16)
+  var
+    border: int16
+    menu: Gadgets.Frame
+begin
+  menu := Menu(F)
+  if menu # nil then
+    border := menu.H
+  else
+    border := 0
+  end
+  X^ := leftBorder
+  Y^ := -F.H + 1
+  W^ := F.W - leftBorder
+  H^ := F.H - border
+end PositionMain
+
+procedure AdjustDocGadget(F: DocGadget; M: pointer to Display.ModifyMsg)
+  var
+    main, menu: Gadgets.Frame
+    A: Display.ModifyMsg
+    border: int16
+begin
+  menu := Menu(F)
+  main := Main(F)
+  if menu # nil then
+    border := menu.H
+  else
+    border := 0
+  end
+
+  if main # nil then
+    // Adjust main
+    A.id := Display.extend
+    A.F := main
+    A.mode := Display.state
+    A.X := leftBorder
+    A.Y := -M.H + 1
+    A.W := M.W - leftBorder
+    A.H := M.H - border
+    A.dX := A.X - main.X
+    A.dY := A.Y - main.Y
+    A.dW := A.W - main.W
+    A.dH := A.H - main.H
+    A.dlink := M.dlink
+    A.res := -1
+    Objects.Stamp(@A)
+    ToMain(F, M.x + F.X, M.y + F.Y, @A)
+  end
+
+  if menu # nil then
+    // Adjust menu
+    A.id := Display.extend
+    A.F := menu
+    A.mode := Display.state
+    A.X := leftBorder
+    A.Y := -border + 1
+    A.W := M.W - leftBorder
+    A.H := border
+    A.dX := A.X - menu.X
+    A.dY := A.Y - menu.Y
+    A.dW := A.W - menu.W
+    A.dH := A.H - menu.H
+    A.dlink := M.dlink
+    A.res := -1
+    Objects.Stamp(@A)
+    ToMenu(F, M.x + F.X, M.y + F.Y, @A)
+  end
+
+  Gadgets.framehandle(F, M)
+end AdjustDocGadget
+
+// -- docviewer main frame changed; have to adjust docviewer size
+procedure AdjustChildDocGadget(F: DocGadget; M: pointer to Display.ModifyMsg)
+  var
+    menu: Gadgets.Frame
+    A: Display.ModifyMsg
+begin
+  if M.stamp # F.stamp then
+    F.stamp := M.stamp
+    menu := Menu(F)
+
+    A.id := Display.extend
+    A.F := F
+    A.mode := M.mode
+    A.W := leftBorder + M.W
+    A.H := M.H
+    if menu # nil then
+      inc(A.H, menu.H)
+    end
+    A.dW := A.W - F.W
+    A.dH := A.H - F.H
+
+    A.X := F.X + M.dX
+    A.Y := F.Y + M.dY
+    A.dX := A.X - F.X
+    A.dY := A.Y - F.Y
+    Display.Broadcast(@A)
+  end
+end AdjustChildDocGadget
+
+procedure RestoreDocGadget(F: DocGadget; R: Display3.Mask; x, y, w, h: int16; M: pointer to Display.DisplayMsg)
+  var
+    menu, main: Gadgets.Frame
+    D: Display.DisplayMsg
+    b: int16
+
+  procedure ClipAgainst(x, y, w, h: pointer to int16; x1, y1, w1, h1: int16)
+    var
+      r, t, r1, t1: int16
+  begin
+    r := x^ + w^ - 1
+    r1 := x1 + w1 - 1
+    t := y^ + h^ - 1
+    t1 := y1 + h1 - 1
+    if x^ < x1 then
+      x^ := x1
+    end
+    if y^ < y1 then
+      y^ := y1
+    end
+    if r > r1 then
+      r := r1
+    end
+    if t > t1 then
+      t := t1
+    end
+    w^ := r - x^ + 1
+    h^ := t - y^ + 1
+  end ClipAgainst
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  menu := Menu(F)
+  main := Main(F)
+  if menu # nil then
+    b := menu.H
+  else
+    b := 0
+  end
+  if leftBorder > 0 then
+    Display3.ReplConst(R, frameColor, x, y, leftBorder, h, Display.replace)
+  end
+
+  if M.id = Display.area then
+    if main # nil then
+      // display main frame
+      D.device := Display.screen
+      D.id := Display.area
+      D.F := main
+      D.u := M.u - leftBorder
+      D.v := M.v + b
+      D.w := M.w
+      D.h := M.h
+      ClipAgainst(@D.u, @D.v, @D.w, @D.h, 0, -main.H + 1, main.W, main.H)
+      D.dlink := M.dlink
+      D.res := -1
+      Objects.Stamp(@D)
+      ToMain(F, x, y, @D)
+    else
+      Display3.FilledRect3D(R, Display3.FG, Display3.FG, Display3.BG, x + leftBorder, y, w - leftBorder, h - b, 1, Display.replace)
+      Display3.String(R, Display3.FG, x + leftBorder + 5, y + h - b - 20, Fonts.Default, "Document not found", Display.paint)
+    end
+
+    if menu # nil then
+      D.device := Display.screen
+      D.id := Display.area
+      D.F := menu
+      D.u := M.u - leftBorder
+      D.v := M.v
+      D.w := M.w
+      D.h := M.h
+      ClipAgainst(@D.u, @D.v, @D.w, @D.h, 0, -menu.H + 1, menu.W, menu.H)
+      D.dlink := M.dlink
+      D.res := -1
+      Objects.Stamp(@D)
+      ToMenu(F, x, y, @D)
+    end
+
+  else
+    if main # nil then
+      D.device := Display.screen
+      D.id := Display.full
+      D.F := main
+      D.dlink := M.dlink
+      D.res := -1
+      Objects.Stamp(@D)
+      ToMain(F, x, y, @D)
+    else
+      Display3.FilledRect3D(R, Display3.FG, Display3.FG, Display3.BG, x + leftBorder, y, w - leftBorder, h - b, 1, Display.replace)
+      Display3.String(R, Display3.FG, x + leftBorder + 5, y + h - b - 20, Fonts.Default, "Document not found", Display.paint)
+    end
+
+    if menu # nil then
+      D.device := Display.screen
+      D.id := Display.full
+      D.F := menu
+      D.dlink := M.dlink
+      D.res := -1
+      Objects.Stamp(@D)
+      ToMenu(F, x, y, @D)
+    end
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreDocGadget
+
+procedure PrintDocGadget(F: DocGadget; M: pointer to Display.DisplayMsg)
+  var
+    menu, main: Display.Frame
+    b, x, y, w, h: int16
+    PM: Display.DisplayMsg
+    R: Display3.Mask
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  if M.id = Display.full then
+    menu := Menu(F)
+    main := Main(F)
+    if menu # nil then
+      b := menu.H
+    else
+      b := 0
+    end
+    if main # nil then
+      PM.device := Display.printer
+      PM.id := Display.full
+      PM.x := M.x
+      PM.y := M.y
+      PM.res := -1
+      PM.F := main
+      PM.dlink := M.dlink
+      main.handle(main, @PM)
+    else
+      Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+      x := M.x
+      y := M.y
+      w := P(F.W)
+      h := P(F.H)
+      Printer3.FilledRect3D(R, Display3.FG, Display3.FG, Display3.BG, x, y, w, h - P(b), 1, Display.replace)
+      Printer3.String(R, Display3.FG, x + 5, y + h - P(b + 20), Fonts.Default, "Document not found", Display.paint)
+    end
+
+    if menu # nil then
+      PM.device := Display.printer
+      PM.id := Display.full
+      PM.x := M.x
+      PM.y := M.y + P(F.H - b)
+      PM.res := -1
+      PM.F := menu
+      PM.dlink := M.dlink
+      menu.handle(menu, @PM)
+    end
+  end
+end PrintDocGadget
+
+procedure CopyDocGadget*(M: pointer to Objects.CopyMsg; from, to_: DocGadget)
+  var
+    menu, main, menu0, main0: Gadgets.Frame
+    C: Objects.CopyMsg
+begin
+  Gadgets.CopyFrame(M, from, to_)
+
+  menu := Menu(from)
+  main := Main(from)
+  if main # nil then
+    C.id := Objects.shallow
+    Objects.Stamp(@C)
+    main.handle(main, @C)
+    main0 := C.obj(Gadgets.Frame)
+  else
+    main0 := nil
+  end
+
+  if menu # nil then
+    C.id := Objects.shallow
+    Objects.Stamp(@C)
+    menu.handle(menu, @C)
+    menu0 := C.obj(Gadgets.Frame)
+  else
+    menu0 := nil
+  end
+
+  if menu0 = nil then
+    to_.dsc := main0
+  else
+    to_.dsc := menu0
+    menu0.next := main0
+  end
+end CopyDocGadget
+
+procedure StoreDocGadget(F: DocGadget; M: pointer to Objects.FileMsg)
+begin
+  Files.WriteInt(@M.R, 1)
+  Files.WriteSet(@M.R, {})
+  Gadgets.WriteRef(@M.R, F.lib, Main(F))
+  Gadgets.framehandle(F, M)
+end StoreDocGadget
+
+procedure LoadDocGadget(F: DocGadget; M: pointer to Objects.FileMsg)
+  var
+    x, i, j: int16
+    tmp: set
+    obj: Objects.Object
+    main: Gadgets.Frame
+    title: array 128 of char
+    L: Objects.LinkMsg
+    A: Objects.AttrMsg
+begin
+  Files.ReadInt(@M.R, @x)
+  if x # 1 then
+    halt(99)
+  end
+  Files.ReadSet(@M.R, @tmp)
+  Gadgets.ReadRef(@M.R, F.lib, @obj)
+  Gadgets.framehandle(F, M)
+
+  if (obj # nil) & (obj is Gadgets.Frame) then
+    main := obj(Gadgets.Frame)
+  else
+    main := nil
+  end
+
+  // Menu
+  L.obj := nil
+  L.res := -1
+  if main # nil then
+    L.id := Objects.get
+    if F.W > asr(Display.Width, 3) * 3 then
+      copy(@L.name, "DeskMenu", 32)
+    else
+      copy(@L.name, "SystemMenu", 32)
+    end
+    main.handle(main, @L)
+  end
+
+  if (L.obj # nil) & (L.obj is Gadgets.Frame) & (L.res >= 0) then
+    obj := L.obj
+  else
+    copy(@title, "Desktops.CloseDoc[Close] ", 128)
+    if main # nil then
+      A.id := Objects.get
+      copy(@A.name, "Menu", 32)
+      A.res := -1
+      copy(@A.s, "", 64)
+      obj.handle(obj, @A)
+      if (A.res >= 0) & (A.class = Objects.String) & (A.s # "") then
+        i := 0
+        while title[i] # 0X do
+          inc(i)
+        end
+        j := 0
+        while A.s[j] # 0X do
+          title[i] := A.s[j]
+          inc(i)
+          inc(j)
+        end
+        title[i] := 0X
+      end
+    end
+
+    obj := NewMenu(@title)
+  end
+
+  // F.Y := F.Y + F.H - main.H - menuH;
+  Init(F, obj(Gadgets.Frame), main, false)
+end LoadDocGadget
+
+procedure DocGadgetAttr(F: DocGadget; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      copy(@M.s, "Desktops.NewDocGadget", 64)
+      M.class := Objects.String
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  else
+    Gadgets.framehandle(F, M)
+  end
+end DocGadgetAttr
+
+procedure LinkMenu(F: DocGadget; obj: Objects.Object)
+  var
+    new_, main, menu: Gadgets.Frame
+    h: int16
+begin
+  if (obj # nil) & (obj is Gadgets.Frame) then
+    new_ := obj(Gadgets.Frame)
+    h := new_.H
+  else
+    new_ := nil
+    h := 0
+  end
+
+  main := Main(F)
+  menu := Menu(F)
+  if menu = nil then
+    inc(F.H, h)
+  else
+    F.H := F.H - menu.H + h
+  end
+
+  Init(F, new_, main, false)
+end LinkMenu
+
+procedure DocGadgetLink(F: DocGadget; M: pointer to Objects.LinkMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Model" then
+      M.obj := Main(F)
+      M.res := 0
+    elsif M.name = "Menu" then
+      M.obj := Menu(F)
+      M.res := 0
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Menu" then
+      LinkMenu(F, M.obj)
+      M.res := 0
+    end
+  end
+end DocGadgetLink
+
+procedure Neutralize(F: DocGadget)
+  var
+    main: Gadgets.Frame
+    S: Display.SelectMsg
+begin
+  main := Main(F)
+  if (main # nil) & (Gadgets.selected in main.state) then
+    S.F := main
+    S.res := -1
+    S.x := 0
+    S.y := 0
+    S.id := Display.reset
+    S.time := -1
+    F.time := -1
+    ToMain(F, 0, 0, @S)
+    Gadgets.Update(main)
+  end
+end Neutralize
+
+procedure HandleSelect(F: DocGadget; M: pointer to Oberon.InputMsg)
+  var
+    main: Gadgets.Frame
+    S: Display.SelectMsg
+    keysum: set
+    C: Objects.CopyMsg
+begin
+  main := Main(F)
+  if main # nil then
+    S.F := main
+    S.res := -1
+    S.x := 0
+    S.y := 0
+    S.time := -1
+    if Gadgets.selected in main.state then
+      S.id := Display.reset
+      F.time := -1
+    else
+      S.id := Display.set_
+      F.time := Oberon.Time()
+    end
+    ToMain(F, M.x + F.X, M.y + F.Y, @S)
+    Gadgets.Update(main)
+    keysum := M.keys
+    repeat
+      Effects.TrackMouse(@M.keys, @M.X, @M.Y, Effects.Arrow)
+      keysum := keysum + M.keys
+    until M.keys = {}
+    M.res := 0
+    if (keysum = {0,2}) & (S.id = Display.set_) then
+    // RL delete selection
+    // nothing
+    elsif (keysum = {0,1}) & (S.id = Display.set_) then
+      // RM copy to focus
+      C.id := Objects.deep
+      C.obj := nil
+      Objects.Stamp(@C)
+      main.handle(main, @C)
+      if C.obj # nil then
+        Gadgets.Integrate(C.obj)
+      end
+    end
+  end
+end HandleSelect
+
+procedure TrackDocGadget(F: DocGadget; x, y, w, h, border: int16; M: pointer to Oberon.InputMsg)
+  var
+    PM: Gadgets.PriorityMsg
+begin
+  if M.Y >= y + h - border then
+    if M.keys = {2} then
+      // to front first
+      PM.id := Gadgets.visible
+      PM.passon := true
+      PM.F := F
+      Display.Broadcast(@PM)
+    end
+
+    ToMenu(F, x, y, M)
+    if (M.res < 0) & ~Gadgets.InActiveArea(F, M) then
+      Gadgets.framehandle(F, M)
+    end
+  else
+    if M.keys = {2} then
+      // to front first
+      PM.id := Gadgets.visible
+      PM.passon := true
+      PM.F := F
+      Display.Broadcast(@PM)
+    end
+
+    if ~Gadgets.InActiveArea(F, M) & (M.keys = {1}) then
+      Gadgets.framehandle(F, M)
+    else
+      ToMain(F, x, y, M)
+      if (M.res < 0) & (M.keys = {0}) then
+        HandleSelect(F, M)
+      end
+      if (M.res < 0) & ~Gadgets.InActiveArea(F, M) then
+        Gadgets.framehandle(F, M)
+      end
+    end
+  end
+end TrackDocGadget
+
+procedure DocGadgetHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h: int16
+    F0: DocGadget
+    R: Display3.Mask
+    obj: Objects.Object
+    main, menu: Gadgets.Frame
+    border: int16
+    N: Oberon.ControlMsg
+    tM: Display.DisplayMsg
+begin
+  case F of
+  | DocGadget:
+    case M of
+    | Display.PFrameMsg:
+      if (M.F = nil) or (M.F = F) then
+        // message addressed to this frame
+        x := M.x + F.X // calculate display coordinates
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        menu := Menu(F)
+        main := Main(F)
+        if menu # nil then
+          border := menu.H
+        else
+          border := 0
+        end
+        if M is Display.PDisplayMsg then
+          if M(Display.PDisplayMsg).device = Display.screen then
+            if (M(Display.PDisplayMsg).id = Display.full) or (M(Display.PDisplayMsg).F = nil) then
+              Gadgets.MakeMask(F, x, y, M(Display.PDisplayMsg).dlink, @R)
+              RestoreDocGadget(F, R, x, y, w, h, M(Display.PDisplayMsg))
+            elsif M(Display.PDisplayMsg).id = Display.area then
+              Gadgets.MakeMask(F, x, y, M(Display.PDisplayMsg).dlink, @R)
+              Display3.AdjustMask(R, x + M(Display.PDisplayMsg).u, y + h - 1 + M(Display.PDisplayMsg).v, M(Display.PDisplayMsg).w, M(Display.PDisplayMsg).h)
+              RestoreDocGadget(F, R, x, y, w, h, M(Display.PDisplayMsg))
+            end
+
+          elsif M(Display.PDisplayMsg).device = Display.printer then
+            PrintDocGadget(F, M(Display.PDisplayMsg))
+          end
+
+        elsif M is Oberon.PInputMsg then
+          if (M(Oberon.PInputMsg).id = Oberon.track) & ~(Gadgets.selected in F.state) then
+            TrackDocGadget(F, x, y, w, h, border, M(Oberon.PInputMsg))
+          elsif ~(Gadgets.selected in F.state) then
+            ToMain(F, x, y, M(Oberon.PInputMsg))
+            ToMenu(F, x, y, M(Oberon.PInputMsg))
+          else
+            Gadgets.framehandle(F, M(Oberon.PInputMsg))
+          end
+
+        elsif M is Display.PModifyMsg then
+          if M(Display.PModifyMsg).F = F then
+            AdjustDocGadget(F, M(Display.PModifyMsg))
+          else
+            Gadgets.framehandle(F, M(Display.PModifyMsg))
+          end
+
+        elsif M is Display.PLocateMsg then
+          if (M(Display.PLocateMsg).loc = nil) & Effects.Inside(M(Display.PLocateMsg).X, M(Display.PLocateMsg).Y, x, y, w, h) then
+            if M(Display.PLocateMsg).Y >= y + h - border then
+              ToMenu(F, x, y, M(Display.PLocateMsg))
+            else
+              ToMain(F, x, y, M(Display.PLocateMsg))
+            end
+
+            if M(Display.PLocateMsg).loc = nil then
+              M(Display.PLocateMsg).loc := F
+              M(Display.PLocateMsg).u := M(Display.PLocateMsg).X - x
+              M(Display.PLocateMsg).v := M(Display.PLocateMsg).Y - (y + h - 1)
+              M(Display.PLocateMsg).res := 0
+            end
+          end
+
+        elsif M is Display.PSelectMsg then
+          if M(Display.PSelectMsg).id = Display.set_ then
+            Neutralize(F)
+            N.id := Oberon.neutralize
+            N.F := nil
+            N.res := -1
+            ToMain(F, x, y, @N)
+            ToMenu(F, x, y, @N)
+          elsif M(Display.PSelectMsg).id = Display.reset then
+          elsif M(Display.PSelectMsg).id = Display.get then
+            main := Main(F)
+            if ((M(Display.PSelectMsg).time - F.time < 0) or (M(Display.PSelectMsg).time = -1)) & (Gadgets.selected in main.state) then
+              M(Display.PSelectMsg).time := F.time
+              M(Display.PSelectMsg).sel := F
+              M(Display.PSelectMsg).obj := main
+            end
+          end
+
+          if M(Display.PSelectMsg).F # nil then
+            Gadgets.framehandle(F, M(Display.PSelectMsg))
+          else
+            ToMain(F, x, y, M(Display.PSelectMsg))
+            ToMenu(F, x, y, M(Display.PSelectMsg))
+          end
+
+        elsif M is Display3.PUpdateMaskMsg then
+          if M(Display3.PUpdateMaskMsg).F = F then
+            // have to create own mask
+            newgc(F.mask)
+            Display3.Open(F.mask)
+            Display3.Add(F.mask, 0, -F.H + 1, F.W, F.H)
+            SetMainMask(F)
+            SetMenuMask(F)
+            M(Display3.PUpdateMaskMsg).res := 0
+          end
+
+        elsif M is Display3.POverlapMsg then
+          if (M(Display3.POverlapMsg).F = F) or (M(Display3.POverlapMsg).F = nil) then
+            F.mask := M(Display3.POverlapMsg).M
+            SetMainMask(F)
+            SetMenuMask(F)
+          end
+
+        elsif M is Display3.PUpdateMaskMsg then
+          if F.mask = nil then
+            Gadgets.MakeMask(F, x, y, M(Display3.PUpdateMaskMsg).dlink, @R)
+          end
+          SetMainMask(F)
+          SetMenuMask(F)
+
+        elsif M is Oberon.PControlMsg then
+          ToMain(F, x, y, M(Oberon.PControlMsg))
+          ToMenu(F, x, y, M(Oberon.PControlMsg))
+          if M(Oberon.PControlMsg).id = Oberon.neutralize then
+            Neutralize(F)
+          end
+
+        elsif M is Documents.PLocateMsg then
+          // added 25.3.94
+          ToMain(F, x, y, M(Documents.PLocateMsg))
+          obj := Main(F)
+          if M(Documents.PLocateMsg).doc # obj then
+            Gadgets.MakeMask(F, x, y, M(Documents.PLocateMsg).dlink, @R)
+            if Effects.Inside(M(Documents.PLocateMsg).X, M(Documents.PLocateMsg).Y, x, y, w, h) & Display3.Visible(R, M(Documents.PLocateMsg).X, M(Documents.PLocateMsg).Y, 1, 1) & (obj is Documents.Document) then
+              M(Documents.PLocateMsg).doc := obj(Documents.Document)
+            end
+          end
+
+        elsif M is Gadgets.PUpdateMsg then
+          if M(Gadgets.PUpdateMsg).obj = main then
+            Gadgets.MakeMask(F, x, y, M(Gadgets.PUpdateMsg).dlink, @R)
+            tM.device := Display.screen
+            tM.id := Display.full
+            tM.dlink := M(Gadgets.PUpdateMsg).dlink
+            RestoreDocGadget(F, R, x, y, w, h, @tM)
+          else
+            ToMain(F, x, y, M(Gadgets.PUpdateMsg))
+            ToMenu(F, x, y, M(Gadgets.PUpdateMsg))
+          end
+
+          if Gadgets.lockedsize in main.state then
+            F.state := F.state + {Gadgets.lockedsize}
+          else
+            F.state := F.state - {Gadgets.lockedsize}
+          end
+
+        elsif M.F # nil then
+          Gadgets.framehandle(F, M)
+        else
+          ToMain(F, x, y, M)
+          ToMenu(F, x, y, M)
+        end
+
+      else
+        // not for this frame but perhaps for a child
+        main := Main(F)
+        M1 := M
+        case M1 of
+        | Display3.PUpdateMaskMsg:
+          if M1.F = main then
+            if F.mask = nil then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            end
+            SetMainMask(F)
+            SetMenuMask(F)
+          else
+            ToMain(F, M1.x + F.X, M1.y + F.Y, M1)
+          end
+
+        | Display.PConsumeMsg:
+          if M1.obj is DocGadget then
+          // prevent consumption
+          else
+            ToMain(F, M1.x + F.X, M1.y + F.Y, M1)
+          end
+
+        | Display.PModifyMsg:
+          if M1.F = main then
+            AdjustChildDocGadget(F, M1(Display.PModifyMsg))
+          else
+            ToMain(F, M1.x + F.X, M1.y + F.Y, M1)
+            ToMenu(F, M1.x + F.X, M1.y + F.Y, M1)
+          end
+
+        | Display.PDisplayMsg:
+          if (M1.device = Display.screen) & (M1.F = main) then
+            Oberon.RemoveMarks(M1.x + F.X, M1.y + F.Y, F.W, F.H)
+          end
+
+          ToMain(F, M1.x + F.X, M1.y + F.Y, M1)
+          ToMenu(F, M1.x + F.X, M1.y + F.Y, M1)
+
+        else
+          ToMain(F, M1.x + F.X, M1.y + F.Y, M1)
+          ToMenu(F, M1.x + F.X, M1.y + F.Y, M1)
+        end
+      end
+
+    // Object messages
+    | Objects.PAttrMsg:
+      DocGadgetAttr(F, M(Objects.PAttrMsg))
+    | Objects.PLinkMsg:
+      DocGadgetLink(F, M(Objects.PLinkMsg))
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        StoreDocGadget(F, M)
+      elsif M.id = Objects.load then
+        LoadDocGadget(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink // copy msg arrives again
+      else
+        // first time copy message arrives
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyDocGadget(M, F, F0)
+        M.obj := F0
+      end
+
+    | Objects.PBindMsg:
+      main := Main(F)
+      if main # nil then
+        main.handle(main, M)
+      end
+      Gadgets.framehandle(F, M)
+    else
+      // unknown msg, framehandler might know it
+      Gadgets.framehandle(F, M)
+    end
+  end
+end DocGadgetHandler
+
+procedure NewDocGadget*()
+  var
+    F: DocGadget
+begin
+  newgc(F)
+  F.handle := DocGadgetHandler
+  F.W := asr(Display.Width, 3) * 3
+  F.H := 200
+  Objects.NewObj := F
+end NewDocGadget
+
+(** Initialize a DocGadget with a menu and main frame. The adjust flag is TRUE if the DocGadget should determine its
+size according to the combined size of the menu and main frames. This is the default case. *)
+procedure Init*(F: DocGadget; menu, main: Gadgets.Frame; adjust: boolean)
+  var
+    A: Display.ModifyMsg
+    oldH: int16
+begin
+  if menu = nil then
+    halt(99)
+  end
+
+  if adjust then
+    F.W := 0
+    F.H := 0
+    inc(F.H, menu.H)
+    if (main # nil) & (main.H > 0) then
+      inc(F.H, main.H)
+      inc(F.W, main.W)
+    else
+      inc(F.W, asr(Display.Width, 3) * 3)
+      inc(F.H, 200)
+    end
+  end
+
+  F.dsc := menu
+  menu.next := main
+
+  A.id := Display.extend
+  A.mode := Display.state
+  A.F := menu
+  A.res := -1
+  A.x := 0
+  A.y := 0
+  A.dlink := nil
+  Objects.Stamp(@A)
+  // ps - 12.12.96
+  oldH := menu.H
+  A.X := menu.X
+  A.Y := menu.Y + oldH - 1
+  A.W := menu.W
+  A.H := 0
+  A.dX := A.X - menu.X
+  A.dY := A.Y - menu.Y
+  A.dW := A.W - menu.W
+  A.dH := A.H - menu.H
+  menu.handle(menu, @A)
+  menu.X := leftBorder
+  menu.Y := 0
+  A.res := -1
+  Objects.Stamp(@A)
+  A.X := leftBorder
+  A.Y := -oldH + 1
+  A.W := F.W - leftBorder
+  A.H := oldH
+  A.dX := A.X - menu.X
+  A.dY := A.Y - menu.Y
+  A.dW := A.W - menu.W
+  A.dH := A.H - menu.H
+  menu.handle(menu, @A)
+
+  if main # nil then
+    A.id := Display.extend
+    A.mode := Display.state
+    A.F := main
+    A.res := -1
+    A.x := 0
+    A.y := 0
+    A.dlink := nil
+    Objects.Stamp(@A)
+    PositionMain(F, @A.X, @A.Y, @A.W, @A.H)
+    A.dX := A.X - main.X
+    A.dY := A.Y - main.Y
+    A.dW := A.W - main.W
+    A.dH := A.H - main.H
+    if Gadgets.lockedsize in main.state then
+      F.state := F.state + {Gadgets.lockedsize}
+    end
+    main.handle(main, @A)
+  end
+
+  F.state := F.state + {Gadgets.lockedcontents}
+end Init
+
+// ===================== Menu bar =================================
+
+(** Create a new menubar from the menu string. Menu strings are sequences of names. The caption
+of a menu button can be set by following the name by the caption text in square brackets, for example
+"MyDoc.Do[Do] MyDoc.Undo[Undo]" etc. The complete syntax is: { cmd [ title ] } . cmd = name | string . string = "'" chars "'" . title = "[" chars "]" . *)
+
+procedure NewMenu*(const menubar: pointer to array of char): Display.Frame
+
+  var
+    obj, list: Objects.Object
+    P, f: Gadgets.Frame
+    X, p: int16
+    cmd, title: array 64 of char
+    C: Display.ConsumeMsg
+    i: int32
+    havecopy: boolean
+
+  procedure Button(const caption: pointer to array of char; const command: pointer to array of char; command_len: int32; X: pointer to int16; f: pointer to Gadgets.Frame; list: pointer to Objects.Object; obj: pointer to Objects.Object; p: pointer to int16)
+  begin
+    obj^ := Gadgets.CreateObject("BasicGadgets.NewButton")
+    f^ := obj^(Gadgets.Frame)
+    f^.X := X^
+    f^.Y := p^
+    f^.H := menuH - 2 * p^
+    f^.W := menuButtonW
+    f^.slink := list^
+    list^ := f^
+    if command^ = "Edit.Store" then
+      copy(command, "Desktops.StoreDoc", command_len)
+    elsif command^ = "Edit.Search" then
+      copy(command, "TextDocs.Search", command_len)
+    end
+
+    Attributes.SetString(f^, "Caption", caption)
+    Attributes.SetString(f^, "Cmd", command)
+    Attributes.SetBool(f^, "Popout", true)
+    inc(X^, f^.W)
+  end Button
+
+  procedure GetString(s: pointer to array of char; i: pointer to int32; menubar: pointer to array of char)
+    var
+      term: char
+      j: int32
+  begin
+    while menubar[i^] = " " do
+      inc(i^)
+    end
+    if menubar[i^] = "'" then
+      inc(i^)
+      term := "'"
+    elsif menubar[i^] = "[" then
+      inc(i^)
+      term := "]"
+    else
+      term := 0X
+    end
+
+    j := 0
+    if term = 0X then
+      while (menubar[i^] # 0X) & (menubar[i^] # " ") & (menubar[i^] # "[") & (menubar[i^] # "'") do
+        s[j] := menubar[i^]
+        inc(i^)
+        inc(j)
+      end
+
+      while menubar[i^] = " " do
+        inc(i^)
+      end
+      if menubar[i^] = "^" then
+        s[j] := " "
+        inc(j)
+        s[j] := "^"
+        inc(j)
+        inc(i^)
+      end
+
+    else
+      while (menubar[i^] # 0X) & (menubar[i^] # term) do
+        s[j] := menubar[i^]
+        inc(i^)
+        inc(j)
+      end
+
+      if menubar[i^] = term then
+        inc(i^)
+      end
+    end
+
+    s[j] := 0X
+    // WHILE menubar[i] = " " DO INC(i) END
+  end GetString
+
+  procedure GenTitle(cmd: pointer to array of char; title: pointer to array of char; title_len: int32)
+    var
+      j, k: int32
+  begin
+    j := 0
+    while (cmd[j] # ".") & (cmd[j] # 0X) & (cmd[j] # " ") do
+      inc(j)
+    end
+    if cmd[j] = "." then
+      k := 0
+      inc(j)
+      while (cmd[j] # 0X) & (cmd[j] # " ") do
+        title[k] := cmd[j]
+        inc(k)
+        inc(j)
+      end
+      title[k] := 0X
+    else
+      copy(title, cmd, title_len)
+    end
+  end GenTitle
+begin
+  p := 1
+  list := nil
+  X := 0
+  havecopy := false
+  obj := Gadgets.CreateObject("Panels.NewPanel")
+  P := obj(Gadgets.Frame)
+  P.W := Display.Width
+  P.H := menuH
+  // PanelHandler := P.handle; (* cache *) (deactivated - ps)
+  // name plate
+  obj := Gadgets.CreateObject("NamePlates.NewNamePlate")
+  f := obj(Gadgets.Frame)
+  f.X := X
+  f.Y := 0
+  f.H := menuH
+  f.W := namePlateW
+  inc(X, f.W)
+  f.slink := list
+  list := f
+
+  Button("Close", "Desktops.CloseDoc", 18, @X, @f, @list, @obj, @p)
+  if PopupButton then
+    obj := Gadgets.FindPublicObj("Desktops.DocButton")
+  end
+  if PopupButton & (obj # nil) then
+    obj := Gadgets.Clone(obj, true)
+    f := obj(Gadgets.Frame)
+    havecopy := true
+    f.X := X
+    f.Y := p
+    f.slink := list
+    list := f
+    inc(X, f.W)
+  else
+    Button("Hide", "Finder.Minimize", 16, @X, @f, @list, @obj, @p)
+    Button("Grow", "Desktops.Grow", 14, @X, @f, @list, @obj, @p)
+  end
+
+  i := 0
+  while menubar[i] # 0X do
+    GetString(@cmd, @i, menubar)
+    if menubar[i] = "[" then
+      GetString(@title, @i, menubar)
+    else
+      GenTitle(@cmd, @title, 64)
+    end
+
+    if (cmd = "System.Close") or (cmd = "System.Grow") or havecopy & (cmd = "Desktops.Copy") then
+    // skip - already have that
+    else
+      Button(@title, @cmd, 64, @X, @f, @list, @obj, @p)
+    end
+  end
+
+  C.id := Display.drop
+  C.obj := list
+  C.x := 0
+  C.y := 0
+  C.F := P
+  C.u := 0
+  C.v := -P.H + 1
+  C.res := -1
+  C.dlink := nil
+  P.handle(P, @C)
+  Attributes.SetBool(P, "Locked", true)
+  Attributes.SetInt(P, "Color", menuC)
+  Attributes.SetInt(P, "Border", 0)
+  (*
+  P.handle := MenuHandler;
+  *)
+  return P
+end NewMenu
+
+procedure ViewerDoc(V: DocViewer): Documents.Document
+  var
+    main: Display.Frame
+    d: Documents.Document
+    obj: Objects.Object
+begin
+  d := nil
+  main := V.dsc.next
+  case main of
+  | Views.View:
+    if main(Views.View).obj # nil then
+      obj := main(Views.View).obj
+      case obj of
+      | Documents.Document:
+        d := obj(Documents.Document)
+      end
+    end
+
+  | Documents.Document:
+    d := main(Documents.Document)
+  end
+
+  return d
+end ViewerDoc
+
+procedure DocGadgetDoc(F: DocGadget): Documents.Document
+  var
+    d: Documents.Document
+    main: Gadgets.Frame
+begin
+  d := nil
+  main := Main(F)
+  if main # nil then
+    case main of
+    | Documents.Document:
+      d := main(Documents.Document)
+    end
+  end
+
+  return d
+end DocGadgetDoc
+
+// Document gadget enclosing the current context.
+procedure CurDoc*(context: Objects.Object): Documents.Document
+  var
+    doc: Documents.Document
+    obj, old: Objects.Object
+begin
+  doc := nil
+  if (Oberon.Par.frame = Oberon.Par.vwr.dsc) & (Oberon.Par.vwr is DocViewer) then
+    // in menu of DocViewer
+    doc := ViewerDoc(Oberon.Par.vwr(DocViewer))
+  else
+    obj := context
+    old := nil
+    while (obj # nil) & (obj # old) & ~(obj is Documents.Document) & ~(obj is DocGadget) do
+      old := obj
+      obj := obj.dlink
+    end
+
+    if obj # nil then
+      case obj of
+      | Documents.Document:
+        doc := obj(Documents.Document)
+      | DocGadget:
+        doc := DocGadgetDoc(obj(DocGadget))
+      end
+    end
+  end
+
+  return doc
+end CurDoc
+
+// Menu bar of the document enclosing the current context.
+procedure CurMenu*(context: Objects.Object): Display.Frame
+  var
+    obj: Objects.Object
+begin
+  obj := context
+  while (obj # nil) & ~((obj is DocGadget) or (obj is DocViewer)) do
+    obj := obj.dlink
+  end
+  if obj # nil then
+    if obj is DocGadget then
+      return Menu(obj(DocGadget))
+    elsif (obj is DocViewer) & HasMenu(obj(DocViewer)) then
+      return obj(DocViewer).dsc
+    else
+      return nil
+    end
+
+  else
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end CurMenu
+
+// TRUE if context is within a Document-Menu.
+procedure IsInMenu*(context: Objects.Object): boolean
+  var
+    obj, L: Objects.Object
+begin
+  obj := context
+  L := nil
+  while (obj # nil) & ~((obj is DocGadget) or (obj is DocViewer)) do
+    L := obj
+    obj := obj.dlink
+  end
+
+  if obj # nil then
+    if obj is DocGadget then
+      return L = Menu(obj(DocGadget))
+    elsif (obj is DocViewer) & HasMenu(obj(DocViewer)) then
+      return L = obj(DocViewer).dsc
+    else
+      return false
+    end
+
+  else
+    return false
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end IsInMenu
+
+// ========Desk top commands ==========
+
+procedure AddStandardThings(F: Display.Frame)
+  var
+    list: Display.Frame
+    X, Y: int16
+    C: Display.ConsumeMsg
+
+  procedure Title(X: pointer to int16; Y: pointer to int16; list: pointer to Display.Frame)
+    var
+      obj: Objects.Object
+      f: Display.Frame
+  begin
+    obj := Gadgets.CreateObject("NamePlates.NewNamePlate")
+    f := obj(Gadgets.Frame)
+    dec(Y^, f.H + 4)
+    f.X := X^
+    f.Y := Y^
+    f.W := asr(3 * f.W, 1)
+    f.slink := list^
+    list^ := f
+  end Title
+
+  procedure Button(const caption, command: pointer to array of char; X: pointer to int16; Y: pointer to int16; list: pointer to Display.Frame)
+    var
+      obj: Objects.Object
+      f: Display.Frame
+      A: Objects.AttrMsg
+  begin
+    obj := Gadgets.CreateObject("BasicGadgets.NewButton")
+    f := obj(Gadgets.Frame)
+    f.H := 31
+    f.W := 36
+    dec(Y^, f.H + 4)
+    f.X := X^
+    f.Y := Y^
+    f.slink := list^
+    list^ := f
+
+    A.id := Objects.set_
+    copy(@A.name, "Caption", 32)
+    A.class := Objects.String
+    copy(@A.s, caption, 64)
+    A.res := -1
+    f.handle(f, @A)
+
+    A.id := Objects.set_
+    copy(@A.name, "Cmd", 32)
+    A.class := Objects.String
+    copy(@A.s, command, 64)
+    A.res := -1
+    f.handle(f, @A)
+
+    A.id := Objects.set_
+    copy(@A.name, "Popout", 32)
+    A.class := Objects.Bool
+    A.b := true
+    A.res := -1
+    f.handle(f, @A)
+  end Button
+
+  procedure Finder(X: pointer to int16; Y: pointer to int16; list: pointer to Display.Frame)
+    var
+      obj: Objects.Object
+      f: Display.Frame
+  begin
+    obj := Gadgets.CreateObject("Finder.NewFrame")
+    f := obj(Gadgets.Frame)
+    dec(Y^, f.H + 4)
+    f.X := X^
+    f.Y := Y^
+    f.slink := list^
+    list^ := f
+  end Finder
+
+  procedure Navigator(X: pointer to int16; Y: pointer to int16; list: pointer to Display.Frame)
+    var
+      obj: Objects.Object
+      f: Display.Frame
+  begin
+    obj := Gadgets.CreateObject("Navigators.NewNavigator")
+    f := obj(Gadgets.Frame)
+    f.H := 31
+    f.W := 36
+    dec(Y^, f.H + 4)
+    f.X := X^
+    f.Y := Y^
+    f.slink := list^
+    list^ := f
+  end Navigator
+begin
+  list := nil
+  X := 0
+  Y := 0
+
+  Title(@X, @Y, @list)
+  inc(X, 10)
+  Navigator(@X, @Y, @list)
+  Button("Close", "Desktops.Close", @X, @Y, @list)
+  Button("Grow", "Desktops.Grow", @X, @Y, @list)
+  Button("Copy", "System.Copy", @X, @Y, @list)
+  Button("Store", "Desktops.Store", @X, @Y, @list)
+
+  Finder(@X, @Y, @list)
+  dec(X, 10)
+
+  C.id := Display.drop
+  C.obj := list
+  C.x := 0
+  C.y := 0
+  C.F := F
+  C.u := 10
+  C.v := -(abs(Y) + 5)
+  C.res := -1
+  C.dlink := nil
+  F.handle(F, @C)
+end AddStandardThings
+
+(** Used in the form: Desktops.Open <filename>
+Tries to open <filename> as a desktop; on failure a new desktop is created. *)
+procedure Open*()
+  var
+    S: Attributes.Scanner
+    F: Gadgets.Frame
+    B: Objects.BindMsg
+    X, Y: int16
+    obj: Objects.Object
+    f: Files.File
+    doc: Documents.Document
+    filename: array 64 of char
+    v: Views.View
+    V: DocViewer
+    main: Gadgets.Frame
+    A: Objects.AttrMsg
+    L: Objects.LinkMsg
+    P: Pictures.Picture
+
+  procedure IsDesktop(f: pointer to Files.File): boolean
+    var
+      R: Files.Rider
+      i, x, y, w, h: int16
+      s: array 64 of char
+  begin
+    copy(@s, "", 64)
+    h := 0
+    w := 0
+    Files.Set(@R, f^, 0)
+    Files.ReadInt(@R, @i)
+    if (i = Documents.Id) or (i = 1831) then
+      Files.ReadString(@R, @s, 64)
+      Files.ReadInt(@R, @x)
+      Files.ReadInt(@R, @y)
+      Files.ReadInt(@R, @w)
+      Files.ReadInt(@R, @h)
+    end
+
+    return (s = "PanelDocs.NewDoc") & (w > Display.Width) & (h > Display.Height)
+  end IsDesktop
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if (S.class = Attributes.Name) or (S.class = Attributes.String) then
+    copy(@filename, @S.s, 64)
+    f := Files.Old(@filename)
+    v := nil
+    if f = nil then
+      obj := Gadgets.CreateObject("PanelDocs.NewDoc")
+      doc := obj(Documents.Document)
+      doc.W := 2 * Display.Width
+      doc.H := 2 * Display.Height
+
+      obj := Gadgets.CreateObject("Panels.NewPanel")
+      F := obj(Gadgets.Frame)
+      F.W := doc.W
+      F.H := doc.H
+      Attributes.SetInt(F, "Border", 0)
+
+      (*
+      f := Files.Old("Backdrop.Pict");
+      IF f # NIL THEN
+      NEW(P); Pictures.Open(P, "Backdrop.Pict", TRUE);
+      L.id := Objects.set; L.name := "Picture"; L.obj := P; L.res := -1;
+      F.handle(F, L);
+      END;
+      *)
+      A.id := Objects.set_
+      copy(@A.name, "Texture", 32)
+      A.b := true
+      A.class := Objects.Bool
+      A.res := -1
+      F.handle(F, @A)
+      A.id := Objects.set_ // Display3.textbackC
+      copy(@A.name, "Color", 32)
+      A.i := 10
+      A.class := Objects.Int
+      A.res := -1
+      F.handle(F, @A)
+
+      newgc(B.lib)
+      Objects.OpenLibrary(B.lib)
+      F.handle(F, @B)
+
+      AddStandardThings(F)
+      doc.state := doc.state + {30} // allow document consumption
+      main := F
+      copy(@doc.name, @S.s, 128)
+      Documents.Init(doc, main)
+
+      v := Views.ViewOf(doc)
+      v.state := v.state + {Gadgets.lockedcontents}
+    elsif IsDesktop(@f) then
+      obj := Gadgets.CreateObject("PanelDocs.NewDoc")
+      doc := obj(Documents.Document)
+      copy(@doc.name, @S.s, 128)
+      doc.Load(doc)
+      Documents.Init(doc, doc.dsc(Gadgets.Frame))
+      doc.state := doc.state + {30} // allow document consumption
+      v := Views.ViewOf(doc)
+      v.W := 0
+      v.H := 0
+      v.state := v.state + {Gadgets.lockedcontents}
+    else
+      Texts.WriteString(@W, @S.s)
+      Texts.WriteString(@W, "  not a desktop")
+      Texts.WriteLn(@W)
+      Texts.Append(Oberon.Log, W.buf)
+    end
+
+    if v # nil then
+      Oberon.OpenTrack(Oberon.UserTrack(Oberon.Par.vwr.X), Display.Width)
+      Oberon.AllocateUserViewer(Oberon.Par.vwr.X, @X, @Y)
+      V := NewDocViewer(nil, v, 0, X, Y)
+    end
+  end
+end Open
+
+procedure SyncPlate(doc: Documents.Document)
+  var
+    M: Oberon.CaretMsg
+begin
+  M.id := Oberon.get
+  M.F := nil
+  M.car := nil
+  M.res := -1
+  Objects.Stamp(@M)
+  Display.Broadcast(@M)
+  if (M.car # nil) & (M.car is Gadgets.Frame) & (M.car(Gadgets.Frame).obj = doc) then
+    Oberon.Defocus()
+  end
+end SyncPlate
+
+// Stores the desktop from which this command is activated.
+procedure Store*()
+  var
+    V: Viewers.Viewer
+    doc: Documents.Document
+begin
+  V := Oberon.Par.vwr
+  if (V # nil) & (V is DocViewer) then
+    case V of
+    | DocViewer:
+      doc := ViewerDoc(V)
+      if doc # nil then
+        SyncPlate(doc)
+        doc.Store(doc)
+      else
+        Texts.WriteString(@W, "[Desktop not found]")
+        Texts.WriteLn(@W)
+        Texts.Append(Oberon.Log, W.buf)
+      end
+    end
+  end
+end Store
+
+(** Used in the form: Desktops.ChangeBackdrop <picturename>
+Changes the backdrop of the marked desktop. *)
+procedure ChangeBackdrop*()
+  var
+    S: Attributes.Scanner
+    V: Viewers.Viewer
+    doc: Documents.Document
+    A: Objects.AttrMsg
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if (S.class = Attributes.Name) or (S.class = Attributes.String) then
+    V := Oberon.MarkedViewer()
+    if (V # nil) & (V is DocViewer) then
+      doc := ViewerDoc(V(DocViewer))
+      if doc # nil then
+        A.id := Objects.set_
+        copy(@A.name, "Picture", 32)
+        A.class := Objects.String
+        A.res := -1
+        copy(@A.s, @S.s, 64)
+        doc.dsc.handle(doc.dsc, @A)
+        Gadgets.Update(doc)
+      end
+    end
+  end
+end ChangeBackdrop
+
+// Grow the current DocViewer or size DocGadgets to its default size.
+procedure Grow*()
+  var
+    V1: Viewers.Viewer
+    D, D1: Documents.Document
+    obj: Objects.Object
+    cnt, DW, DH: int16
+    MM: Display.ModifyMsg
+    M: Objects.CopyMsg
+    N: Display.ControlMsg
+begin
+  obj := Gadgets.executorObj
+  while (obj # nil) & ~((obj is DocViewer) or (obj is DocGadget)) do
+    obj := obj.dlink
+  end
+
+  if obj # nil then
+    case obj of
+    | DocViewer:
+      DH := Oberon.DisplayHeight(obj.X)
+      if obj.H < DH then
+        V1 := Viewers.This(obj.X, 0)
+        cnt := 0
+        while V1.state # 1 do
+          inc(cnt)
+          V1 := Viewers.Next(V1)
+        end
+      else
+        cnt := 2
+      end
+
+      if cnt > 1 then
+        DW := Oberon.DisplayWidth(obj.X)
+        if obj.H < DH - Viewers.minH then
+          Oberon.OpenTrack(obj.X, obj.W)
+        elsif obj.W < DW then
+          Oberon.OpenTrack(Oberon.UserTrack(obj.X), DW)
+        end
+
+        if (obj.H < DH - Viewers.minH) or (obj.W < DW) then
+          M.id := Objects.shallow
+          obj.handle(obj, @M)
+          V1 := M.obj(Viewers.Viewer)
+          Viewers.Open(V1, obj.X, DH)
+          N.F := nil
+          N.id := Display.restore
+          V1.handle(V1, @N)
+        end
+
+      else
+        Viewers.Change(obj, DH)
+        N.F := nil
+        N.id := Display.restore
+        obj.handle(obj, @N)
+      end
+
+    else
+      case obj of
+      | DocGadget:
+        if (obj.dsc # nil) & (obj.dsc.next # nil) then
+          D := obj.dsc.next(Documents.Document)
+          newgc(D1)
+          D1^ := D^
+          copy(@D1.name, "", 128)
+          D1.Load(D1)
+          if D.W < D1.W then
+            DW := D1.W - D.W
+          else
+            DW := 0
+          end
+          if D.H < D1.H then
+            DH := D1.H - D.H
+          else
+            DH := 0
+          end
+          MM.X := obj.X
+          MM.Y := obj.Y - DH
+          MM.W := obj.W + DW
+          MM.H := obj.H + DH
+          MM.dX := 0
+          MM.dY := MM.Y - obj.Y
+          MM.dW := MM.W - obj.W
+          MM.dH := MM.H - obj.H
+          MM.F := obj
+          Display.Broadcast(@MM)
+        end
+      end
+    end
+  end
+end Grow
+
+// Copy the current DocViewer.
+procedure Copy*()
+  var
+    V1: DocViewer
+    D1: DocGadget
+    obj: Objects.Object
+    M: Objects.CopyMsg
+    N: Display.ControlMsg
+    C: Display.ConsumeMsg
+begin
+  obj := Gadgets.executorObj
+  while (obj # nil) & ~((obj is DocViewer) or (obj is DocGadget)) do
+    obj := obj.dlink
+  end
+  if obj # nil then
+    case obj of
+    | DocViewer:
+      M.id := Objects.shallow
+      Objects.Stamp(@M)
+      obj.handle(obj, @M)
+      V1 := M.obj(DocViewer)
+      Viewers.Open(V1, obj.X, obj.Y + asr(obj.H, 1))
+      N.F := nil
+      N.id := Display.restore
+      V1.handle(V1, @N)
+
+    else
+      M.id := Objects.shallow
+      Objects.Stamp(@M)
+      obj.handle(obj, @M)
+      D1 := M.obj(DocGadget)
+      if (Oberon.Par.vwr # nil) & (Oberon.Par.vwr is DocViewer) then
+        C.id := Display.drop
+        C.obj := D1
+        AllocateDocGadget(Oberon.Par.vwr(DocViewer), D1.W, D1.H, @C.F, @C.u, @C.v)
+        if C.F # nil then
+          Display.Broadcast(@C)
+          N.F := nil
+          N.id := Display.restore
+          D1.handle(D1, @N)
+        end
+      end
+    end
+  end
+end Copy
+
+// Close the current DocViewer.
+procedure Close*()
+begin
+  Viewers.Close(Oberon.Par.vwr)
+end Close
+
+// ======== Doc Viewer commands ==========
+
+// work out where to put a document in the desktop
+procedure AllocateDocGadget(V: DocViewer; w, h: int16; F: pointer to Display.Frame; u, v: pointer to int16)
+  var
+    obj: Objects.Object
+    P: Gadgets.Frame
+    view: Views.View
+    f: Display.Frame
+begin
+  view := V.dsc.next(Views.View)
+  obj := view.obj
+  case obj of
+  | Documents.Document:
+    P := obj.dsc(Gadgets.Frame)
+  end
+  F^ := P
+  if Oberon.Pointer.on then
+    // use hint
+    u^ := Oberon.Pointer.X - V.X - view.vx
+    v^ := Oberon.Pointer.Y - (V.Y + V.H) - view.vy - h
+  else
+    u^ := 75
+    v^ := -50
+    // improve placement by making the left top corner visible
+    if u^ <= -view.vx + 50 then
+      u^ := -view.vx + 50
+    end
+    if v^ + h >= -view.vy - 50 then
+      v^ := -view.vy - 50 - h
+    end
+
+    f := P.dsc // check overlapping
+    while f # nil do
+      if (u^ = f.X) & (v^ + h = f.Y + f.H) then
+        // overlap left corner
+        inc(u^, 20)
+        dec(v^, 30)
+      end
+
+      f := f.next
+    end
+  end
+end AllocateDocGadget
+
+procedure CreateMenu(D: Documents.Document; desktop, system: boolean): Display.Frame
+  var
+    L: Objects.LinkMsg
+begin
+  // special menus
+  L.id := Objects.get
+  L.obj := nil
+  L.res := -1
+  if desktop then
+    if D.W > asr(Display.Width, 3) * 3 then
+      copy(@L.name, "DeskMenu", 32)
+    else
+      copy(@L.name, "SystemMenu", 32)
+    end
+  elsif system then
+    copy(@L.name, "SystemMenu", 32)
+  else
+    copy(@L.name, "UserMenu", 32)
+  end
+
+  D.handle(D, @L)
+  if (L.obj = nil) or ~(L.obj is Display.Frame) or (L.res < 0) then
+    L.obj := NewMenu("")
+  end
+  return L.obj(Display.Frame)
+end CreateMenu
+
+// Open a document in the viewer system or in the desktop, depending on the context and the marker.
+procedure ShowDoc*(D: Documents.Document)
+  var
+    C: Display.ConsumeMsg
+    open, menu: Display.Frame
+    X, Y: int16
+    v: Viewers.Viewer
+    V: DocViewer
+    A: Objects.AttrMsg
+    DF: DocGadget
+    CM: Display.ControlMsg
+    viewerSystem, adaptive: boolean
+begin
+  if (D.lib # nil) & (D.lib.name # "") then
+    halt(99) // uh-uh, public object
+  end
+  if Oberon.Pointer.on then
+    // placement hint
+    v := Oberon.MarkedViewer()
+    if (v is DocViewer) & ~HasMenu(v(DocViewer)) then
+      // in the desktop
+      V := v(DocViewer)
+      viewerSystem := false
+    else
+      // in viewer system
+      viewerSystem := true
+    end
+
+  else
+    // no placement hint
+    if Oberon.Par.vwr = nil then
+      Oberon.Par.vwr := Viewers.This(0, 0)
+    end
+    if (Oberon.Par.vwr is DocViewer) & ~HasMenu(Oberon.Par.vwr(DocViewer)) then
+      // in the desktop
+      V := Oberon.Par.vwr(DocViewer)
+      viewerSystem := false
+    else
+      viewerSystem := true
+    end
+  end
+
+  // post: ~viewerSystem & (V # NIL)
+
+  if ~viewerSystem then
+    // in the desktop
+    NewDocGadget()
+    DF := Objects.NewObj(DocGadget)
+    menu := CreateMenu(D, true, false)
+
+    // private
+    Init(DF, menu(Gadgets.Frame), D, true)
+    open := DF
+
+    CM.id := Display.restore
+    CM.F := nil
+    CM.x := 0
+    CM.y := 0
+    CM.dlink := nil
+    CM.res := -1
+    open.handle(open, @CM)
+
+    C.id := Display.drop
+    C.obj := open
+    AllocateDocGadget(V, open.W, open.H, @C.F, @C.u, @C.v)
+    C.x := 0
+    C.y := 0
+    if C.F # nil then
+      Display.Broadcast(@C)
+      viewerSystem := C.res < 0
+    else
+      viewerSystem := true
+    end
+  end
+
+  if viewerSystem then
+    // in the viewer system, or desktop integration failed
+    if D.W <= asr(Display.Width, 3) * 3 then
+      Oberon.AllocateSystemViewer(Oberon.Par.vwr.X, @X, @Y)
+    else
+      Oberon.AllocateUserViewer(Oberon.Par.vwr.X, @X, @Y)
+    end
+
+    A.id := Objects.get
+    copy(@A.name, "Adaptive", 32)
+    A.class := Objects.Inval
+    A.b := false
+    A.res := -1
+    D.handle(D, @A)
+    adaptive := (A.res >= 0) & (A.class = Objects.Bool) & A.b
+
+    if ~adaptive then
+      open := Views.ViewOf(D)
+      open.W := D.W
+      open.H := D.H
+    // Attributes.SetBool(open, "Locked", TRUE)
+    else
+      open := D
+    end
+
+    menu := CreateMenu(D, false, X >= asr(Display.Width, 3) * 5)
+    V := NewDocViewer(menu, open, menu.H, X, Y)
+  end
+end ShowDoc
+
+// Replace the document enclosing the current context with the document D.
+procedure ReplaceCurrentDoc*(D: Documents.Document)
+  var
+    V: DocViewer
+    obj: Objects.Object
+    A: Display.ModifyMsg
+    menu, open: Display.Frame
+    x, y, w, h: int16
+    AM: Objects.AttrMsg
+    addview: boolean
+begin
+  obj := Gadgets.context
+  while (obj # nil) & ~(obj is DocGadget) & ~(obj is DocViewer) do
+    obj := obj.dlink
+  end
+  if obj # nil then
+    case obj of
+    | DocGadget:
+      x := obj.X
+      y := obj.Y
+      w := obj.W
+      h := obj.H
+      menu := CreateMenu(D, true, false)
+      Init(obj, menu(Gadgets.Frame), D, true)
+      A.id := Display.extend
+      A.mode := Display.display
+      A.F := obj
+      A.X := x
+      A.Y := y + h - obj.H
+      A.W := obj.W
+      A.H := obj.H
+      A.dX := A.X - x
+      A.dY := A.Y - y
+      A.dW := A.W - w
+      A.dH := A.H - h
+      Display.Broadcast(@A)
+
+    else
+      V := obj(DocViewer)
+      if HasMenu(V) then
+        menu := CreateMenu(D, false, V.X >= asr(Display.Width, 3) * 5)
+      else
+        menu := NewDummy()
+      end
+
+      AM.id := Objects.get
+      copy(@AM.name, "Adaptive", 32)
+      AM.class := Objects.Inval
+      AM.b := false
+      AM.res := -1
+      D.handle(D, @AM)
+      addview := (AM.res >= 0) & (AM.class = Objects.Bool) & ~AM.b
+      if addview then
+        open := Views.ViewOf(D)
+        open.W := D.W
+        open.H := D.H
+      else
+        open := D
+      end
+
+      V.dsc := menu
+      V.dsc.next := open
+      V.menuH := menu.H
+      Restore(V)
+    end
+  end
+end ReplaceCurrentDoc
+
+procedure ParentHandler(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    obj: Objects.Object
+begin
+  if (M is PParentMsg) & (M(Display.PFrameMsg).F = F) then
+    case M of
+    | PParentMsg:
+      obj := M.dlink
+      while (obj # nil) & ~(obj is DocViewer) & ~(obj is DocGadget) do
+        obj := obj.dlink
+      end
+      M.parent := obj
+      M.res := 0
+    end
+  end
+end ParentHandler
+
+// Close the document D.
+procedure CloseThisDoc*(D: Documents.Document)
+  var
+    handle: Objects.Handler
+    V: DocViewer
+    P: ParentMsg
+    R: Display.ControlMsg
+begin
+  handle := D.handle
+  D.handle := ParentHandler
+  P.F := D
+  P.parent := nil
+  Display.Broadcast(@P)
+  D.handle := handle
+  if P.parent # nil then
+    if P.parent is DocViewer then
+      V := P.parent(DocViewer)
+      if ~(V.dsc is Dummy) then
+        Viewers.Close(V) // do not close dekstops
+      end
+    else
+      R.id := Display.remove
+      R.F := P.parent(Display.Frame)
+      Display.Broadcast(@R)
+    end
+  end
+end CloseThisDoc
+
+procedure Option(S: pointer to Attributes.Scanner; s: pointer to array of char; s_len: int32; scan: boolean)
+  var
+    name: array 64 of char
+begin
+  s[0] := 0X
+  if scan then
+    Attributes.Scan(S)
+  end
+  if (S.class = Attributes.Char) & (S.c = "(") then
+    Attributes.Scan(S)
+    if S.class = Attributes.Name then
+      copy(@name, @S.s, 64)
+      Attributes.Scan(S)
+      if (S.class = Attributes.Char) & (S.c = ")") then
+        copy(s, @name, s_len)
+      end
+    end
+  end
+end Option
+
+procedure LoadDoc(name: pointer to array of char; name_len: int32): Documents.Document
+  var
+    S: Attributes.Scanner
+    type_, alias: array 64 of char
+    d: Documents.Document
+begin
+  name[0] := 0X
+  d := nil
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if (S.class = Attributes.Char) & (S.c = "(") then
+    Option(@S, @type_, 64, false)
+    Gadgets.GetAlias(@type_, @alias, 64)
+    if alias # "" then
+      copy(@type_, @alias, 64)
+    end
+    if type_ # "" then
+      Gadgets.Execute(@type_, Gadgets.executorObj, Gadgets.context, nil, nil)
+      if (Objects.NewObj # nil) & (Objects.NewObj is Documents.Document) then
+        d := Objects.NewObj(Documents.Document)
+        d.name[0] := 0X
+        d.Load(d)
+        copy(name, @d.name, name_len)
+      end
+    end
+
+  elsif (S.class = Attributes.Name) or (S.class = Attributes.String) then
+    copy(name, @S.s, name_len)
+    Option(@S, @type_, 64, true)
+    Gadgets.GetAlias(@type_, @alias, 64)
+    if alias # "" then
+      copy(@type_, @alias, 64)
+    end
+    if type_ # "" then
+      Gadgets.Execute(@type_, Gadgets.executorObj, Gadgets.context, nil, nil)
+      if (Objects.NewObj # nil) & (Objects.NewObj is Documents.Document) then
+        d := Objects.NewObj(Documents.Document)
+        copy(@d.name, name, 128)
+        d.Load(d)
+      end
+
+    else
+      d := Documents.Open(name)
+      if (d = nil) or (d.dsc = nil) then
+        Texts.WriteString(@W, @Documents.errMsg)
+        Texts.WriteLn(@W)
+        Texts.Append(Oberon.Log, W.buf)
+      end
+    end
+  end
+
+  if (d # nil) & (d.dsc # nil) then
+    return d
+  else
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end LoadDoc
+
+(** Used in the forms:
+Desktops.OpenDoc <documentname>  (* open an existing document *)
+Desktops.OpenDoc (<document-generator>)  (* create a new document *)
+Desktops.OpenDoc <document-name>(<document-generator>)  (* cast existing document to new type *)
+
+The document is loaded, and opened in the desktop or viewer system depending on the context and the marker.
+*)
+procedure OpenDoc*()
+  var
+    name: array 128 of char
+    d: Documents.Document
+begin
+  d := LoadDoc(@name, 128)
+  if d # nil then
+    ShowDoc(d)
+  end
+
+  Objects.NewObj := nil
+end OpenDoc
+
+// Same usage as Desktops.OpenDoc. Document is inserted without menubar at the caret.
+procedure InsertDoc*()
+  var
+    name: array 128 of char
+    d: Documents.Document
+begin
+  d := LoadDoc(@name, 128)
+  if d # nil then
+    Gadgets.Integrate(d)
+  end
+
+  Objects.NewObj := nil
+end InsertDoc
+
+// Same usage as Desktops.OpenDoc. Current document is exchanged with the new document.
+procedure ReplaceDoc*()
+  var
+    name: array 128 of char
+    d: Documents.Document
+begin
+  d := LoadDoc(@name, 128)
+  if d # nil then
+    ReplaceCurrentDoc(d)
+  end
+
+  Objects.NewObj := nil
+end ReplaceDoc
+
+procedure StoreThisDoc*(doc: Documents.Document)
+begin
+  if doc # nil then
+    SyncPlate(doc)
+    doc.Store(doc)
+  else
+    Texts.WriteString(@W, "[Document not found]")
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end
+end StoreThisDoc
+
+(** Used in the forms:
+Desktops.StoreDoc  (* in menubar, or inside of a document *)
+Desktops.StoreDoc * (* for a marked document *)
+Stores a document under its given name.
+*)
+procedure StoreDoc*()
+  var
+    V: DocViewer
+    doc: Documents.Document
+    S: Attributes.Scanner
+    M: Display.SelectMsg
+    obj: Objects.Object
+begin
+  doc := nil
+  if (Oberon.Par.frame = Oberon.Par.vwr.dsc) & (Oberon.Par.vwr is DocViewer) then
+    // in menu of DocViewer
+    V := Oberon.Par.vwr(DocViewer)
+    doc := ViewerDoc(V)
+    StoreThisDoc(doc)
+  else
+    Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+    Attributes.Scan(@S)
+    if (S.class = Attributes.Char) & (S.c = "*") then
+      // marked document
+      doc := Documents.MarkedDoc()
+      StoreThisDoc(doc)
+    elsif (S.class = Attributes.Char) & (S.c = "@") then
+      // Objects selection
+      M.id := Display.get
+      M.F := nil
+      M.sel := nil
+      M.obj := nil
+      M.time := -1
+      Display.Broadcast(@M)
+      if M.time # -1 then
+        obj := M.obj
+        while obj # nil do
+          case obj of
+          | Documents.Document:
+            StoreThisDoc(obj(Documents.Document))
+          end
+          obj := obj.slink
+        end
+
+      else
+        Texts.WriteString(@W, "[No selection]")
+        Texts.WriteLn(@W)
+        Texts.Append(Oberon.Log, W.buf)
+      end
+
+    else
+      // current doc
+      obj := Gadgets.context
+      while (obj # nil) & ~(obj is Documents.Document) & ~(obj is DocGadget) do
+        obj := obj.dlink
+      end
+      if obj # nil then
+        case obj of
+        | Documents.Document:
+          StoreThisDoc(obj(Documents.Document))
+        else
+          doc := DocGadgetDoc(obj(DocGadget))
+          StoreThisDoc(doc)
+        end
+
+      else
+        Texts.WriteString(@W, "[Document not found]")
+        Texts.WriteLn(@W)
+        Texts.Append(Oberon.Log, W.buf)
+      end
+    end
+  end
+end StoreDoc
+
+// Closes the current document. Works both in the viewer and desktop systems.
+procedure CloseDoc*()
+  var
+    obj, obj0: Objects.Object
+    R: Display.ControlMsg
+begin
+  if (Oberon.Par.frame = Oberon.Par.vwr.dsc) & (Oberon.Par.vwr is DocViewer) then
+    // in menu of DocViewer
+    recall := Oberon.Par.vwr
+    Viewers.Close(Oberon.Par.vwr(DocViewer))
+  else
+    obj := Gadgets.context
+    while (obj # nil) & ~(obj is Documents.Document) & ~(obj is DocGadget) do
+      obj := obj.dlink
+    end
+    if obj # nil then
+      obj0 := obj
+      while (obj0 # nil) & ~((obj0 is DocViewer) & HasMenu(obj0(DocViewer))) & ~(obj0 is DocGadget) do
+        obj0 := obj0.dlink
+      end
+
+      if obj0 # nil then
+        obj := obj0
+      end
+    end
+
+    if obj # nil then
+      case obj of
+      | DocViewer:
+        recall := obj(Display.Frame)
+        Viewers.Close(obj(DocViewer))
+      else
+        R.id := Display.remove
+        R.F := obj(Display.Frame)
+        recall := R.F
+        Display.Broadcast(@R)
+      end
+
+    else
+      Texts.WriteString(@W, "[Document not found]")
+      Texts.WriteLn(@W)
+      Texts.Append(Oberon.Log, W.buf)
+    end
+  end
+
+  Objects.Stamp(@R)
+  recall.stamp := R.stamp
+end CloseDoc
+
+// Recalls last closed document.
+procedure Recall*()
+  var
+    V: Viewers.Viewer
+    M: Display.ControlMsg
+    doc: Documents.Document
+begin
+  if recall # nil then
+    case recall of
+    | DocViewer:
+      doc := ViewerDoc(recall(DocViewer))
+      if doc # nil then
+        ShowDoc(doc)
+      end
+    | DocGadget:
+      doc := DocGadgetDoc(recall(DocGadget))
+      if doc # nil then
+        ShowDoc(doc)
+      end
+    end
+
+  else
+    Viewers.Recall(@V)
+    if (V # nil) & (V.state = 0) then
+      Viewers.Open(V, V.X, V.Y + V.H)
+      M.F := nil
+      M.id := Display.restore
+      V.handle(V, @M)
+    end
+  end
+end Recall
+
+(** Used in the form:
+Desktops.PrintDoc <printer-name> [ "\" options ] <list-of files> ~
+Desktops.PrintDoc <printer-name> [ "\" options ] * (* Marked document *)
+Prints a document.
+*)
+procedure PrintDoc*()
+  var
+    S: Attributes.Scanner
+    M: Display.SelectMsg
+    obj: Objects.Object
+    D: Documents.Document
+    printer, options: array usig(64 + val(int16, 128)) of char
+
+  procedure PrinterErr()
+    var
+      err: array 32 of char
+  begin
+    if Printer.res # 0 then
+      if Printer.res = 1 then
+        copy(@err, " no such printer", 32)
+      elsif Printer.res = 2 then
+        copy(@err, " no link", 32)
+      elsif Printer.res = 3 then
+        copy(@err, " printer not ready", 32)
+      elsif Printer.res = 4 then
+        copy(@err, " no permission", 32)
+      else
+        copy(@err, " unknown error", 32)
+      end
+
+      Texts.WriteString(@W, @err)
+      Texts.WriteLn(@W)
+      Texts.Append(Oberon.Log, W.buf)
+    end
+  end PrinterErr
+
+  procedure printDoc(doc: Documents.Document)
+    var
+      P: Display.DisplayMsg
+  begin
+    if doc # nil then
+      Texts.WriteString(@W, @doc.name)
+      P.device := Display.printer
+      P.id := Display.contents
+      P.F := nil
+      P.x := 0
+      P.y := 0
+      P.dlink := nil
+      doc.handle(doc, @P)
+      if Printer.res # 0 then
+        PrinterErr()
+      else
+        Texts.WriteString(@W, " Ok")
+      end
+
+    else
+      Texts.WriteString(@W, "[Document not found]")
+    end
+
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end printDoc
+
+  procedure PrintSelectedDocViewers(M: pointer to Display.SelectMsg; obj: pointer to Objects.Object)
+    var o: Objects.Object
+  begin
+    M.id := Display.get
+    M.F := nil
+    M.sel := nil
+    M.obj := nil
+    M.time := -1
+    Display.Broadcast(M)
+    if M.time # -1 then
+      obj^ := M.obj
+      while obj^ # nil do
+        o := obj^
+        case o of
+        | Documents.Document:
+          printDoc(o(Documents.Document))
+        end
+
+        obj^ := obj^.slink
+      end
+
+    else
+      Texts.WriteString(@W, " [no selection]")
+      Texts.Append(Oberon.Log, W.buf)
+    end
+  end PrintSelectedDocViewers
+
+  procedure OpenPrinter(const name: pointer to array of char; const options: pointer to array of char; options_len: int32; D: pointer to Documents.Document)
+    var
+      S: Texts.Scanner
+  begin
+    if name^ = "Default" then
+      Oberon.OpenScanner(@S, "Printer.DefaultName")
+      if ~(S.class in {Texts.Name,Texts.String}) then
+        copy(@S.s, name, 64)
+      end
+    else
+      copy(@S.s, name, 64)
+    end
+
+    Strings.AppendCh(options, options_len, Oberon.OptionChar)
+    Strings.Append(options, options_len, @D^.name)
+    Texts.WriteString(@W, @S.s)
+    Texts.Write(@W, " ")
+    Texts.Append(Oberon.Log, W.buf)
+    Printer.Open(@S.s, options)
+  end OpenPrinter
+begin
+  Texts.WriteString(@W, "Desktops.PrintDoc ")
+  Texts.Append(Oberon.Log, W.buf)
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if S.class in {Attributes.Name,Attributes.String} then
+    // printer name
+    copy(@printer, @S.s, 64 + val(int16, 128))
+    Attributes.Scan(@S)
+    if (S.class = Attributes.Char) & (S.c = Oberon.OptionChar) then
+      Attributes.Scan(@S)
+      if (S.class # Texts.Name) & (S.class # Texts.String) then
+        copy(@options, "", 64 + val(int16, 128))
+      else
+        copy(@options, @S.s, 64 + val(int16, 128))
+      end
+
+      Attributes.Scan(@S)
+    else
+      copy(@options, "", 64 + val(int16, 128))
+    end
+
+    if (S.class = Attributes.Char) & (S.c = "*") then
+      D := Documents.MarkedDoc()
+      if D # nil then
+        OpenPrinter(@printer, @options, 64 + val(int16, 128), @D)
+        if Printer.res = 0 then
+          printDoc(D)
+          Printer.Close()
+        end
+
+        if Printer.res # 0 then
+          PrinterErr()
+        end
+      end
+
+    elsif (S.class = Attributes.Char) & (S.c = "@") then
+      // Selection
+      OpenPrinter(@printer, @options, 64 + val(int16, 128), @D)
+      if Printer.res = 0 then
+        PrintSelectedDocViewers(@M, @obj)
+        Printer.Close()
+      end
+
+      if Printer.res # 0 then
+        PrinterErr()
+      end
+    elsif S.class = Attributes.Name then
+      Printer.res := 0
+      while (S.class = Attributes.Name) & (Printer.res = 0) do
+        D := Documents.Open(@S.s)
+        if (D # nil) & (D.dsc # nil) then
+          OpenPrinter(@printer, @options, 64 + val(int16, 128), @D)
+          if Printer.res = 0 then
+            printDoc(D)
+            Printer.Close()
+          end
+
+          if Printer.res # 0 then
+            PrinterErr()
+          end
+        else
+          Texts.WriteString(@W, @Documents.errMsg)
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+        end
+
+        Attributes.Scan(@S)
+      end
+
+    else
+      D := CurDoc(Gadgets.context)
+      if D # nil then
+        OpenPrinter(@printer, @options, 64 + val(int16, 128), @D)
+        if Printer.res = 0 then
+          printDoc(D)
+          Printer.Close()
+        end
+
+        if Printer.res # 0 then
+          PrinterErr()
+        end
+      end
+    end
+
+  else
+    Texts.WriteString(@W, " unknown printer")
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end
+end PrintDoc
+
+// Desktops.MenuCmd docgadget cmd
+procedure MenuCmd*()
+
+  var
+    S: Attributes.Scanner
+    obj: Objects.Object
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if S.class in {Attributes.Name,Attributes.String} then
+    obj := Gadgets.FindObj(Gadgets.context, @S.s)
+    if (obj # nil) & (obj is Documents.Document) then
+      Attributes.Scan(@S)
+      if S.class in {Attributes.Name,Attributes.String} then
+        Gadgets.Execute(@S.s, Gadgets.executorObj, obj, nil, nil)
+      end
+    end
+  end
+end MenuCmd
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewDocGadget" end return NewDocGadget end
+  if i = 1 then if name # nil then name^ := "Open" end return Open end
+  if i = 2 then if name # nil then name^ := "Store" end return Store end
+  if i = 3 then if name # nil then name^ := "ChangeBackdrop" end return ChangeBackdrop end
+  if i = 4 then if name # nil then name^ := "Grow" end return Grow end
+  if i = 5 then if name # nil then name^ := "Copy" end return Copy end
+  if i = 6 then if name # nil then name^ := "Close" end return Close end
+  if i = 7 then if name # nil then name^ := "OpenDoc" end return OpenDoc end
+  if i = 8 then if name # nil then name^ := "InsertDoc" end return InsertDoc end
+  if i = 9 then if name # nil then name^ := "ReplaceDoc" end return ReplaceDoc end
+  if i = 10 then if name # nil then name^ := "StoreDoc" end return StoreDoc end
+  if i = 11 then if name # nil then name^ := "CloseDoc" end return CloseDoc end
+  if i = 12 then if name # nil then name^ := "Recall" end return Recall end
+  if i = 13 then if name # nil then name^ := "PrintDoc" end return PrintDoc end
+  if i = 14 then if name # nil then name^ := "MenuCmd" end return MenuCmd end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Desktops", cmd_)
+  Texts.OpenWriter(@W)
+  menuH := 20
+  menuC := 13
+  if PopupButton then
+    menuButtonW := 39
+    namePlateW := 143
+  else
+    if Display.Width < CutoffWidth then
+      menuButtonW := 36 // 84
+      namePlateW := 140
+    else
+      menuButtonW := 39
+      namePlateW := 140
+    end
+  end
+
+  recDocWidth := namePlateW + 3 * menuButtonW
+end Desktops.

@@ -1,0 +1,1170 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module NamePlates [level=5]
+
+import Objects, Input, Display, Fonts, Texts, Display3, Oberon, Gadgets, Effects, Printer, Printer3, Files, Documents, Viewers, Desktops, TextGadgets0, FileDir, Modules
+// portable
+// jm 19.4.95
+
+(*
+5.4.93 - object is not named anymore
+- selection is returned in full
+8.11.94 - improved findmodel
+19.4.95 - added delete right, arrow support
+26.10.95 - Added scrolling support
+20.6.96 - added iconize of documents when middle clicked (ps - 20.6.96)
+8.1.97 - removed iconize of documents when middle clicked (ps)
+*)
+
+// name plates
+
+const
+  VersionNo = 1
+  MaxLen = 128
+  CarHeight = 14
+  CarWidth = 2
+  Xoffset = 10
+  TranslatePlate = false
+  PrefixBehind = false
+
+type
+  NamePlate* = pointer to NamePlateDesc
+  NamePlateDesc* = object (Gadgets.FrameDesc)
+    selbeg, selend: int16
+    time: int32
+    carpos, carx, cary: int16
+    val_: array 128 (* MaxLen *) of char
+    start: int16
+  end
+
+var
+  W: Texts.Writer
+  invTF: int16 // focus & selection color for text fields
+  XtraOffset: int16
+
+procedure ^ LocatePos(F: NamePlate; pos: int16; x, y: pointer to int16)
+
+procedure Update(obj: Objects.Object)
+  var
+    M: Desktops.UpdateNameMsg
+begin
+  M.obj := obj
+  M.F := nil
+  Display.Broadcast(@M)
+end Update
+
+procedure Min(x, y: int16): int16
+begin
+  if x < y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+procedure Yoffset(F: NamePlate): int16
+begin
+  return asr(F.H, 1) - asr(Fonts.Default.height, 1) + abs(Fonts.Default.minY)
+end Yoffset
+
+procedure Length(S: pointer to array of char): int16
+  var
+    p: int16
+begin
+  p := 0
+  while S[p] # 0X do
+    inc(p)
+  end
+  return p
+end Length
+
+procedure InsertChar(S: pointer to array of char; S_len: int32; pos: int16; ch: char)
+  var
+    len_, p: int16
+begin
+  len_ := Length(S)
+  if pos > len_ then
+    pos := len_
+  elsif pos < 0 then
+    pos := 0
+  end
+  if len_ < val(int16, S_len) - 1 then
+    // space left
+    p := len_
+    S[len_ + 1] := 0X
+    while p > pos do
+      S[p] := S[p - 1]
+      dec(p)
+    end
+    S[pos] := ch
+  end
+end InsertChar
+
+procedure DeleteChar(S: pointer to array of char; S_len: int32; pos: int16)
+  var
+    len_, p: int16
+begin
+  len_ := Length(S)
+  if pos > len_ then
+    pos := len_
+  elsif pos < 0 then
+    pos := 0
+  end
+  if (pos < val(int16, S_len)) & (len_ > 0) then
+    p := pos
+    while S[p] # 0X do
+      S[p] := S[p + 1]
+      inc(p)
+    end
+  end
+end DeleteChar
+
+procedure Delete(S: pointer to array of char; beg, end_: int16)
+  // [beg, end)
+  var
+    len_, p: int16
+begin
+  if beg < 0 then
+    beg := 0
+  end
+  len_ := Length(S)
+  if end_ > len_ then
+    end_ := len_
+  end
+  p := end_
+  while p <= len_ do
+    S[beg] := S[p]
+    inc(beg)
+    inc(p)
+  end
+end Delete
+
+procedure DocToPlate(F: NamePlate)
+  var
+    i, j, k: int32
+begin
+  if F.carpos >= 0 then
+    return
+  end
+  copy(@F.val_, @F.obj(Documents.Document).name, 128 (* MaxLen *))
+  if TranslatePlate then
+    i := 0
+    j := -1
+    while F.val_[i] # 0X do
+      if (F.val_[i] = "/") or PrefixBehind & (F.val_[i] = ":") then
+        j := i + 1
+      end
+
+      inc(i)
+    end
+
+    if j > 0 then
+      k := 0
+      i := j
+      while F.val_[i] # 0X do
+        F.val_[k] := F.val_[i]
+        inc(i)
+        inc(k)
+      end
+
+      F.val_[k] := " "
+      inc(k)
+      i := 0
+      while (i < j) & (k < 127) do
+        F.val_[k] := F.obj(Documents.Document).name[i]
+        inc(i)
+        inc(k)
+      end
+
+      F.val_[k] := 0X
+    end
+  end
+end DocToPlate
+
+procedure PlateToDoc(F: NamePlate)
+
+  var
+    i, j: int32
+    lastChar: char
+begin
+  if F.carpos >= 0 then
+    return
+  end
+  if TranslatePlate then
+    i := 0
+    while F.val_[i] > " " do
+      inc(i)
+    end
+
+    if F.val_[i] = " " then
+      inc(i)
+      j := 0
+      lastChar := "/"
+      while F.val_[i] # 0X do
+        lastChar := F.val_[i]
+        F.obj(Documents.Document).name[j] := lastChar
+        inc(i)
+        inc(j)
+      end
+
+      if (lastChar # "/") & (lastChar # ":") then
+        F.obj(Documents.Document).name[j] := "/"
+        inc(j)
+        if i < 127 then
+          F.val_[i] := "/"
+          F.val_[i + 1] := 0X
+        end
+      end
+
+      i := 0
+      while F.val_[i] > " " do
+        F.obj(Documents.Document).name[j] := F.val_[i]
+        inc(i)
+        inc(j)
+      end
+
+      F.obj(Documents.Document).name[j] := 0X
+    else
+      copy(@F.obj(Documents.Document).name, @F.val_, 128)
+    end
+
+    Update(F.obj)
+  else
+    copy(@F.obj(Documents.Document).name, @F.val_, 128)
+  end
+end PlateToDoc
+
+// ----- NamePlates -----
+
+procedure FindModel(F: NamePlate; dlink: Objects.Object)
+  var
+    f: Display.Frame
+    M: Objects.LinkMsg
+begin
+  while (dlink # nil) & ~(dlink is Documents.Document) & ~(dlink is Viewers.Viewer) & ~(dlink is Desktops.DocGadget) do
+    dlink := dlink.dlink
+  end
+  if dlink # nil then
+    case dlink of
+    | Documents.Document:
+      if F.obj # dlink then
+        F.obj := dlink
+        DocToPlate(F)
+      end
+
+    | Desktops.DocGadget:
+      if Desktops.Main(dlink) # nil then
+        f := Desktops.Main(dlink)
+        case f of
+        | Documents.Document:
+          F.obj := f
+          DocToPlate(F)
+        else
+          M.id := Objects.get
+          copy(@M.name, "Model", 32)
+          M.obj := nil
+          M.res := -1
+          f.handle(f, @M)
+          if (M.res >= 0) & (M.obj # nil) & (M.obj is Documents.Document) then
+            F.obj := M.obj
+            DocToPlate(F)
+          end
+        end
+      end
+
+    else
+      // Viewer
+      case dlink of
+      | Display.Frame:
+        f := dlink.dsc.next
+        if f # nil then
+          case f of
+          | Documents.Document:
+            F.obj := f
+            DocToPlate(F)
+          | Gadgets.Frame:
+            if (f.obj # nil) & (f.obj is Documents.Document) then
+              F.obj := f.obj
+              DocToPlate(F)
+            end
+
+          end
+        end
+      end
+    end
+  end
+end FindModel
+
+procedure UpdateNamePlate(F: NamePlate)
+  var
+    obj: Objects.Object
+begin
+  obj := F.obj
+  if obj # nil then
+    case obj of
+    | Documents.Document:
+      PlateToDoc(F)
+      Update(obj)
+    end
+
+  else
+    Gadgets.Update(F)
+  end
+end UpdateNamePlate
+
+procedure ConsumeChar(F: NamePlate; ch: char)
+  var
+    x, y: int16
+begin
+  if ch = 7FX then
+    if F.carpos > 0 then
+      dec(F.carpos)
+      DeleteChar(@F.val_, 128 (* MaxLen *), F.carpos)
+      if F.start > F.carpos then
+        dec(F.start)
+      end
+      F.selbeg := -1
+      UpdateNamePlate(F)
+    end
+
+  elsif ch = 0A1X then
+    // Delete right
+    if F.val_[F.carpos] # 0X then
+      DeleteChar(@F.val_, 128 (* MaxLen *), F.carpos)
+      F.selbeg := -1
+      UpdateNamePlate(F)
+    end
+
+  elsif ch = 0C4X then
+    // left arrow
+    if F.carpos > 0 then
+      dec(F.carpos)
+      if F.start > F.carpos then
+        dec(F.start)
+      end
+      F.selbeg := -1
+      UpdateNamePlate(F)
+    end
+
+  elsif ch = 0C3X then
+    // right arrow
+    if F.val_[F.carpos] # 0X then
+      inc(F.carpos)
+      LocatePos(F, F.carpos, @x, @y)
+      while (x >= F.W - 3) & (F.val_[F.start] # 0X) do
+        inc(F.start)
+        LocatePos(F, F.carpos, @x, @y)
+      end
+
+      F.selbeg := -1
+      UpdateNamePlate(F)
+    end
+
+  elsif ch = 0A8X then
+    // home
+    if F.carpos > 0 then
+      F.carpos := 0
+      F.start := 0
+      F.selbeg := -1
+      UpdateNamePlate(F)
+    end
+
+  elsif ch = 0A9X then
+    // end
+    if F.val_[F.carpos] # 0X then
+      while F.val_[F.carpos] # 0X do
+        inc(F.carpos)
+      end
+
+      LocatePos(F, F.carpos, @x, @y)
+      while (x >= F.W - 3) & (F.val_[F.start] # 0X) do
+        inc(F.start)
+        LocatePos(F, F.carpos, @x, @y)
+      end
+
+      F.selbeg := -1
+      UpdateNamePlate(F)
+    end
+
+  elsif ((ch >= " ") or (ch = 9X)) & (Length(@F.val_) < MaxLen - 1i2) then
+    InsertChar(@F.val_, 128 (* MaxLen *), F.carpos, ch)
+    inc(F.carpos)
+    LocatePos(F, F.carpos, @x, @y)
+    while (x >= F.W - 3) & (F.val_[F.start] # 0X) do
+      inc(F.start)
+      LocatePos(F, F.carpos, @x, @y)
+    end
+
+    F.selbeg := -1
+    UpdateNamePlate(F)
+  elsif ch = 0DX then
+  end
+end ConsumeChar
+
+procedure LocateChar(F: NamePlate; x, mx: int16; pos: pointer to int16)
+  var
+    p: int16
+    r: Objects.Object
+    X: int16
+begin
+  p := F.start
+  X := x + Xoffset + XtraOffset
+  while F.val_[p] # 0X do
+    Fonts.Default.GetObj(Fonts.Default, val(int16, ord(F.val_[p])), @r)
+    if mx < X + r(Fonts.Char).dx then
+      pos^ := p
+      return
+    end
+    inc(X, r(Fonts.Char).dx)
+    inc(p)
+  end
+
+  pos^ := p
+end LocateChar
+
+procedure LocatePos(F: NamePlate; pos: int16; x, y: pointer to int16)
+  var
+    r: Objects.Object
+    p: int16
+begin
+  x^ := Xoffset + XtraOffset
+  y^ := Yoffset(F)
+  p := F.start
+  while (F.val_[p] # 0X) & (p < pos) do
+    Fonts.Default.GetObj(Fonts.Default, val(int16, ord(F.val_[p])), @r)
+    inc(x^, r(Fonts.Char).dx)
+    inc(p)
+  end
+end LocatePos
+
+procedure FlipCaret(R: Display3.Mask; F: NamePlate; x, y: int16)
+begin
+  if F.carpos >= 0 then
+    Display3.ReplConst(R, invTF, x + F.carx, y + F.cary - 3, CarWidth, CarHeight, Display.invert)
+  end
+end FlipCaret
+
+procedure SetCaret(R: Display3.Mask; F: NamePlate; x, y, pos: int16)
+begin
+  LocatePos(F, pos, @F.carx, @F.cary)
+  Display3.ReplConst(R, invTF, x + F.carx, y + F.cary - 3, CarWidth, CarHeight, Display.invert)
+end SetCaret
+
+procedure RemoveCaret(R: Display3.Mask; F: NamePlate; x, y: int16)
+begin
+  if F.carpos >= 0 then
+    FlipCaret(R, F, x, y)
+    F.carpos := -1
+  end
+end RemoveCaret
+
+procedure TrackCaret(DR: pointer to Display3.Mask; F: NamePlate; x, y: int16)
+  var
+    mx, my, pos: int16
+    keys, keysum: set
+    time, beg, end_, p: int32
+    text: Texts.Text
+    R: Texts.Reader
+    ch: char
+begin
+  RemoveCaret(DR^, F, x, y)
+  keysum := {}
+  loop
+    Input.Mouse(@keys, @mx, @my)
+    keysum := keysum + keys
+    if keys = {} then
+      exit
+    end
+    LocateChar(F, x, mx, @pos)
+    if pos # F.carpos then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      FlipCaret(DR^, F, x, y)
+      F.carpos := pos
+      LocatePos(F, F.carpos, @F.carx, @F.cary)
+      FlipCaret(DR^, F, x, y)
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, mx, my)
+  end
+
+  if keysum = {2,1} then
+    Oberon.GetSelection(@text, @beg, @end_, @time)
+    if time # -1 then
+      p := beg
+      Texts.OpenReader(@R, text, p)
+      loop
+        if p = end_ then
+          exit
+        end
+        Texts.Read(@R, @ch)
+        if R.eot then
+          exit
+        end
+        if Length(@F.val_) >= MaxLen - 1i2 then
+          exit
+        end
+        if (" " <= ch) & (ch < 86X) or (ch = " ") or (ch = 9X) then
+          InsertChar(@F.val_, 128 (* MaxLen *), F.carpos, ch)
+          inc(F.carpos)
+        end
+
+        inc(p)
+      end
+      F.selbeg := -1
+      UpdateNamePlate(F)
+    end
+
+  else
+    Gadgets.Update(F)
+  end
+end TrackCaret
+
+procedure FlipSelection(R: Display3.Mask; F: NamePlate; x, y, spos, epos: int16)
+  var
+    sx, sy, ex, ey: int16
+begin
+  LocatePos(F, spos, @sx, @sy)
+  LocatePos(F, epos, @ex, @ey)
+  Display3.ReplConst(R, invTF, x + sx, y + sy - 3, ex - sx, Min(CarHeight, F.H - 4), Display.invert)
+end FlipSelection
+
+procedure RemoveSelection(R: Display3.Mask; F: NamePlate; x, y: int16)
+begin
+  if F.selbeg >= 0 then
+    FlipSelection(R, F, x, y, F.selbeg, F.selend)
+    F.selbeg := -1
+  end
+end RemoveSelection
+
+procedure TrackSelection(R: Display3.Mask; F: NamePlate; x, y: int16)
+  var
+    mx, my, pos, spos, epos, len_: int16
+    keys, keysum: set
+    time: int32
+    C: Oberon.ConsumeMsg
+begin
+  Oberon.FadeCursor(@Oberon.Mouse)
+  Input.Mouse(@keys, @mx, @my)
+  if keys = {} then
+    return
+  end
+  keysum := keys
+  len_ := Length(@F.val_)
+  LocateChar(F, x, mx, @spos)
+  if spos >= len_ then
+    dec(spos)
+  end
+  if (F.selbeg >= 0) & (F.selbeg = spos) & (F.selend = F.selbeg + 1) then
+    RemoveSelection(R, F, x, y)
+    epos := spos
+    spos := 0
+    FlipSelection(R, F, x, y, spos, epos + 1)
+  else
+    RemoveSelection(R, F, x, y)
+    epos := spos
+    FlipSelection(R, F, x, y, spos, epos + 1)
+  end
+
+  loop
+    Input.Mouse(@keys, @mx, @my)
+    keysum := keysum + keys
+    if keys = {} then
+      exit
+    end
+    LocateChar(F, x, mx, @pos)
+    if pos >= len_ then
+      dec(pos)
+    end
+    if (pos >= spos) & (pos # epos) then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      if pos < epos then
+        FlipSelection(R, F, x, y, pos + 1, epos + 1)
+      else
+        FlipSelection(R, F, x, y, epos + 1, pos + 1)
+      end
+
+      epos := pos
+    end
+
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, mx, my)
+  end
+
+  FlipSelection(R, F, x, y, spos, epos + 1)
+  F.selbeg := -1
+  if keysum = {0} then
+    F.time := Oberon.Time()
+    F.selbeg := spos
+    F.selend := epos + 1
+    Gadgets.Update(F)
+  elsif keysum = {0,1} then
+    // copy out
+    F.selbeg := spos
+    F.selend := epos + 1
+    F.time := Oberon.Time()
+    Gadgets.Update(F)
+    Oberon.GetSelection(@C.text, @C.beg, @C.end_, @time)
+    C.F := nil
+    C.res := -1
+    Display.Broadcast(@C)
+  elsif keysum = {0,2} then
+    // delete
+    Oberon.Defocus()
+    Delete(@F.val_, spos, epos + 1)
+    F.carpos := spos
+    UpdateNamePlate(F)
+  else
+    Gadgets.Update(F)
+  end
+end TrackSelection
+
+procedure GetSelection(F: NamePlate; text: pointer to Texts.Text; beg, end_, time: pointer to int32)
+  var
+    p: int16
+    W: Texts.Writer
+begin
+  newgc(text^)
+  Texts.Open(text^, "")
+  (* old
+  p := F.selbeg; Texts.OpenWriter(W);
+  WHILE p < F.selend DO
+  Texts.Write(W, F.val[p]); INC(p);
+  END;
+  *)
+  p := 0
+  Texts.OpenWriter(@W)
+  while F.val_[p] # 0X do
+    Texts.Write(@W, F.val_[p])
+    inc(p)
+  end
+
+  Texts.Append(text^, W.buf)
+  beg^ := F.selbeg
+  end_^ := F.selend
+  time^ := F.time
+end GetSelection
+
+procedure ForceString(F: Display.Frame; M: pointer to Objects.AttrMsg)
+begin
+  Gadgets.framehandle(F, M)
+  if M.res < 0 then
+    M.class := Objects.String
+    copy(@M.s, "", 64)
+    M.res := 0
+  end
+end ForceString
+
+procedure NamePlateAttr(F: NamePlate; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "NamePlates.NewNamePlate", 64)
+      M.res := 0
+    elsif M.name = "Value" then
+      if F.carpos >= 0 then
+        // ejz
+        PlateToDoc(F)
+        DocToPlate(F)
+      end
+
+      M.class := Objects.String
+      if (F.obj # nil) & (F.obj is Documents.Document) then
+        copy(@M.s, @F.obj(Documents.Document).name, 64)
+      else
+        copy(@M.s, @F.val_, 64)
+      end
+
+      M.res := 0
+    elsif M.name = "Cmd" then
+      ForceString(F, M)
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Value" then
+      if M.class = Objects.String then
+        if (F.obj # nil) & (F.obj is Documents.Document) then
+          copy(@F.obj(Documents.Document).name, @M.s, 128)
+          DocToPlate(F)
+        else
+          copy(@F.val_, @M.s, 128 (* MaxLen *))
+        end
+
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Value")
+    M.Enum("Cmd")
+    Gadgets.framehandle(F, M)
+  end
+end NamePlateAttr
+
+procedure ConsumeText(F: NamePlate; M: pointer to Oberon.ConsumeMsg)
+  var
+    R: Texts.Reader
+    ch: char
+    pos: int32
+begin
+  F.selbeg := -1
+  pos := M.beg
+  Texts.OpenReader(@R, M.text, pos)
+  loop
+    if pos = M.end_ then
+      exit
+    end
+    Texts.Read(@R, @ch)
+    if R.eot then
+      exit
+    end
+    if Length(@F.val_) >= MaxLen - 1i2 then
+      exit
+    end
+    if (" " <= ch) or (ch = " ") or (ch = 9X) then
+      InsertChar(@F.val_, 128 (* MaxLen *), F.carpos, ch)
+      inc(F.carpos)
+    end
+
+    inc(pos)
+  end
+
+  UpdateNamePlate(F)
+end ConsumeText
+
+procedure Dot(R: Display3.Mask; x, y: int16)
+  var
+    c: int16
+
+  procedure D(col: int16; R: pointer to Display3.Mask; c: pointer to int16; x: pointer to int16; y: pointer to int16)
+  begin
+    Display3.Dot(R^, col, x^, y^, Display.replace)
+    inc(c^)
+    inc(x^)
+    if band(c^, 3) = 0 then
+      inc(y^)
+      dec(x^, 4)
+    end
+  end D
+begin
+  c := 0
+  D(14, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(12, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(12, @R, @c, @x, @y)
+  D(0, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(13, @R, @c, @x, @y)
+  D(0, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+  D(14, @R, @c, @x, @y)
+end Dot
+
+procedure RestoreNamePlate(R: Display3.Mask; F: NamePlate; x, y, w, h: int16; dlink: Objects.Object)
+  var
+    p, X, Y, cx, cy, cw, ch: int16
+    r: Objects.Object
+    col: int32
+    eo: int16
+begin
+  FindModel(F, dlink)
+  Oberon.RemoveMarks(x, y, w, h)
+  col := Display3.textbackC
+  if XtraOffset > 0 then
+    Display3.FilledRect3D(R, Display3.topC, Display3.bottomC, col, x, y, XtraOffset, h, 1, Display.replace)
+    (*
+    cx := x + XtraOffset DIV 2; cy := Display3.downC;
+    Display3.Line(R, cy, Display.solid, cx, y+4, cx, y+h-6, 1, Display.replace);
+    Display3.Line(R, cy, Display.solid, cx, y+5, cx-2, y+7, 1, Display.replace);
+    Display3.Line(R, cy, Display.solid, cx, y+5, cx+2, y+7, 1, Display.replace);
+    Display3.Line(R, cy, Display.solid, cx, y+h-6, cx-2, y+h-8, 1, Display.replace);
+    Display3.Line(R, cy, Display.solid, cx, y+h-6, cx+2, y+h-8, 1, Display.replace)
+    *)
+    if ((XtraOffset mod 2) # 0) then
+      eo := XtraOffset
+    else
+      eo := XtraOffset - 1
+    end
+    cx := x + asr(eo, 1)
+    cy := y + asr(h, 1)
+    cw := eo - 4
+    ch := h - 4
+    if cw < ch then
+      ch := cw
+      X := x + 2
+      Y := cy - asr(ch, 1)
+    else
+      cw := ch
+      X := cx - asr(cw, 1)
+      Y := y + 2
+    end
+
+    Display3.ReplConst(R, Display3.downC, cx, Y, 1, ch, Display.replace)
+    Display3.ReplConst(R, Display3.downC, X, cy, cw, 1, Display.replace)
+    Display3.ReplConst(R, Display3.downC, cx - 1, Y + 1, 3, 1, Display.replace)
+    Display3.ReplConst(R, Display3.downC, cx - 2, Y + 2, 5, 1, Display.replace)
+    Display3.ReplConst(R, Display3.downC, cx - 2, Y + ch - 1 - 2, 5, 1, Display.replace)
+    Display3.ReplConst(R, Display3.downC, cx - 1, Y + ch - 1 - 1, 3, 1, Display.replace)
+    Display3.ReplConst(R, Display3.downC, X + 1, cy - 1, 1, 3, Display.replace)
+    Display3.ReplConst(R, Display3.downC, X + 2, cy - 2, 1, 5, Display.replace)
+    Display3.ReplConst(R, Display3.downC, X + cw - 1 - 2, cy - 2, 1, 5, Display.replace)
+    Display3.ReplConst(R, Display3.downC, X + cw - 1 - 1, cy - 1, 1, 3, Display.replace)
+  end
+
+  Display3.Rect3D(R, Display3.topC, Display3.bottomC, x + XtraOffset, y, w - XtraOffset, h, 1, Display.replace)
+
+  // left border
+  Display3.ReplConst(R, col, x + XtraOffset + 1, y + 1, Xoffset + XtraOffset - 1, h - 2, Display.replace)
+
+  Dot(R, x + XtraOffset + 2, y + 2)
+  Dot(R, x + XtraOffset + 2, y + h - 7)
+
+  p := F.start
+  X := x + Xoffset + XtraOffset
+  Y := y + Yoffset(F)
+  cx := R.X
+  cy := R.Y
+  cw := R.W
+  ch := R.H
+  Display3.AdjustMask(R, x + XtraOffset + 1, y + 1, w - 2 - XtraOffset, h - 2)
+  while F.val_[p] # 0X do
+    Fonts.Default.GetObj(Fonts.Default, val(int16, ord(F.val_[p])), @r)
+    case r of
+    | Fonts.Char:
+      Display3.ReplConst(R, col, X, y + 1, r.dx, h - 2, Display.replace)
+      Display3.CopyPattern(R, Display3.textC, r.pat (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; Oberon: Display3.CopyPattern(R, Display3.textC, r.pat, X + r.x, Y + r.y, Display3.textmode); INC(X, r.dx); INC(p); *), X + r.x, Y + r.y, Display3.textmode)
+      inc(X, r.dx)
+      inc(p)
+    end
+  end
+
+  if X < x + w - 1 then
+    Display3.ReplConst(R, col, X, y + 1, x + w - X - 1, h - 2, Display.replace)
+  end
+
+  Dot(R, x + w - 7, y + 2)
+  Dot(R, x + w - 7, y + h - 7)
+
+  if F.carpos >= 0 then
+    if F.carpos > Length(@F.val_) then
+      F.carpos := Length(@F.val_)
+    end
+
+    SetCaret(R, F, x, y, F.carpos)
+  end
+
+  if F.selbeg >= 0 then
+    FlipSelection(R, F, x, y, F.selbeg, F.selend)
+  end
+
+  R.X := cx
+  R.Y := cy
+  R.W := cw
+  R.H := ch
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreNamePlate
+
+procedure PrintNamePlate(F: NamePlate; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask
+    x, y, w, h: int16
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  Printer3.Rect3D(R, Display3.topC, Display3.bottomC, x, y, w, h, P(1), Display.replace)
+  Printer3.ReplConst(R, Display3.textbackC, x + P(1), y + P(1), w - P(2), h - P(2), Display.replace)
+  Display3.AdjustMask(R, x + P(1), y + P(1), w - P(2), h - P(2))
+  Printer3.String(R, Display3.textC, x + P(Xoffset + XtraOffset), y + P(Yoffset(F)), Fonts.Default, @F.val_, Display.replace)
+end PrintNamePlate
+
+procedure CopyNamePlate*(M: pointer to Objects.CopyMsg; from, to_: NamePlate)
+  var
+    obj: Objects.Object
+begin
+  obj := from.obj
+  from.obj := nil
+  Gadgets.CopyFrame(M, from, to_)
+  from.obj := obj
+
+  copy(@to_.val_, @from.val_, 128 (* MaxLen *))
+  to_.carpos := -1
+  to_.selbeg := -1
+end CopyNamePlate
+
+procedure NamePlateHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    F2: NamePlate
+    x, y, w, h: int16
+    R: Display3.Mask
+    ver: int32
+    obj: Objects.Object
+    A: Objects.AttrMsg
+    M1: Display.PFrameMsg
+begin
+  if Oberon.New then
+    XtraOffset := TextGadgets0.sliderW
+  else
+    XtraOffset := 0
+  end
+  case F of
+  | NamePlate:
+    case M of
+    | Objects.PAttrMsg:
+      NamePlateAttr(F, M)
+
+    | Objects.PFileMsg:
+      if M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if ver # VersionNo then
+          Texts.WriteString(@W, "  cannot read nameplate")
+          Texts.WriteLn(@W)
+          halt(99)
+        end
+
+        Files.ReadString(@M.R, @F.val_, 128 (* MaxLen *))
+        Gadgets.framehandle(F, M)
+        A.res := -1
+        A.id := Objects.get
+        copy(@A.name, "Cmd", 32)
+        Gadgets.framehandle(F, @A)
+        if (A.res = 0) & (A.s = "") then
+          A.res := -1
+          A.id := Objects.set_
+          copy(@A.name, "Cmd", 32)
+          A.class := Objects.String
+          copy(@A.s, "Attributes.Echo '#Value '", 64)
+          Gadgets.framehandle(F, @A)
+        end
+
+      elsif M.id = Objects.store then
+        Files.WriteNum(@M.R, VersionNo)
+        Files.WriteString(@M.R, @F.val_, 128 (* MaxLen *))
+        obj := F.obj
+        F.obj := nil
+        Gadgets.framehandle(F, M)
+        F.obj := obj
+      end
+
+    | Objects.PBindMsg:
+      // do not bind the model !!!
+      obj := F.obj
+      F.obj := nil
+      Gadgets.framehandle(F, M)
+      F.obj := obj
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F2)
+        F.stamp := M.stamp
+        F.dlink := F2
+        CopyNamePlate(M, F, F2)
+        M.obj := F2
+      end
+
+    | Display.PFrameMsg:
+      if M.res >= 0 then
+        return
+      end
+      x := M.x + F.X
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      M1 := M
+      case M1 of
+      | Display.PDisplayMsg:
+        if M1.device = Display.screen then
+          if (M1.F = nil) or (M1.id = Display.full) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            RestoreNamePlate(R, F, x, y, w, h, M1.dlink)
+          elsif (M1.id = Display.area) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            Display3.AdjustMask(R, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+            RestoreNamePlate(R, F, x, y, w, h, M1.dlink)
+          end
+
+        elsif M1.device = Display.printer then
+          PrintNamePlate(F, M1)
+        end
+
+      | Oberon.PControlMsg:
+        if (M1.id = Oberon.defocus) & (F.carpos >= 0) then
+          F.carpos := -1
+          F.start := 0
+          // ejz
+          PlateToDoc(F)
+          DocToPlate(F)
+          Gadgets.Update(F)
+        elsif (M1.id = Oberon.neutralize) & (F.carpos >= 0) then
+          F.carpos := -1 // hack @@@
+          F.start := 0
+          // ejz
+          PlateToDoc(F)
+          DocToPlate(F)
+          F.selbeg := -1
+          Gadgets.Update(F)
+        elsif (M1.id = Oberon.neutralize) & (F.selbeg >= 0) then
+          F.carpos := -1
+          F.start := 0
+          // ejz
+          PlateToDoc(F)
+          DocToPlate(F)
+          F.selbeg := -1
+          Gadgets.Update(F)
+        elsif M1.id = Oberon.mark then
+          Oberon.DrawCursor(@Oberon.Pointer, @Oberon.Star, M1.X, M1.Y)
+        end
+
+      | Desktops.PUpdateNameMsg:
+        if M1.obj = F.obj then
+          if M1.stamp # F.stamp then
+            F.stamp := M1.stamp
+            if F.obj is Documents.Document then
+              DocToPlate(F)
+            end
+          end
+
+          F.selbeg := -1
+          Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+          RestoreNamePlate(R, F, x, y, w, h, M1.dlink)
+        end
+
+      | Gadgets.PUpdateMsg:
+        if M1.obj = F.obj then
+          Update(F.obj)
+        else
+          Gadgets.framehandle(F, M1)
+        end
+
+      | Display.PControlMsg:
+        // !!!
+        if false & (M1.id = Display.restore) & (F.obj # nil) then
+          if M1.stamp # F.stamp then
+            F.stamp := M1.stamp
+            if F.obj is Documents.Document then
+              DocToPlate(F)
+            end
+          end
+
+          F.selbeg := -1
+        end
+
+      | Oberon.PSelectMsg:
+        if (F.selbeg >= 0) & (F.time - M1.time > 0) then
+          GetSelection(F, @M1.text, @M1.beg, @M1.end_, @M1.time)
+        end
+
+      | Oberon.PConsumeMsg:
+        if F.carpos >= 0 then
+          ConsumeText(F, M1)
+        end
+
+      | Oberon.PCaretMsg:
+        if F.carpos >= 0 then
+          M1.car := F
+          M1.res := 0
+        else
+          Gadgets.framehandle(F, M1)
+        end
+
+      | Oberon.PInputMsg:
+        if (M1.id = Oberon.track) & (Gadgets.InActiveArea(F, M1) or (2 in M1.keys)) then
+          if M1.X - x > XtraOffset then
+            if (2 in M1.keys) & (M1.X - x >= Xoffset + XtraOffset) & (F.W - M1.X + x >= Xoffset + XtraOffset) & (M1.Y - y >= Yoffset(F)) & (F.H - M1.Y + y >= Yoffset(F)) then
+
+              Oberon.Defocus()
+              Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+              TrackCaret(@R, F, x, y)
+              M1.res := 0
+            elsif 0 in M1.keys then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+              TrackSelection(R, F, x, y)
+              M1.res := 0
+            else
+              Gadgets.framehandle(F, M1)
+            end
+
+          else
+          end // ignore
+
+        elsif (M1.id = Oberon.consume) & (F.carpos >= 0) then
+          ConsumeChar(F, M1.ch)
+          M1.res := 0
+        elsif ~(Gadgets.selected in F.state) then
+          Gadgets.framehandle(F, M1)
+        end
+
+      else
+        Gadgets.framehandle(F, M)
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end NamePlateHandler
+
+procedure InitNamePlate*(F: NamePlate)
+  var
+    M: Objects.AttrMsg
+begin
+  F.handle := NamePlateHandler
+  F.carpos := -1
+  copy(@F.val_, "", 128 (* MaxLen *))
+  F.W := 100
+  F.H := 20
+  F.selbeg := -1
+  M.res := -1
+  M.id := Objects.set_
+  copy(@M.name, "Cmd", 32)
+  M.class := Objects.String
+  copy(@M.s, "Attributes.Echo '#Value '", 64)
+  Gadgets.framehandle(F, @M)
+end InitNamePlate
+
+procedure NewNamePlate*()
+  var
+    B: NamePlate
+begin
+  newgc(B)
+  InitNamePlate(B)
+  Objects.NewObj := B
+end NewNamePlate
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewNamePlate" end return NewNamePlate end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("NamePlates", cmd_)
+  Texts.OpenWriter(@W)
+  invTF := 15i1 - 14i1
+  XtraOffset := 0
+end NamePlates.

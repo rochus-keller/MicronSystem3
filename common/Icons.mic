@@ -1,0 +1,2530 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Icons [level=5]
+
+import Objects, Gadgets, Effects, Display, Display3, Texts, Oberon, Files, Input, Fonts, Links, Views, Printer, Printer3, Documents, Modules
+// portable
+// jm 19.1.95
+
+(** Implementation of Icons and the Iconizer. Also contains an implementation of a very simple camera-view with fixed viewpoint where no editing of the viewed model is allowed.
+*)
+(*
+29.3.94 - added Icon printing
+5.4.94 - added support for LinkMsg
+27.4.94 - support for priorityMsg
+5.5.94 - added locking
+7.7.94 - iconizers now open to the bottom in text
+14.7.94 - fixed problems with missing masks
+18.7.94 improved mask handling when displaying views
+25.7.95 icons only move themselves when not locked
+28.8.95 - Icons do not allow non-frames as models
+8.5.96 - added links to iconizers (ps - 8.5.96)
+9.6.96 - added links to icons (ps - 9.5.96)
+28.5.96 - centered icon caption (ps - 28.5.96)
+20.6.96 - added new hot-doc-icon support (ps - 20.6.96)
+28.6.96 - improoved lineup (ps -28.6.96)
+28.6.96 - send defocus and deselect msg to component when flip (ps -28.6.96)
+27.8.96 - fix dlink in TrackPopup
+1.10.96 - fixed problem with getting right frame when poping
+8.1.97 - removed hot-doc-icon support (ps)
+*)
+
+const
+  pinsize = 10i2
+  offset = 2i2
+
+// Simple camera-view.
+
+type
+  View* = pointer to ViewDesc
+  ViewDesc* = object (Gadgets.ViewDesc)
+  end
+
+  Icon* = pointer to IconDesc
+  IconDesc* = object (Gadgets.FrameDesc)
+    caption*: array 64 of char // Caption text.
+    col, h: int16
+  end
+
+  Iconizer* = pointer to IconizerDesc
+  IconizerDesc* = object (Gadgets.FrameDesc)
+    closedF*: Display.Frame // Frames of the closed and open sides of the iconizer.
+    openF*: Display.Frame
+    closed*: boolean // is it closed or not ?
+    popup*: boolean // Does it pop up on a middle-click ?
+    pin*: boolean // Display switch pin in top left corner?
+    sel*: boolean // Does it allow you to select an item when popping open ?
+    pos*: boolean // Do the open and close positions differ ?
+    poping: boolean // is poped open at the moment
+    px, py, oX, oY, cX, cY: int16
+  end
+
+  // Stack = POINTER TO StackDesc;
+  StackDesc = record
+    iconizer: Iconizer
+  end
+// next: Stack;
+
+var
+  W: Texts.Writer
+  top: Iconizer
+
+procedure SetMasks(F: Display.Frame; M: Display3.Mask)
+  var
+    O: Display3.OverlapMsg
+begin
+  O.M := M
+  O.x := 0
+  O.y := 0
+  O.F := F
+  O.dlink := nil
+  O.res := -1
+  F.handle(F, @O)
+end SetMasks
+
+procedure ClipAgainst(x, y, w, h: pointer to int16; x1, y1, w1, h1: int16)
+  var
+    r, t, r1, t1: int16
+begin
+  r := x^ + w^ - 1
+  r1 := x1 + w1 - 1
+  t := y^ + h^ - 1
+  t1 := y1 + h1 - 1
+  if x^ < x1 then
+    x^ := x1
+  end
+  if y^ < y1 then
+    y^ := y1
+  end
+  if r > r1 then
+    r := r1
+  end
+  if t > t1 then
+    t := t1
+  end
+  w^ := r - x^ + 1
+  h^ := t - y^ + 1
+end ClipAgainst
+
+// ==================== Views ==================
+
+procedure RestoreView(F: View; R: Display3.Mask; x, y, w, h: int16; M: pointer to Display.DisplayMsg)
+  var
+    D: Display.DisplayMsg
+    f: Gadgets.Frame
+    state: set
+begin
+  if (F.obj # nil) & (F.obj is Gadgets.Frame) then
+    f := F.obj(Gadgets.Frame)
+    state := f.state
+    f.state := f.state - {Gadgets.selected}
+    (*
+    oldR := f.mask;
+    NEW(newR); Display3.Open(newR);
+    Display3.Add(newR, 0, -f.H + 1, f.W, f.H); SetMasks(f, newR);
+    *)
+
+    if (M.F = nil) or (M.id = Display.full) then
+      D.dlink := M.dlink
+      D.device := Display.screen
+      D.id := Display.full
+      D.F := nil
+      D.res := -1
+      D.x := x - f.X
+      D.y := y - f.Y
+      Gadgets.Send(F, x, y, f, @D)
+    elsif M.id = Display.area then
+      D.dlink := M.dlink
+      D.device := Display.screen
+      D.id := Display.area
+      D.F := f
+      D.u := M.u
+      D.v := M.v
+      D.w := M.w
+      D.h := M.h
+      D.res := -1
+      D.x := x - f.X
+      D.y := y - f.Y
+      Gadgets.Send(F, x, y, f, @D)
+    end
+
+    (*
+    SetMasks(f, oldR);
+    *)
+    f.state := state // restore previous state
+  else
+    Display3.FilledRect3D(R, Display.FG, Display.FG, Display.BG, x, y, w, h, 2, Display.paint)
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreView
+
+procedure PrintView(F: View; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask // PM: Display.DisplayMsg;
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R) // make sure I have a mask too, and it is positioned correctly
+
+  // PM := M;
+  Gadgets.Send(F, M.x, M.y, F.obj(Display.Frame), M) // P
+end PrintView
+
+procedure CopyView*(M: pointer to Objects.CopyMsg; from, to_: View)
+  var
+    C: Objects.CopyMsg
+begin
+  C.id := Objects.shallow
+  C.stamp := M.stamp
+  Gadgets.CopyFrame(@C, from, to_)
+end CopyView
+
+procedure ViewHandle*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M3: Display.PFrameMsg
+    x, y, w, h, u, v, t: int16
+    F0: View
+    A: Display.ModifyMsg
+    f: Display.Frame
+    R: Display3.Mask
+begin
+  case F of
+  | View:
+    case M of
+    | Objects.PAttrMsg:
+      if (M.id = Objects.get) & (M.name = "Gen") then
+        copy(@M.s, "Icons.NewView", 64)
+        M.res := 0
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        Gadgets.framehandle(F, M)
+        F.state := F.state + {Gadgets.lockedsize}
+        if (F.obj # nil) & (F.obj is Objects.Dummy) then
+          Texts.WriteString(@W, "Discarding ")
+          Texts.WriteString(@W, @F.obj(Objects.Dummy).GName)
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+          F.obj := nil
+        end
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyView(M, F, F0)
+        M.obj := F0
+      end
+
+    | Objects.PBindMsg:
+      Gadgets.framehandle(F, M)
+    | Display.PFrameMsg:
+      x := M.x + F.X
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      u := M.x // store volatile info
+      v := M.y
+      M3 := M
+      case M3 of
+      | Display.PDisplayMsg:
+        if M3.device = Display.screen then
+          if (M3.F = nil) or (M3.id = Display.full) & (M3.F = F) then
+            Gadgets.MakeMask(F, x, y, M3.dlink, @R)
+            RestoreView(F, R, x, y, w, h, M3)
+          elsif (M3.id = Display.area) & (M3.F = F) then
+            Gadgets.MakeMask(F, x, y, M3.dlink, @R)
+            Display3.AdjustMask(R, x + M3.u, y + h - 1 + M3.v, M3.w, M3.h)
+            RestoreView(F, R, x, y, w, h, M3)
+          end
+
+        elsif M3.device = Display.printer then
+          PrintView(F, M3)
+        end
+
+      | Display.PModifyMsg:
+        if M3.F = F then
+          Gadgets.framehandle(F, M3)
+        elsif M3.F = F.obj then
+          t := M3.mode
+          M3.mode := Display.state
+          F.obj.handle(F.obj, M3)
+          M3.mode := t
+          A.id := Display.extend
+          A.mode := Display.display
+          A.F := F
+          f := F.obj(Display.Frame)
+          A.X := F.X
+          A.Y := F.Y
+          A.W := f.W
+          A.H := f.H
+          A.dX := 0
+          A.dY := 0
+          A.dW := A.W - f.W
+          A.dH := A.H - f.H
+          Display.Broadcast(@A)
+        elsif F.obj # nil then
+          F.obj.handle(F.obj, M3)
+        end
+
+      else
+        Gadgets.framehandle(F, M3)
+      end
+
+      M.x := u // restore volatile info
+      M.y := v
+
+    | Objects.PLinkMsg:
+      if (M.id = Objects.set_) & (M.name = "Model") then
+        if M.obj is Gadgets.Frame then
+          Gadgets.framehandle(F, M)
+          A.id := Display.extend
+          A.mode := Display.display
+          A.F := F
+          f := F.obj(Display.Frame)
+          A.X := F.X
+          A.Y := F.Y
+          A.W := f.W
+          A.H := f.H
+          A.dX := 0
+          A.dY := 0
+          A.dW := A.W - f.W
+          A.dH := A.H - f.H
+          Display.Broadcast(@A)
+        else
+          Texts.WriteString(@W, "  sorry, model is not a Display.Frame")
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+        end
+
+      else
+        Gadgets.framehandle(F, M)
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end ViewHandle
+
+// Make a simple camera-view of f.
+procedure ViewOf*(f: Gadgets.Frame): View
+  var
+    F: View
+begin
+  newgc(F)
+  F.obj := f
+  F.handle := ViewHandle
+  F.X := 0
+  F.Y := 0
+  F.W := f.W
+  F.H := f.H
+  F.state := F.state + {Gadgets.lockedsize}
+  return F
+end ViewOf
+
+procedure InitView*(F: View)
+begin
+  F.obj := nil
+  F.handle := ViewHandle
+  F.X := 0
+  F.Y := 0
+  F.W := 5
+  F.H := 5
+  F.state := F.state + {Gadgets.lockedsize}
+end InitView
+
+procedure NewView*()
+  var
+    F: View
+begin
+  newgc(F)
+  InitView(F)
+  Objects.NewObj := F
+end NewView
+
+// ==================== end of Views ==================
+
+procedure ToIcon(F: Icon; x, y, w, h: int16; M: pointer to Display.FrameMsg)
+  var
+    caph0: int16
+    obj: Display.Frame
+begin
+  if F.obj # nil then
+    obj := F.obj(Display.Frame)
+    caph0 := F.h + 2
+    M.x := x + asr(w, 1) - asr(obj.W, 1) - obj.X
+    M.y := y + caph0 - obj.Y
+    obj.handle(obj, M)
+  end
+end ToIcon
+
+procedure StringSize(const s: pointer to array of char; w, h: pointer to int16)
+  var
+    r: Objects.Object
+    p: int16
+begin
+  w^ := 6
+  h^ := 0
+  p := 0
+  while s[p] # 0X do
+    Fonts.Default.GetObj(Fonts.Default, val(int16, ord(s[p])), @r)
+    inc(w^, r(Fonts.Char).dx)
+    inc(p)
+  end
+
+  h^ := Fonts.Default.height + 2
+end StringSize
+
+procedure IconSize(F: Icon; w, h: pointer to int16)
+  var
+    iw, ih, cw: int16
+    obj: Objects.Object
+begin
+  obj := F.obj
+  if obj = nil then
+    iw := 0
+    ih := 0
+  elsif obj is Display.Frame then
+    iw := obj(Display.Frame).W
+    ih := obj(Display.Frame).H
+  end
+
+  StringSize(@F.caption, @cw, @F.h)
+  h^ := F.h + ih + 2 // add caption height
+  if cw > iw then
+    w^ := cw
+  else
+    w^ := iw
+  end
+end IconSize
+
+procedure Change(F: Icon)
+  var
+    M: Display.ModifyMsg
+    w, h: int16
+begin
+  M.id := Display.extend
+  M.mode := Display.display
+  M.F := F
+  IconSize(F, @w, @h)
+  M.X := F.X + asr(F.W - asr(w, 1) * 2, 1)
+  M.Y := F.Y + F.H - h
+  M.W := w
+  M.H := h
+  M.dX := M.X - F.X
+  M.dY := M.Y - F.Y
+  M.dW := M.W - F.W
+  M.dH := M.H - F.H
+  Display.Broadcast(@M)
+end Change
+
+procedure ForceString(F: Display.Frame; M: pointer to Objects.AttrMsg)
+begin
+  Gadgets.framehandle(F, M)
+  if M.res < 0 then
+    M.class := Objects.String
+    copy(@M.s, "", 64)
+    M.res := 0
+  end
+end ForceString
+
+procedure IconAttr(F: Icon; M: pointer to Objects.AttrMsg)
+  var
+    obj: Objects.Object
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "Icons.NewIcon", 64)
+      M.res := 0
+    elsif M.name = "Caption" then
+      M.class := Objects.String
+      copy(@M.s, @F.caption, 64)
+      M.res := 0
+    elsif M.name = "Icon" then
+      ForceString(F, M)
+    elsif M.name = "Cmd" then
+      ForceString(F, M)
+    elsif M.name = "ConsumeCmd" then
+      ForceString(F, M)
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Caption" then
+      if M.class = Objects.String then
+        if M.s # F.caption then
+          copy(@F.caption, @M.s, 64)
+          Change(F)
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "Icon" then
+      if M.class = Objects.String then
+        if M.s # "" then
+          obj := Gadgets.FindPublicObj(@M.s)
+          if (obj # nil) & (obj is Gadgets.Frame) then
+            if (F.obj # nil) & (F.obj is View) & (F.obj(View).obj = obj) then
+            // do nothing
+            else
+              F.obj := ViewOf(obj(Gadgets.Frame))
+              Change(F)
+            end
+
+          else
+            F.obj := nil
+            Change(F)
+          end
+        end
+
+        Gadgets.framehandle(F, M)
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Caption")
+    M.Enum("Icon")
+    M.Enum("Cmd")
+    M.Enum("ConsumeCmd")
+    Gadgets.framehandle(F, M)
+  end
+end IconAttr
+
+procedure IconLink(F: Icon; M: pointer to Objects.LinkMsg)
+  var
+    f: Display.Frame
+    CM: Display.ControlMsg
+    B: Objects.BindMsg
+begin
+  if (M.id = Objects.set_) & (M.name = "Model") then
+    if M.obj = nil then
+      F.obj := nil
+      Change(F)
+      M.res := 0
+    elsif M.obj = F.obj then
+      M.res := 0
+    elsif M.obj is Display.Frame then
+      f := M.obj(Display.Frame)
+      if Gadgets.Recursive(F, f) then
+        Texts.WriteString(@W, "Not allowed, will cause recursive structures")
+        Texts.WriteLn(@W)
+        Texts.Append(Oberon.Log, W.buf)
+      elsif (F.lib # nil) & (f.lib # nil) & (F.lib # f.lib) & (f.lib.name # "") then
+        Texts.WriteString(@W, "Across library movement not allowed")
+        Texts.Append(Oberon.Log, W.buf)
+      else
+        CM.id := Display.remove // << remove
+        CM.F := f
+        Display.Broadcast(@CM)
+        if F.lib # nil then
+          B.lib := F.lib
+          f.handle(f, @B)
+        end
+        case f of
+        | Gadgets.Frame:
+          f.state := f.state - {Gadgets.selected}
+          SetMasks(F, nil)
+
+        end
+
+        F.obj := f
+        Change(F)
+        M.res := 0
+      end
+    end
+
+  else
+    Gadgets.framehandle(F, M)
+  end
+end IconLink
+
+procedure RestoreIcon(R: Display3.Mask; F: Icon; x, y, w, h: int16; M: pointer to Display.DisplayMsg)
+  var
+    obj: Objects.Object
+    D: Display.DisplayMsg
+    cx, cy, cw, ch, caph0: int16
+begin
+  caph0 := F.h + 2
+  obj := F.obj
+  if obj = nil then
+    Display3.ReplConst(R, Display3.FG, x + asr(w, 1) - 3, y + caph0 + asr(h - caph0, 1) - 3, 3, 3, Display.replace)
+  elsif obj is Display.Frame then
+    if (M.F = nil) or (M.id = Display.full) then
+      D.device := Display.screen
+      D.id := Display.full
+      D.F := obj(Display.Frame)
+      D.res := -1
+      D.dlink := M.dlink
+      D.x := x + asr(w, 1) - asr(obj(Display.Frame).W, 1) - obj(Display.Frame).X
+      D.y := y + caph0 - obj(Display.Frame).Y
+      obj(Display.Frame).handle(obj(Display.Frame), @D)
+    elsif M.id = Display.area then
+      cx := asr(w, 1) - asr(obj(Display.Frame).W, 1)
+      cy := -h + caph0 + 1
+      cw := obj(Display.Frame).W
+      ch := obj(Display.Frame).H
+      ClipAgainst(@cx, @cy, @cw, @ch, M.u, M.v, M.w, M.h)
+      D.device := Display.screen
+      D.id := Display.area
+      D.dlink := M.dlink
+      D.res := -1
+      D.F := obj(Display.Frame)
+      D.x := x + asr(w, 1) - asr(obj(Display.Frame).W, 1) - obj(Display.Frame).X
+      D.y := y + caph0 - obj(Display.Frame).Y
+      D.u := cx - (asr(w, 1) - asr(obj(Display.Frame).W, 1))
+      D.v := cy - (-h + caph0 + obj(Display.Frame).H)
+      D.w := cw
+      D.h := ch
+      if (D.w > 0) & (D.h > 0) then
+        obj(Display.Frame).handle(obj(Display.Frame), @D)
+      end
+    end
+
+  end
+
+  Display3.FilledRect3D(R, Display3.topC, Display3.bottomC, F.col, x, y, w, F.h + 2, 1, Display.replace)
+  // ps - 28.5.96
+  Display3.CenterString(R, Display3.textC, x, y, w, F.h + 2, Fonts.Default, @F.caption, Display3.textmode)
+
+  if Gadgets.selected in F.state then
+    if obj = nil then
+      Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+    elsif obj is Display.Frame then
+      Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x + asr(w, 1) - asr(obj(Display.Frame).W, 1), y + caph0, obj(Display.Frame).W, obj(Display.Frame).H, Display.paint)
+
+    end
+
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, caph0, Display.paint)
+  end
+end RestoreIcon
+
+procedure PrintIcon(F: Icon; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask
+    caph0, w, h: int16
+    obj: Objects.Object
+    PM: Display.DisplayMsg
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  caph0 := F.h + 2
+  w := F.W
+  h := F.H
+  obj := F.obj
+  if obj = nil then
+    Printer3.ReplConst(R, Display3.FG, M.x + P(asr(w, 1) - 3), M.y + P(caph0 + asr(h - caph0, 1) - 3), P(3), P(3), Display.replace)
+  elsif obj is Display.Frame then
+    PM.device := Display.printer
+    PM.id := Display.full
+    PM.x := M.x + P(asr(w, 1) - asr(obj(Display.Frame).W, 1))
+    PM.y := M.y + P(caph0)
+    PM.res := -1
+    PM.dlink := M.dlink
+    obj(Display.Frame).handle(obj(Display.Frame), @PM)
+
+  end
+
+  Printer3.FilledRect3D(R, Display3.topC, Display3.bottomC, F.col, M.x, M.y, P(w), P(F.h + 2), P(1), Display.replace)
+  Printer3.String(R, Display3.textC, M.x + P(3), M.y + P(abs(Fonts.Default.minY) + 2), Fonts.Default, @F.caption, Display3.textmode)
+end PrintIcon
+
+procedure LocateMsg(F: Icon; x, y, w, h: int16; M: pointer to Display.LocateMsg)
+  var
+    caph: int16
+    obj: Objects.Object
+begin
+  if (M.loc = nil) & Effects.Inside(M.X, M.Y, x, y, w, h) then
+    if F.obj = nil then
+      M.loc := F
+      M.u := M.X - x
+      M.v := M.Y - (y + h - 1)
+      M.res := 0
+      return
+    else
+      obj := F.obj
+      caph := F.h + 2
+      if Effects.Inside(M.X, M.Y, x, y, w, caph) then
+        M.loc := F
+        M.u := M.X - x
+        M.v := M.Y - (y + h - 1)
+        M.res := 0
+        return
+      end
+      case obj of
+      | Display.Frame:
+        if Effects.Inside(M.X, M.Y, x + asr(w, 1) - asr(obj.W, 1), y + caph, obj.W, obj.H) then
+          M.loc := F
+          M.u := M.X - x
+          M.v := M.Y - (y + h - 1)
+          M.res := 0
+        end
+
+      end
+    end
+  end
+end LocateMsg
+
+procedure CopyIcon*(M: pointer to Objects.CopyMsg; from, to_: Icon)
+  var
+    id: int16
+begin
+  id := M.id
+  M.id := Objects.deep
+  Gadgets.CopyFrame(M, from, to_)
+  M.id := id
+  copy(@to_.caption, @from.caption, 64)
+  to_.h := from.h
+  to_.col := from.col
+end CopyIcon
+
+procedure Size(F: Icon; x, y, w, h: pointer to int16)
+  var
+    obj: Objects.Object
+begin
+  obj := F.obj
+  if obj # nil then
+    case obj of
+    | Display.Frame:
+      x^ := x^ + asr(w^, 1) - asr(obj.W, 1)
+      y^ := y^ + F.h + 2
+      w^ := obj.W
+      h^ := obj.H
+    end
+  end
+end Size
+
+procedure TrackHighlight(R: Display3.Mask; X, Y: pointer to int16; x, y, w, h: int16; keysum: pointer to set)
+  var
+    keys: set
+    on: boolean
+    xx, yy: int16
+
+  procedure High(R: pointer to Display3.Mask; h: pointer to int16; on: pointer to boolean; w: pointer to int16; x: pointer to int16; xx: pointer to int16; y: pointer to int16; yy: pointer to int16)
+  begin
+    if Effects.Inside(xx^, yy^, x^, y^, w^, h^) then
+      if ~on^ then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        Display3.ReplConst(R^, Display3.invertC, x^, y^, w^, h^, Display.invert)
+        on^ := true
+      end
+
+    else
+      if on^ then
+        Oberon.FadeCursor(@Oberon.Mouse)
+        Display3.ReplConst(R^, Display3.invertC, x^, y^, w^, h^, Display.invert)
+        on^ := false
+      end
+    end
+  end High
+begin
+  on := false
+  keysum^ := {}
+  High(@R, @h, @on, @w, @x, @xx, @y, @yy)
+  loop
+    Input.Mouse(@keys, @xx, @yy)
+    keysum^ := keysum^ + keys
+    if keys = {} then
+      exit
+    end
+    High(@R, @h, @on, @w, @x, @xx, @y, @yy)
+    Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, xx, yy)
+  end
+
+  X^ := xx
+  Y^ := yy
+  xx := -100
+  yy := -100
+  High(@R, @h, @on, @w, @x, @xx, @y, @yy)
+end TrackHighlight
+
+procedure IconTrack(F: Icon; R: Display3.Mask; M: pointer to Oberon.InputMsg)
+  var
+    x, y, w, h: int16
+    keysum: set
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  w := F.W
+  h := F.H
+  Size(F, @x, @y, @w, @h)
+  TrackHighlight(R, @M.X, @M.Y, x, y, w, h, @keysum)
+  if Effects.Inside(M.X, M.Y, x, y, w, h) & (keysum = {1}) then
+    Gadgets.ExecuteAttr(F, "Cmd", M.dlink, nil, nil)
+  end
+end IconTrack
+
+procedure HasCmdAttr(F: Display.Frame; const attr: pointer to array of char): boolean
+  var
+    A: Objects.AttrMsg
+begin
+  A.id := Objects.get
+  copy(@A.name, attr, 32)
+  A.class := Objects.Inval
+  A.res := -1
+  A.dlink := nil
+  Objects.Stamp(@A)
+  F.handle(F, @A)
+  return (A.res >= 0) & (A.class = Objects.String) & (A.s # "")
+end HasCmdAttr
+
+procedure IconHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M2: Display.PFrameMsg
+    x, y, w, h, u, v, capw: int16
+    F0: Icon
+    f: Display.Frame
+    B: Objects.BindMsg
+    CM: Display.ControlMsg
+    C: Objects.CopyMsg
+    R: Display3.Mask
+    ver: int32
+begin
+  case F of
+  | Icon:
+    case M of
+    | Objects.PAttrMsg:
+      IconAttr(F, M)
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Files.WriteNum(@M.R, 1)
+        Files.WriteString(@M.R, @F.caption, 64)
+        Files.WriteNum(@M.R, 0)
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if ver # 1 then
+          halt(42)
+        end
+        Files.ReadString(@M.R, @F.caption, 64)
+        Files.ReadNum(@M.R, @ver)
+        Gadgets.framehandle(F, M)
+        if (F.obj # nil) & (F.obj is Objects.Dummy) then
+          Texts.WriteString(@W, "Discarding ")
+          Texts.WriteString(@W, @F.obj(Objects.Dummy).GName)
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+          F.obj := nil
+        end
+
+        // IconSize(F, F.W, F.H); because the icon might not be loaded yet
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyIcon(M, F, F0)
+        M.obj := F0
+      end
+
+    | Objects.PLinkMsg:
+      // ps - 9.5.96
+      IconLink(F, M(Objects.PLinkMsg))
+    | Display.PFrameMsg:
+      x := M.x + F.X // calculate actual coordinates
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      u := M.x // store volatile info
+      v := M.y
+      M2 := M
+      case M2 of
+      | Display.PDisplayMsg:
+        if M2.device = Display.screen then
+          if (M2.F = nil) or (M2.id = Display.full) & (M2.F = F) then
+            Gadgets.MakeMask(F, x, y, M2.dlink, @R)
+            RestoreIcon(R, F, x, y, w, h, M2)
+          elsif (M2.id = Display.area) & (M2.F = F) then
+            Gadgets.MakeMask(F, x, y, M2.dlink, @R)
+            Display3.AdjustMask(R, x + M2.u, y + h - 1 + M2.v, M2.w, M2.h)
+            RestoreIcon(R, F, x, y, w, h, M2)
+          end
+
+        elsif M2.device = Display.printer then
+          PrintIcon(F, M2)
+        end
+
+      | Display.PLocateMsg:
+        LocateMsg(F, x, y, w, h, M2)
+
+      | Display3.POverlapMsg:
+        if (M2.F = nil) or (M2.F = F) then
+          F.mask := M2.M
+          if (F.obj # nil) & (F.obj is Gadgets.Frame) then
+            if F.mask = nil then
+              SetMasks(F.obj(Gadgets.Frame), nil)
+            else
+              f := F.obj(Gadgets.Frame)
+              Display3.Copy(M2.M, @R)
+              R.x := 0
+              R.y := 0
+
+              Display3.Intersect(R, asr(F.W, 1) - asr(f.W, 1), -F.H + 1 + F.h + 2, f.W, f.H)
+              R.x := -(asr(F.W, 1) - asr(f.W, 1))
+              R.y := 0
+              Display3.Shift(R)
+              SetMasks(f, R)
+            end
+          end
+
+          M2.res := 0
+        end
+
+      | Display.PModifyMsg:
+        if M2.F = F then
+          Gadgets.framehandle(F, M2)
+        elsif M2.F = F.obj then
+          capw := M2.mode
+          M2.mode := Display.state
+          F.obj.handle(F.obj, M2)
+          M2.mode := capw
+          Change(F)
+        elsif F.obj # nil then
+          ToIcon(F, x, y, w, h, M2)
+        end
+
+      | Display.PConsumeMsg:
+        if M2.F = F then
+          if (M2.obj is Display.Frame) & (F.obj = nil) then
+            f := M2.obj(Display.Frame)
+            f.slink := nil
+            if Gadgets.Recursive(F, f) then
+              Texts.WriteString(@W, "Not allowed, will cause recursive structures")
+              Texts.WriteLn(@W)
+              Texts.Append(Oberon.Log, W.buf)
+            elsif (F.lib # nil) & (f.lib # nil) & (F.lib # f.lib) & (f.lib.name # "") then
+              Texts.WriteString(@W, "Across library movement not allowed")
+              Texts.Append(Oberon.Log, W.buf)
+            else
+              CM.id := Display.remove // << remove
+              CM.F := M2.obj(Display.Frame)
+              Display.Broadcast(@CM)
+              C.id := Objects.deep
+              Objects.Stamp(@C)
+              C.obj := nil
+              M2.obj.handle(M2.obj, @C)
+              F.obj := C.obj
+              if F.obj is Gadgets.Frame then
+                F.obj(Gadgets.Frame).state := F.obj(Gadgets.Frame).state - {Gadgets.selected}
+                SetMasks(F, nil)
+              end
+              if F.lib # nil then
+                B.lib := F.lib
+                F.obj.handle(F.obj, @B)
+              end
+              Change(F)
+              M2.res := 0
+            end
+
+          elsif M2.obj is Display.Frame then
+            Gadgets.ExecuteAttr(F, "ConsumeCmd", M2.dlink, M2.obj, F)
+            M2.res := 0
+          end
+
+        else
+          Gadgets.framehandle(F, M2)
+        end
+
+      | Oberon.PInputMsg:
+        if ~(Gadgets.selected in F.state) then
+          if (M2.id = Oberon.track) & (M2.keys = {1}) then
+            if Effects.Inside(M2.X, M2.Y, x, y, w, F.h + 2) & ~Gadgets.IsLocked(F, M2.dlink) then
+              Gadgets.MoveFrame(F, M2)
+            elsif HasCmdAttr(F, "Cmd") then
+              // ! Gadgets.InActiveArea(F, M2) &
+              Gadgets.MakeMask(F, x, y, M2.dlink, @R)
+              IconTrack(F, R, M2)
+              M2.res := 0
+              // ! ELSE Gadgets.framehandle(F, M2)
+            end
+
+          else
+            Gadgets.framehandle(F, M2)
+          end
+
+        else
+          Gadgets.framehandle(F, M2)
+        end
+
+      else
+        Gadgets.framehandle(F, M2)
+      end
+
+      M.x := u // restore volatile info
+      M.y := v
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end IconHandler
+
+// Manufacture an icon with caption name and icon as content. Icon must be of type frame. Icons is typically a simple camera-view created by ViewOf.
+procedure MakeIcon*(F: Icon; const name: pointer to array of char; icon: Objects.Object)
+begin
+  F.handle := IconHandler
+  F.obj := icon
+  F.col := Display3.groupC
+  copy(@F.caption, name, 64)
+  IconSize(F, @F.W, @F.H)
+  F.state := {Gadgets.lockedsize,Gadgets.transparent}
+end MakeIcon
+
+procedure NewIcon*()
+  var
+    F: Icon
+begin
+  newgc(F)
+  MakeIcon(F, "Icon", nil)
+  Objects.NewObj := F
+end NewIcon
+
+// ========================= Iconizers =========================
+
+procedure Push(S: pointer to StackDesc; F: Iconizer)
+begin
+  S.iconizer := top
+  top := F
+end Push
+
+procedure Pop(S: pointer to StackDesc)
+begin
+  top := S.iconizer
+end Pop
+
+procedure Top(): Iconizer
+begin
+  return top
+end Top
+
+procedure To(F: Iconizer; childu, childv: int16; M: pointer to Display.FrameMsg)
+  var
+    d: Display.Frame
+    u, v: int16
+    Fdlink, Mdlink: Objects.Object
+begin
+  if F.closed & ~F.poping then
+    d := F.closedF
+  else
+    d := F.openF
+  end
+  if d # nil then
+    u := M.x
+    v := M.y
+    M.x := childu
+    M.y := childv
+    if F.poping then
+      // coord might have changed
+      inc(M.x, F.px)
+      inc(M.y, F.py)
+    end
+
+    Fdlink := F.dlink
+    Mdlink := M.dlink
+    F.dlink := M.dlink
+    M.dlink := F
+    d.handle(d, M)
+    M.dlink := Mdlink
+    F.dlink := Fdlink
+    M.x := u
+    M.y := v
+  end
+end To
+
+// Executed from within an iconizer causes it to flip open/close.
+procedure Flip*()
+  var
+    A: Display.ModifyMsg
+    n: Display.Frame
+    i: Iconizer
+    CM: Display.ControlMsg
+    P: Gadgets.PriorityMsg
+    OM: Oberon.ControlMsg
+begin
+  i := Top()
+  if i # nil then
+    if i.pos then
+      if i.closed then
+        i.cX := i.X
+        i.cY := i.Y + i.H - 1
+      else
+        i.oX := i.X
+        i.oY := i.Y + i.H - 1
+      end
+    end
+
+    if i.closed then
+      P.id := Gadgets.top
+      P.F := i
+      P.passon := false
+      Display.Broadcast(@P)
+    end
+
+    i.closed := ~i.closed
+    if i.closed then
+      n := i.closedF
+    else
+      n := i.openF
+    end
+    i.obj := n
+    if n = nil then
+      n := i
+      i.state := i.state - {Gadgets.lockedsize}
+    end
+    if (n # nil) & (n is Gadgets.Frame) then
+      case n of
+      | Gadgets.Frame:
+        if Gadgets.transparent in n.state then
+          i.state := i.state + {Gadgets.transparent}
+        else
+          i.state := i.state - {Gadgets.transparent}
+        end
+
+        if Gadgets.lockedsize in n.state then
+          i.state := i.state + {Gadgets.lockedsize}
+        elsif ~(Gadgets.lockedcontents in i.state) then
+          i.state := i.state - {Gadgets.lockedsize}
+        end
+
+        // send restore message down
+        CM.id := Display.restore
+        CM.F := nil
+        CM.x := 0
+        CM.y := 0
+        CM.dlink := nil
+        CM.res := -1
+        Objects.Stamp(@CM)
+        n.handle(n, @CM)
+      end
+    end
+
+    A.id := Display.extend
+    A.mode := Display.display
+    A.F := i
+    if i.pos then
+      if i.closed then
+        A.X := i.cX
+        A.Y := i.cY - n.H + 1
+      else
+        A.X := i.oX
+        A.Y := i.oY - n.H + 1
+      end
+    else
+      A.X := i.X
+      A.Y := i.Y + i.H - n.H
+    end
+
+    A.W := n.W
+    A.H := n.H
+    A.dX := A.X - i.X
+    A.dY := A.Y - i.Y
+    A.dW := A.W - i.W
+    A.dH := A.H - i.H
+    SetMasks(i, nil)
+    Display.Broadcast(@A)
+
+    // neutralize
+    OM.id := Oberon.neutralize
+    OM.F := nil
+    OM.x := 0
+    OM.y := 0
+    OM.dlink := nil
+    OM.res := -1
+    Objects.Stamp(@OM)
+    n.handle(n, @OM)
+  end
+end Flip
+
+procedure SetLinkObject(F: Iconizer; f: Display.Frame; closed: boolean): boolean
+  var
+    CM: Display.ControlMsg
+    A: Display.ModifyMsg
+    B: Objects.BindMsg
+begin
+  if Gadgets.Recursive(F, f) then
+    Texts.WriteString(@W, "Not allowed, will cause recursive structures")
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+    return false
+  elsif (F.lib # nil) & (f.lib # nil) & (F.lib # f.lib) & (f.lib.name # "") then
+    Texts.WriteString(@W, "Across library movement not allowed")
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+    return false
+  else
+    CM.id := Display.remove // << remove
+    CM.F := f
+    Display.Broadcast(@CM)
+
+    if F.lib # nil then
+      B.lib := F.lib // << binding
+      f.handle(f, @B)
+    end
+    f.next := nil
+    if closed then
+      F.closedF := f
+    else
+      F.openF := f
+    end
+    if F.closed = closed then
+      // link is know visible
+      F.obj := f
+
+      A.id := Display.extend
+      A.mode := Display.display
+      A.F := F
+      A.X := F.X
+      A.Y := F.Y + F.H - f.H
+      A.W := f.W
+      A.H := f.H
+      A.dX := A.X - F.X
+      A.dY := A.Y - F.Y
+      A.dW := A.W - F.W
+      A.dH := A.H - F.H
+
+      if F.pos then
+        F.oX := F.X
+        F.oY := A.Y + A.H - 1
+        F.cX := F.oX
+        F.cY := F.oY
+      end
+
+      case f of
+      | Gadgets.Frame:
+        f.mask := nil
+        if Gadgets.lockedsize in f.state then
+          F.state := F.state + {Gadgets.lockedsize}
+        elsif ~(Gadgets.lockedcontents in F.state) then
+          F.state := F.state - {Gadgets.lockedcontents}
+        end
+
+        f.state := f.state - {Gadgets.selected}
+        if Gadgets.transparent in f.state then
+          F.state := F.state + {Gadgets.transparent}
+        else
+          F.state := F.state - {Gadgets.transparent}
+        end
+
+      end
+
+      Display.Broadcast(@A)
+    end
+
+    return true
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end SetLinkObject
+
+procedure IconizerAttr(F: Iconizer; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "Icons.NewIconizer", 64)
+      M.res := 0
+    elsif M.name = "Popup" then
+      M.class := Objects.Bool
+      M.b := F.popup
+      M.res := 0
+    elsif M.name = "Menu" then
+      M.class := Objects.Bool
+      M.b := F.sel
+      M.res := 0
+    elsif M.name = "FixedViews" then
+      M.class := Objects.Bool
+      M.b := ~F.pos
+      M.res := 0
+    elsif M.name = "Pin" then
+      M.class := Objects.Bool
+      M.b := F.pin
+      M.res := 0
+    elsif M.name = "Locked" then
+      M.class := Objects.Bool
+      M.b := Gadgets.lockedcontents in F.state
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      // ps -28.6.96
+      if ~F.closed & (F.closedF # nil) then
+        M.i := F.H - asr(F.closedF.H + 1, 1) - 5
+      else
+        M.i := asr(F.H, 1) - 5
+      end
+
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Popup" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.popup := true
+        else
+          F.popup := false
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "Menu" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.sel := true
+          F.popup := true
+        else
+          F.sel := false
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "FixedViews" then
+      if M.class = Objects.Bool then
+        if ~M.b then
+          if ~F.pos then
+            F.oX := F.X
+            F.oY := F.Y + F.H - 1
+            F.cX := F.oX
+            F.cY := F.oY
+          end
+          F.pos := true
+        else
+          F.pos := false
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "Pin" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.pin := true
+        else
+          F.pin := false
+        end
+        M.res := 0
+        F.mask := nil
+      end
+
+    elsif M.name = "Locked" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state := F.state + {Gadgets.lockedcontents,Gadgets.lockedsize}
+        else
+          F.state := F.state - {Gadgets.lockedcontents,Gadgets.lockedsize}
+        end
+
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Popup")
+    M.Enum("Menu")
+    M.Enum("FixedViews")
+    M.Enum("Pin")
+    M.Enum("Locked")
+    Gadgets.framehandle(F, M)
+  end
+end IconizerAttr
+
+procedure IconizerLink(F: Iconizer; M: pointer to Objects.LinkMsg)
+begin
+  // ps - 8.5.96
+
+  if M.id = Objects.get then
+    if M.name = "Closed" then
+      M.obj := F.closedF
+      M.res := 0
+    elsif M.name = "Open" then
+      M.obj := F.openF
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Closed" then
+      if M.obj = F.closedF then
+        M.res := 0
+      else
+        if M.obj = nil then
+          F.closedF := nil
+          if F.closed then
+            F.obj := nil
+          end
+          M.res := 0
+        elsif M.obj is Display.Frame then
+          if SetLinkObject(F, M.obj(Display.Frame), true) then
+            M.res := 0
+          end
+        end
+      end
+
+    elsif M.name = "Open" then
+      if M.obj = F.openF then
+        M.res := 0
+      else
+        if M.obj = nil then
+          F.openF := nil
+          if ~F.closed then
+            F.obj := nil
+          end
+          M.res := 0
+        elsif M.obj is Display.Frame then
+          if SetLinkObject(F, M.obj(Display.Frame), false) then
+            M.res := 0
+          end
+        end
+      end
+
+    elsif M.name = "Model" then
+      if M.obj = F.obj then
+        M.res := 0
+      else
+        if M.obj = nil then
+          F.obj := nil
+          if F.closed then
+            F.closedF := nil
+          else
+            F.openF := nil
+          end
+          M.res := 0
+        elsif M.obj is Display.Frame then
+          if SetLinkObject(F, M.obj(Display.Frame), F.closed) then
+            M.res := 0
+          end
+        end
+      end
+
+    else
+      Links.HandleLinkMsg(@F.link, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Closed")
+    M.Enum("Open")
+    Links.HandleLinkMsg(@F.link, M)
+  end
+end IconizerLink
+
+procedure LocateIconizer(F: Iconizer; M: pointer to Display.LocateMsg)
+  var
+    d: Display.Frame
+begin
+  if F.closed then
+    d := F.closedF
+  else
+    d := F.openF
+  end
+  if d = nil then
+    if Effects.Inside(M.X, M.Y, M.x + F.X, M.y + F.Y, F.W, F.H) then
+      M.loc := F
+      M.res := 0
+      M.u := M.X - (M.x + F.X)
+      M.v := M.Y - (M.y + F.Y)
+    end
+
+  elsif Effects.Inside(M.X, M.Y, M.x + F.X + offset, M.y + F.Y + F.H - pinsize - offset, pinsize, pinsize) then
+    M.loc := F
+    M.res := 0
+    M.u := M.X - (M.x + F.X)
+    M.v := M.Y - (M.y + F.Y)
+  else
+    To(F, M.x + F.X, M.y + F.Y + F.H - 1, M)
+  end
+end LocateIconizer
+
+procedure AdjustIconizer(F: Iconizer; M: pointer to Display.ModifyMsg)
+  var
+    d: Display.Frame
+    A: Display.ModifyMsg
+begin
+  if F.closed then
+    d := F.closedF
+  else
+    d := F.openF
+  end
+  if d # nil then
+    A.X := 0
+    A.Y := -M.H + 1
+    A.W := M.W
+    A.H := M.H
+    A.mode := Display.state
+    A.id := Display.extend
+    A.dX := A.X - d.X
+    A.dY := A.Y - d.Y
+    A.dW := A.W - d.W
+    A.dH := A.H - d.H
+    A.F := d
+    A.res := -1
+    A.dlink := M.dlink
+    Objects.Stamp(@A)
+    To(F, M.x + F.X, M.y + F.Y + F.H - 1, @A)
+    case d of
+    | Gadgets.Frame:
+      if Gadgets.transparent in d.state then
+        F.state := F.state + {Gadgets.transparent}
+      else
+        F.state := F.state - {Gadgets.transparent}
+      end
+
+      if Gadgets.lockedsize in d.state then
+        F.state := F.state + {Gadgets.lockedsize}
+      elsif ~(Gadgets.lockedcontents in F.state) then
+        F.state := F.state - {Gadgets.lockedsize}
+      end
+
+    end
+  end
+
+  if F.pos then
+    if F.closedF = nil then
+      F.cX := M.X
+      F.cY := M.Y + M.H - 1
+    end
+    if F.openF = nil then
+      F.oX := M.X
+      F.oY := M.Y + M.H - 1
+    end
+  end
+
+  // Explode(M.x+F.X, M.y+F.Y, F.W, F.H, M.x+M.X, M.y+M.Y, M.W, M.H);
+  // KillMasks(F);
+
+  Gadgets.Adjust(F, M)
+end AdjustIconizer
+
+procedure AdjustIconizerChild(F: Iconizer; M: pointer to Display.ModifyMsg)
+  var
+    A: Display.ModifyMsg
+    d: Display.Frame
+begin
+  M.res := 0
+  A.F := F
+  A.id := Display.extend
+  A.mode := M.mode
+  A.X := F.X
+  A.Y := F.Y + F.H - M.H
+  A.W := M.W
+  A.H := M.H
+  A.dX := 0
+  A.dY := A.Y - F.Y
+  A.dW := A.W - F.W
+  A.dH := A.H - F.H
+  if F.closed then
+    d := F.closedF
+  else
+    d := F.openF
+  end
+  case d of
+  | Gadgets.Frame:
+    if Gadgets.transparent in d.state then
+      F.state := F.state + {Gadgets.transparent}
+    else
+      F.state := F.state - {Gadgets.transparent}
+    end
+
+    if Gadgets.lockedsize in d.state then
+      F.state := F.state + {Gadgets.lockedsize}
+    elsif ~(Gadgets.lockedcontents in F.state) then
+      F.state := F.state - {Gadgets.lockedsize}
+    end
+
+  end
+
+  Display.Broadcast(@A)
+end AdjustIconizerChild
+
+procedure ConsumeIconizer(F: Iconizer; M: pointer to Display.ConsumeMsg)
+  var
+    d: Display.Frame
+begin
+  if F.closed then
+    d := F.closedF
+  else
+    d := F.openF
+  end
+  if (d = nil) & (M.F = F) then
+    if SetLinkObject(F, M.obj(Display.Frame), F.closed) then
+      M.res := 0
+    end
+  else
+    To(F, M.x + F.X, M.y + F.Y + F.H - 1, M)
+  end
+end ConsumeIconizer
+
+procedure TrackPopup(F: Iconizer; x, y, w, h: int16; M: pointer to Oberon.InputMsg)
+  var
+    px, py: int16
+    D: Display.DisplayMsg
+    block: Views.Block
+    L: Display.LocateMsg
+    ls: Display.Frame
+    A: Objects.AttrMsg
+    of_: Gadgets.Frame
+    keysum, fstate: set
+    R, R0: Display3.Mask
+    CM: Display.ControlMsg
+    mdlink, fdlink: Objects.Object
+    wasLocked: boolean
+
+  procedure Select(f: Display.Frame; state: boolean; M: pointer to Oberon.InputMsg; R0: pointer to Display3.Mask; of_: pointer to Gadgets.Frame; px: pointer to int16; py: pointer to int16)
+    var
+      D: Display.DisplayMsg
+  begin
+    Oberon.FadeCursor(@Oberon.Mouse)
+    if state then
+      Display3.Rect(R0^, Display.FG, Display.grey1, px^ + f.X, py^ + of_^.H - 1 + f.Y, f.W, f.H, 2, Display3.textmode)
+    else
+      D.device := Display.screen
+      D.id := Display.area
+      D.F := of_^
+      D.u := f.X
+      D.v := f.Y
+      D.w := f.W
+      D.h := f.H
+      D.res := -1
+      D.x := px^ - of_^.X
+      D.y := py^ - of_^.Y
+      Objects.Stamp(@D)
+      D.dlink := M.dlink
+      of_^.handle(of_^, @D)
+    end
+  end Select
+
+  procedure DoSelect(f: Display.Frame; M: pointer to Oberon.InputMsg; R0: pointer to Display3.Mask; ls: pointer to Display.Frame; of_: pointer to Gadgets.Frame; px: pointer to int16; py: pointer to int16)
+  begin
+    if ls^ # nil then
+      Select(ls^, false, M, R0, of_, px, py)
+    end
+    if f # nil then
+      Select(f, true, M, R0, of_, px, py)
+    end
+    ls^ := f
+  end DoSelect
+
+  procedure CalcPlace(px, py: pointer to int16; M: pointer to Oberon.InputMsg; h: pointer to int16; of_: pointer to Gadgets.Frame; x: pointer to int16; y: pointer to int16)
+    var
+      cx: int16 // clipping area
+      cy, cw, ch: int16
+      f: Objects.Object
+  begin
+    cx := 0
+    cy := 0
+    cw := Display.Width
+    ch := Display.Height
+    f := M.dlink
+    while f # nil do
+      case f of
+      | Gadgets.View:
+        ClipAgainst(@cx, @cy, @cw, @ch, f.absX, f.absY, f.W, f.H)
+
+      end
+
+      f := f.dlink
+    end
+
+    px^ := x^
+    py^ := y^ + h^ - of_^.H
+    if px^ < cx then
+      px^ := cx
+    end
+    if px^ + of_^.W >= cx + cw then
+      px^ := cx + cw - 1 - of_^.W
+    end
+    if py^ < cy then
+      py^ := cy
+    end
+    if py^ + of_^.H >= cy + ch then
+      py^ := cy + ch - 1 - of_^.H
+    end
+  end CalcPlace
+begin
+  if F.openF # nil then
+    (*
+    To(F,  x, y + h - 1, M);
+    IF M.res >= 0 THEN RETURN END;
+    *)
+    Oberon.RemoveMarks(x, y, w, h)
+    of_ := F.openF(Gadgets.Frame)
+    CalcPlace(@px, @py, M, @h, @of_, @x, @y)
+    Views.GetBlock(px, py, of_.W, of_.H, M.dlink, @block)
+    // Effects.OpenMenu(px, py, of.W, of.H); (* ps - 15.07.96 *)
+
+    CM.id := Display.restore
+    CM.F := nil
+    CM.x := 0
+    CM.y := 0
+    CM.res := -1
+    CM.dlink := nil
+    of_.handle(of_, @CM)
+
+    wasLocked := true
+    if Oberon.New then
+      Objects.Stamp(@A)
+      A.id := Objects.get
+      copy(@A.name, "Locked", 32)
+      A.res := -1
+      A.class := Objects.Inval
+      of_.handle(of_, @A)
+      if (A.res >= 0) & (A.class = Objects.Bool) & ~A.b then
+        // lock it
+        Objects.Stamp(@A)
+        A.id := Objects.set_
+        copy(@A.name, "Locked", 32)
+        A.res := -1
+        A.b := true
+        of_.handle(of_, @A)
+        wasLocked := false
+      end
+    end
+
+    F.poping := true
+    F.px := px - (x + of_.X)
+    F.py := py - (y + h - 1 + of_.Y)
+    of_.mask := nil
+    D.device := Display.screen
+    D.id := Display.full
+    D.F := of_
+    D.res := -1
+    D.x := px - of_.X
+    D.y := py - of_.Y
+    D.dlink := M.dlink
+    of_.handle(of_, @D)
+    Gadgets.MakeMask(of_, px, py, M.dlink, @R)
+    Display3.Copy(R, @R0)
+    Input.Mouse(@M.keys, @M.X, @M.Y)
+    keysum := M.keys
+    ls := nil
+    fstate := F.state // jm
+    F.state := F.state + {Gadgets.lockedcontents}
+    mdlink := M.dlink
+    M.dlink := F
+    fdlink := F.dlink // ps
+    F.dlink := mdlink
+    while (M.keys # {}) & (M.res < 0) do
+      if F.sel then
+        if Effects.Inside(M.X, M.Y, px, py, of_.W, of_.H) then
+          L.F := nil
+          L.loc := nil
+          L.X := M.X
+          L.Y := M.Y
+          L.x := px - F.closedF.X
+          L.y := py - of_.Y
+          L.res := -1
+          Objects.Stamp(@L)
+          L.dlink := nil
+          of_.handle(of_, @L)
+          if (L.loc # nil) & (L.loc # of_) & (L.loc # ls) & HasCmdAttr(L.loc, "Cmd") then
+            DoSelect(L.loc, M, @R0, @ls, @of_, @px, @py)
+          elsif L.loc # ls then
+            DoSelect(nil, M, @R0, @ls, @of_, @px, @py)
+          end
+
+        else
+          DoSelect(nil, M, @R0, @ls, @of_, @px, @py)
+        end
+
+      else
+        M.x := px - of_.X
+        M.y := py - of_.Y
+        of_.handle(of_, M)
+      end
+
+      Input.Mouse(@M.keys, @M.X, @M.Y)
+      keysum := keysum + M.keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+    end
+
+    // IF ls # NIL THEN Select(ls, FALSE) END;
+    F.state := fstate // jm / ps
+    M.dlink := mdlink
+    F.dlink := fdlink
+
+    if Oberon.New & ~wasLocked then
+      Objects.Stamp(@A)
+      A.id := Objects.set_
+      copy(@A.name, "Locked", 32)
+      A.res := -1
+      A.class := Objects.Bool
+      A.b := false
+      of_.handle(of_, @A)
+    end
+
+    Oberon.FadeCursor(@Oberon.Mouse)
+    F.poping := false
+    of_.mask := nil
+    Views.RestoreBlock(block)
+
+    // Effects.CloseMenu;
+    if (ls # nil) & ((keysum = {1}) or Oberon.New & (keysum = {2})) then
+      A.id := Objects.get
+      copy(@A.name, "Cmd", 32)
+      A.res := -1
+      A.class := Objects.Inval
+      ls.handle(ls, @A)
+      if (A.res >= 0) & (A.class = Objects.String) then
+        Gadgets.Execute(@A.s, ls, M.dlink, nil, nil)
+      end
+    end
+
+    M.res := 0
+  else
+    Gadgets.framehandle(F, M)
+  end
+end TrackPopup
+
+procedure PrintIconizer(F: Iconizer; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask
+    d: Display.Frame
+    PM: Display.DisplayMsg
+    Fdlink, Mdlink: Objects.Object
+    x, y, w, h, a, b: int16
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+
+  if F.closed then
+    d := F.closedF
+  else
+    d := F.openF
+  end
+  if d = nil then
+    Printer3.FilledRect3D(R, Display3.FG, Display3.FG, Display3.textbackC, x, y, w, h, P(1), Display.replace)
+    if F.closed then
+      Printer3.CenterString(R, Display3.textC, x, y, w, h, Fonts.Default, "Closed", Display3.textmode)
+    else
+      Printer3.CenterString(R, Display3.textC, x, y, w, h, Fonts.Default, "Open", Display3.textmode)
+    end
+
+  else
+    PM.device := Display.printer
+    PM.id := Display.full
+    PM.x := M.x
+    PM.y := M.y
+    PM.res := -1
+    PM.dlink := M.dlink
+
+    Fdlink := F.dlink
+    Mdlink := PM.dlink
+    F.dlink := PM.dlink
+    PM.dlink := F
+    d.handle(d, @PM)
+    PM.dlink := Mdlink
+    F.dlink := Fdlink
+  end
+
+  if F.pin then
+    a := x + P(offset)
+    b := y + h - P(pinsize + offset)
+    Printer3.FilledRect3D(R, Display3.bottomC, Display3.topC, Display3.groupC, a, b, P(pinsize), P(pinsize), P(1), Display.replace)
+
+    if ~F.closed then
+      Printer3.Line(R, Display.FG, Display.solid, a + P(1), b + P(1), a + P(pinsize - 2i1), b + P(pinsize - 2i1), P(1), Display.replace)
+      Printer3.Line(R, Display.FG, Display.solid, a + P(1), b + P(pinsize - 2i1), a + P(pinsize - 2i1), b + P(1), P(1), Display.replace)
+    end
+  end
+end PrintIconizer
+
+procedure RestoreIconizer(R: Display3.Mask; F: Iconizer; x, y, w, h: int16; dlink: Objects.Object)
+  var
+    d: Display.Frame
+    M: Display.DisplayMsg
+    a, b: int16
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  if F.closed then
+    d := F.closedF
+  else
+    d := F.openF
+  end
+  if d = nil then
+    Display3.FilledRect3D(R, Display3.FG, Display3.FG, Display3.textbackC, x, y, w, h, 1, Display.replace)
+    if F.closed then
+      Display3.CenterString(R, Display3.textC, x, y, w, h, Fonts.Default, "Closed", Display3.textmode)
+    else
+      Display3.CenterString(R, Display3.textC, x, y, w, h, Fonts.Default, "Open", Display3.textmode)
+    end
+
+  else
+    M.device := Display.screen
+    M.id := Display.full
+    M.F := d
+    M.dlink := dlink
+    M.res := -1
+    Objects.Stamp(@M)
+    To(F, x, y + h - 1, @M)
+  end
+
+  if F.pin then
+    a := x + offset
+    b := y + h - pinsize - offset
+    Display3.FilledRect3D(R, Display3.bottomC, Display3.topC, Display3.groupC, a, b, pinsize, pinsize, 1, Display.replace)
+    if ~F.closed then
+      Display3.Line(R, Display.FG, Display.solid, a + 1, b + 1, a + pinsize - 2, b + pinsize - 2, 1, Display.replace)
+      Display3.Line(R, Display.FG, Display.solid, a + 1, b + pinsize - 2, a + pinsize - 2, b + 1, 1, Display.replace)
+    end
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreIconizer
+
+procedure RestoreIconizerArea(R: Display3.Mask; F: Iconizer; x, y, w, h: int16; M: pointer to Display.DisplayMsg)
+  var
+    d: Display.Frame
+    M0: Display.DisplayMsg
+    a, b: int16
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  if F.closed then
+    d := F.closedF
+  else
+    d := F.openF
+  end
+  if d = nil then
+    Display3.FilledRect3D(R, Display3.FG, Display3.FG, Display3.textbackC, x, y, w, h, 1, Display.replace)
+    if F.closed then
+      Display3.CenterString(R, Display3.textC, x, y, w, h, Fonts.Default, "Closed", Display3.textmode)
+    else
+      Display3.CenterString(R, Display3.textC, x, y, w, h, Fonts.Default, "Open", Display3.textmode)
+    end
+
+  else
+    M0 := M^
+    M0.F := d
+    Objects.Stamp(@M0)
+    To(F, x, y + h - 1, @M0)
+  end
+
+  if F.pin then
+    a := x + offset
+    b := y + h - pinsize - offset
+    Display3.FilledRect3D(R, Display3.bottomC, Display3.topC, Display3.groupC, a, b, pinsize, pinsize, 1, Display.replace)
+    if ~F.closed then
+      Display3.Line(R, Display.FG, Display.solid, a + 1, b + 1, a + pinsize - 2, b + pinsize - 2, 1, Display.replace)
+      Display3.Line(R, Display.FG, Display.solid, a + 1, b + pinsize - 2, a + pinsize - 2, b + 1, 1, Display.replace)
+    end
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreIconizerArea
+
+procedure CopyIconizer*(M: pointer to Objects.CopyMsg; from, to_: Iconizer)
+  var
+    C: Objects.CopyMsg
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  to_.pos := from.pos
+  to_.pin := from.pin
+  to_.closed := from.closed
+  to_.popup := from.popup
+  to_.sel := from.sel
+  C.id := Objects.deep
+  C.stamp := M.stamp
+  C.obj := nil
+  if from.openF # nil then
+    from.openF.handle(from.openF, @C)
+    to_.openF := C.obj(Display.Frame)
+  else
+    to_.openF := nil
+  end
+
+  C.id := Objects.deep
+  C.stamp := M.stamp
+  C.obj := nil
+  if from.closedF # nil then
+    from.closedF.handle(from.closedF, @C)
+    to_.closedF := C.obj(Display.Frame)
+  else
+    to_.closedF := nil
+  end
+
+  if to_.closed then
+    to_.obj := to_.closedF
+  else
+    to_.obj := to_.openF
+  end
+end CopyIconizer
+
+procedure StoreIconizer(F: Iconizer; M: pointer to Objects.FileMsg)
+begin
+  Files.WriteNum(@M.R, 3)
+  Gadgets.WriteRef(@M.R, F.lib, F.closedF)
+  Gadgets.WriteRef(@M.R, F.lib, F.openF)
+  if F.closed then
+    Files.WriteNum(@M.R, 1)
+  else
+    Files.WriteNum(@M.R, 0)
+  end
+  if F.popup then
+    Files.WriteNum(@M.R, 1)
+  else
+    Files.WriteNum(@M.R, 0)
+  end
+  if F.sel then
+    Files.WriteNum(@M.R, 1)
+  else
+    Files.WriteNum(@M.R, 0)
+  end
+  if F.pin then
+    Files.WriteNum(@M.R, 1)
+  else
+    Files.WriteNum(@M.R, 0)
+  end
+  Files.WriteBool(@M.R, F.pos)
+  Files.WriteInt(@M.R, F.cX)
+  Files.WriteInt(@M.R, F.cY)
+  Files.WriteInt(@M.R, F.oX)
+  Files.WriteInt(@M.R, F.oY)
+  Gadgets.framehandle(F, M)
+end StoreIconizer
+
+procedure LoadIconizer(F: Iconizer; M: pointer to Objects.FileMsg)
+  var
+    ver, i: int32
+    obj: Objects.Object
+begin
+  Files.ReadNum(@M.R, @ver)
+  if (ver = 2) or (ver = 3) then
+    Gadgets.ReadRef(@M.R, F.lib, @obj)
+    if (obj # nil) & (obj is Display.Frame) then
+      F.closedF := obj(Display.Frame)
+    end
+    Gadgets.ReadRef(@M.R, F.lib, @obj)
+    if (obj # nil) & (obj is Display.Frame) then
+      F.openF := obj(Display.Frame)
+    end
+    Files.ReadNum(@M.R, @i)
+    F.closed := i = 1
+    Files.ReadNum(@M.R, @i)
+    F.popup := i = 1
+    Files.ReadNum(@M.R, @i)
+    F.sel := i = 1
+    if ver = 3 then
+      Files.ReadNum(@M.R, @i)
+      F.pin := i = 1
+    else
+      F.pin := true
+    end
+    Files.ReadBool(@M.R, @F.pos)
+    Files.ReadInt(@M.R, @F.cX)
+    Files.ReadInt(@M.R, @F.cY)
+    Files.ReadInt(@M.R, @F.oX)
+    Files.ReadInt(@M.R, @F.oY)
+    Gadgets.framehandle(F, M)
+  elsif ver = 1 then
+    // oldversion
+    Gadgets.ReadRef(@M.R, F.lib, @obj)
+    if (obj # nil) & (obj is Display.Frame) then
+      F.closedF := obj(Display.Frame)
+    end
+    Gadgets.ReadRef(@M.R, F.lib, @obj)
+    if (obj # nil) & (obj is Display.Frame) then
+      F.openF := obj(Display.Frame)
+    end
+    Files.ReadNum(@M.R, @i)
+    F.closed := i = 1
+    Files.ReadNum(@M.R, @i)
+    F.popup := i = 1
+    Files.ReadNum(@M.R, @i)
+    F.sel := i = 1
+    F.pos := false
+    F.pin := true
+    Gadgets.framehandle(F, M)
+  else
+    halt(42)
+  end
+
+  if F.closed & (F.closedF # nil) then
+    F.obj := F.closedF
+  elsif F.openF # nil then
+    F.obj := F.openF
+  end
+end LoadIconizer
+
+procedure UpdateMask(F: Iconizer; x, y, w, h: int16; M: pointer to Display3.UpdateMaskMsg)
+  var
+    O: Display3.OverlapMsg
+    U: Display3.UpdateMaskMsg
+begin
+  if M.F = F then
+  elsif (F.mask = nil) & ((M.F = F.openF) or (M.F = F.closedF)) then
+    U.F := F
+    Display.Broadcast(@U)
+  elsif F.poping & ((M.F = F.openF) or (M.F = F.closedF)) then
+    newgc(O.M)
+    Display3.Open(O.M)
+    Display3.Add(O.M, 0, -M.F.H + 1, M.F.W, M.F.H)
+    O.F := M.F
+    O.res := -1
+    O.x := 0
+    O.y := 0
+    O.dlink := nil
+    M.F.handle(M.F, @O)
+    M.res := 0
+  elsif (M.F = F.openF) & (F.mask # nil) then
+    Display3.Copy(F.mask, @O.M)
+    O.M.x := 0
+    O.M.y := 0
+    if F.pin then
+      Display3.Subtract(O.M, offset, -pinsize + 1i1 - offset, pinsize, pinsize)
+    end
+    O.F := F.openF
+    O.res := -1
+    O.x := 0
+    O.y := 0
+    O.dlink := nil
+    F.openF.handle(F.openF, @O)
+    M.res := 0
+  elsif (M.F = F.closedF) & (F.mask # nil) then
+    Display3.Copy(F.mask, @O.M)
+    O.M.x := 0
+    O.M.y := 0
+    if F.pin then
+      Display3.Subtract(O.M, offset, -pinsize + 1i1 - offset, pinsize, pinsize)
+    end
+    O.F := F.closedF
+    O.res := -1
+    O.x := 0
+    O.y := 0
+    O.dlink := nil
+    F.closedF.handle(F.closedF, @O)
+    M.res := 0
+  else
+    To(F, x, y + h - 1, M)
+  end
+end UpdateMask
+
+procedure TrackIconizer(F: Iconizer; x, y, w, h: int16; M: pointer to Oberon.InputMsg)
+  var
+    R: Display3.Mask
+    stack: StackDesc
+begin
+  if (M.id = Oberon.track) & ~(Gadgets.selected in F.state) & Effects.Inside(M.X, M.Y, x, y, w, h) then
+    if ((M.keys = {1}) or Oberon.New & (M.keys = {2})) & F.pin & Effects.Inside(M.X, M.Y, x + offset, y + h - pinsize - offset, pinsize, pinsize) then
+      Gadgets.MakeMask(F, x, y, M.dlink, @R)
+      TrackHighlight(R, @M.X, @M.Y, x + offset + 1, y + h - pinsize - offset + 1, pinsize - 2i1, pinsize - 2i1, @M.keys)
+      if Effects.Inside(M.X, M.Y, x + offset + 1, y + h - pinsize - offset + 1, pinsize - 2i1, pinsize - 2i1) & ((M.keys = {1}) or Oberon.New & (M.keys = {2})) then
+
+        Push(@stack, F)
+        Flip()
+        Pop(@stack)
+      end
+
+      M.res := 0
+    elsif F.popup & ((M.keys = {1}) or Oberon.New & (M.keys = {2})) & F.closed & Gadgets.InActiveArea(F, M) then
+      TrackPopup(F, x, y, w, h, M)
+    elsif (F.obj # nil) & Gadgets.InActiveArea(F, M) & ~(Gadgets.selected in F.state) then
+      Push(@stack, F)
+      To(F, x, y + h - 1, M)
+      Pop(@stack)
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Oberon.track then
+    if Gadgets.selected in F.state then
+      Gadgets.framehandle(F, M)
+    else
+      Push(@stack, F)
+      To(F, x, y + h - 1, M)
+      Pop(@stack)
+      if M.res < 0 then
+        Gadgets.framehandle(F, M)
+      end
+    end
+
+  else
+    Push(@stack, F)
+    To(F, x, y + h - 1, M)
+    Pop(@stack)
+    if M.res < 0 then
+      Gadgets.framehandle(F, M)
+    end
+  end
+end TrackIconizer
+
+procedure IconizerHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h, u, v: int16
+    d: Display.Frame
+    F0: Iconizer
+    R: Display3.Mask
+    O: Display3.OverlapMsg
+    PM: Gadgets.PriorityMsg
+begin
+  case F of
+  | Iconizer:
+    case M of
+    | Objects.PAttrMsg:
+      IconizerAttr(F, M(Objects.PAttrMsg))
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        StoreIconizer(F, M)
+      elsif M.id = Objects.load then
+        LoadIconizer(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyIconizer(M, F, F0)
+        M.obj := F0
+      end
+
+    | Objects.PLinkMsg:
+      IconizerLink(F, M(Objects.PLinkMsg))
+    | Objects.PBindMsg:
+      Gadgets.framehandle(F, M)
+      if F.closedF # nil then
+        F.closedF.handle(F.closedF, M)
+      end
+      if F.openF # nil then
+        F.openF.handle(F.openF, M)
+      end
+    | Objects.PFindMsg:
+      Gadgets.framehandle(F, M)
+      if M.obj = nil then
+        if F.closedF # nil then
+          F.closedF.handle(F.closedF, M)
+        end
+        if F.openF # nil then
+          F.openF.handle(F.openF, M)
+        end
+      end
+
+    | Display.PFrameMsg:
+      x := M.x + F.X // calculate actual coordinates
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      u := M.x // store volatile info
+      v := M.y
+      M1 := M
+      case M1 of
+      | Display.PDisplayMsg:
+        if M1.device = Display.screen then
+          if (M1.F = nil) or (M1.id = Display.full) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            RestoreIconizer(R, F, x, y, w, h, M1.dlink)
+          elsif (M1.id = Display.area) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            Display3.AdjustMask(R, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+            RestoreIconizerArea(R, F, x, y, w, h, M1)
+          else
+            if F.closed then
+              d := F.closedF
+            else
+              d := F.openF
+            end
+            if (d # nil) & (M1.F = d) & (d is Gadgets.Frame) & (Gadgets.transparent in d(Gadgets.Frame).state) then
+              F.state := F.state + {Gadgets.transparent}
+              Gadgets.Update(F)
+            else
+              To(F, x, y + h - 1, M1)
+            end
+          end
+
+        elsif M1.device = Display.printer then
+          PrintIconizer(F, M1)
+        else
+          To(F, x, y + h - 1, M1)
+        end
+
+      | Display.PLocateMsg:
+        LocateIconizer(F, M1(Display.PLocateMsg))
+      | Display.PConsumeMsg:
+        // ps - 8.5.96
+        if (M1.id = Display.drop) & (M1.F = F) then
+          ConsumeIconizer(F, M1)
+        else
+          To(F, x, y + h - 1, M1)
+        end
+
+      | Display3.POverlapMsg:
+        if (M1.F = nil) or (M1.F = F) then
+          F.mask := M1.M
+          if F.obj # nil then
+            O.F := F.obj(Gadgets.Frame)
+            O.res := -1
+            O.x := 0
+            O.y := 0
+            O.dlink := nil
+            if F.mask = nil then
+              O.M := nil
+              F.obj.handle(F.obj, @O)
+            else
+              Display3.Copy(M1.M, @O.M)
+              O.M.x := 0
+              O.M.y := 0
+              if F.pin then
+                Display3.Subtract(O.M, offset, -pinsize + 1i1 - offset, pinsize, pinsize)
+              end
+              F.obj.handle(F.obj, @O)
+            end
+          end
+
+          M1.res := 0
+        end
+
+      | Gadgets.PUpdateMsg:
+        To(F, x, y + h - 1, M1)
+        Gadgets.framehandle(F, M1)
+      | Display3.PUpdateMaskMsg:
+        UpdateMask(F, x, y, w, h, M1(Display3.PUpdateMaskMsg))
+      | Display.PSelectMsg:
+        if ((M1.F = nil) or (M1.F = F)) & ((M1.id = Display.set_) or (M1.id = Display.reset)) then
+          Gadgets.framehandle(F, M1)
+        else
+          To(F, x, y + h - 1, M1)
+        end
+
+      | Oberon.PInputMsg:
+        if M1.id = Oberon.track then
+          TrackIconizer(F, x, y, w, h, M1)
+        else
+          To(F, x, y + h - 1, M1)
+        end
+
+      | Gadgets.PPriorityMsg:
+        if M1.F = F.obj then
+          PM.id := M1.id
+          PM.F := F
+          Display.Broadcast(@PM)
+        else
+          To(F, x, y + h - 1, M1)
+        end
+
+      | Display.PModifyMsg:
+        if M1.F = F then
+          AdjustIconizer(F, M1)
+        elsif (M1.F = F.closedF) or (M1.F = F.openF) then
+          AdjustIconizerChild(F, M1)
+        else
+          To(F, x, y + h - 1, M1)
+        end
+
+      else
+        To(F, x, y + h - 1, M1)
+      end
+
+      M.x := u // restore volatile info
+      M.y := v
+
+    else
+      if F.closed then
+        d := F.closedF
+      else
+        d := F.openF
+      end
+      if d # nil then
+        d.handle(d, M)
+      end
+    end
+  end
+end IconizerHandler
+
+// Initialize an iconizer from the frames open and close.
+procedure MakeIconizer*(F: Iconizer; close, open: Display.Frame)
+begin
+  F.closed := true
+  F.poping := false
+  F.obj := close
+  F.W := 40
+  F.H := 40
+  F.handle := IconizerHandler
+  F.closedF := close
+  F.openF := open
+  F.pin := true
+  if close # nil then
+    F.W := close.W
+    F.H := close.H
+    close.X := 0
+    close.Y := -close.H + 1
+  end
+
+  if open # nil then
+    open.X := 0
+    open.Y := -open.H + 1
+  end
+end MakeIconizer
+
+procedure NewIconizer*()
+  var
+    F: Iconizer
+begin
+  newgc(F)
+  F.closed := true
+  F.pin := true
+  F.W := 40
+  F.H := 40
+  F.handle := IconizerHandler
+  Objects.NewObj := F
+end NewIconizer
+
+// Takes the selected iconizer/icon apart and insert the constituents at the caret.
+procedure Break*()
+  var
+    M: Display.SelectMsg
+    t: Display.Frame
+    I: Icon
+    F: Iconizer
+    X: int16
+begin
+  M.F := nil
+  M.id := Display.get
+  M.time := -1
+  M.obj := nil
+  Display.Broadcast(@M)
+  if (M.time > 0) & (M.obj # nil) then
+    if M.obj is Icon then
+      I := M.obj(Icon)
+      if (I.obj # nil) & (I.obj is Display.Frame) then
+        t := I.obj(Display.Frame)
+        I.obj := nil
+        Gadgets.Update(I)
+        Gadgets.Integrate(t)
+      end
+
+    elsif M.obj is Iconizer then
+      F := M.obj(Iconizer)
+      t := nil
+      X := 0
+      if F.openF # nil then
+        F.openF.slink := t
+        t := F.openF
+        F.openF := nil
+        t.X := X
+        t.Y := 0
+        inc(X, t.W + 5)
+      end
+
+      if F.closedF # nil then
+        F.closedF.slink := t
+        t := F.closedF
+        F.closedF := nil
+        t.X := X
+        t.Y := 0
+      end
+
+      if t # nil then
+        Gadgets.Integrate(t)
+        Gadgets.Update(F)
+      end
+
+      F.obj := nil
+    end
+  end
+end Break
+
+// ---------------------- Making an icon out of a document -------------
+
+// Initialize a new icon for a document. Icon should be in "Library.ObjName" format. The Cmd attribute is initialized to "Desktops.OpenDoc '#Caption '".
+procedure CreateIcon*(F: Icon; const caption, icon: pointer to array of char)
+  var
+    A: Objects.AttrMsg
+    obj: Objects.Object
+begin
+  obj := Gadgets.FindPublicObj(icon)
+  if obj # nil then
+    MakeIcon(F, caption, ViewOf(obj(Gadgets.Frame)))
+  else
+    MakeIcon(F, caption, nil)
+  end
+
+  A.id := Objects.set_
+  copy(@A.name, "Cmd", 32)
+  A.class := Objects.String
+  copy(@A.s, "Desktops.OpenDoc '#Caption '", 64)
+  A.res := -1
+  F.handle(F, @A)
+end CreateIcon
+
+// Inserts an Icon for the marked document at the caret.
+procedure InsertIcon*()
+  var
+    F: Icon
+    A: Objects.AttrMsg
+    iconname: array 64 of char
+    D: Documents.Document
+begin
+  D := Documents.MarkedDoc()
+  if D # nil then
+    copy(@iconname, "Icons.Moon", 64)
+    A.id := Objects.get
+    copy(@A.name, "Icon", 32)
+    A.class := Objects.Inval
+    copy(@A.s, "", 64)
+    A.res := -1
+    D.handle(D, @A)
+    if (A.res >= 0) & (A.class = Objects.String) then
+      copy(@iconname, @A.s, 64)
+    end
+    newgc(F)
+    CreateIcon(F, @D.name, @iconname)
+    Gadgets.Integrate(F)
+  end
+end InsertIcon
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewView" end return NewView end
+  if i = 1 then if name # nil then name^ := "NewIcon" end return NewIcon end
+  if i = 2 then if name # nil then name^ := "Flip" end return Flip end
+  if i = 3 then if name # nil then name^ := "NewIconizer" end return NewIconizer end
+  if i = 4 then if name # nil then name^ := "Break" end return Break end
+  if i = 5 then if name # nil then name^ := "InsertIcon" end return InsertIcon end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Icons", cmd_)
+  Texts.OpenWriter(@W)
+  top := nil
+end Icons.

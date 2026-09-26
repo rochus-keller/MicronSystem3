@@ -1,0 +1,439 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Organizers [level=5]
+
+import Objects, Display, Effects, Gadgets, Panels, Oberon, Strings, Modules
+// portable
+// jm 8.12.94
+
+(*
+This is an example of a Panel extension. It uses simple constraints attached as attributes to its direct contents
+to calculate a new layout when the panel is resized. It uses a strategy by Luca Cardelli, and described
+in his paper "Building User Interfaces by Direct Manipulation", DEC, 1987.
+
+Four wires are strung between the four sides of a descendant and an edge of the panel. The horizontal sides
+of the child gadget are attached to the top or bottom of the panel, and the vertical sides to the left or the right.
+The length of the four wires are given as four numbers in the "Constraint" attribute. Positive numbers strung the
+wire "outward" and negative numbers "over the gadget".
+
+That is
+
+Gadgets.ChangeAttr Constraints "10 20 10 10" ~
+
+sets a constraint where the left edge of the gadget is 10 pixels from the left of the panel, the top edge 20 pixels
+from the panel top, the right edge 10 pixels from the panel right, and the bottom edge 10 pixels from the panel
+bottom. Thus the sequence of numbers are left, top, right, and bottom distances.
+
+Changing the 20 to -20 attaches the top edge of the gadget 20 pixels from the bottom of the panel.
+Get the idea? The mechanism is quite flexible, although I am sure you will want more!
+
+Gadgets.Exchange flips the marked panel between an organizer and a normal panel. This works on panel
+documents too. An example document built with Organizers is "TestOrganizer.Panel".
+
+Hannes Marais, 9.12.94
+*)
+
+const
+  outofboundsmodify = 3
+  DontCare = 2147483647
+
+var
+  methods: Panels.Methods
+
+procedure Parse(const s: pointer to array of char; l, t, r, b: pointer to int32)
+  var
+    p: array 64 of char
+    i, j: int16
+
+  procedure ReadNum(i: pointer to int16; j: pointer to int16; p: pointer to array 64 of char; s: pointer to array of char): int32
+    var
+      x: int32
+  begin
+    while (s[i^] # 0X) & (s[i^] <= " ") do
+      inc(i^)
+    end
+    if s[i^] = 0X then
+      return 0
+    elsif ((s[i^] < "0") or (s[i^] > "9")) & (s[i^] # "-") then
+      inc(i^)
+      return DontCare
+    end
+
+    j^ := 0
+    while (s[i^] # 0X) & (s[i^] > " ") do
+      p[j^] := s[i^]
+      inc(i^)
+      inc(j^)
+    end
+    p[j^] := 0X
+    Strings.StrToInt(p, @x)
+    return x
+  end ReadNum
+begin
+  i := 0
+  l^ := ReadNum(@i, @j, @p, s)
+  t^ := ReadNum(@i, @j, @p, s)
+  r^ := ReadNum(@i, @j, @p, s)
+  b^ := ReadNum(@i, @j, @p, s)
+end Parse
+
+procedure HasConstraints*(f: Display.Frame; l, t, r, b: pointer to int32): boolean
+  var
+    A: Objects.AttrMsg
+begin
+  A.id := Objects.get
+  copy(@A.name, "Constraints", 32)
+  A.res := -1
+  f.handle(f, @A)
+  if (A.res >= 0) & (A.class = Objects.String) & (A.s # "") then
+    Parse(@A.s, l, t, r, b)
+    return true
+  else
+    return false
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end HasConstraints
+
+procedure SolveGadget*(PW, PH: int16; f: Display.Frame; l, t, r, b: int32; X, Y, W, H: pointer to int16)
+  var
+    ll, tt, rr, bb: int32
+begin
+  if l = DontCare then
+    ll := f.X
+  elsif l >= 0 then
+    ll := l
+  else
+    ll := PW + l
+  end
+  if r = DontCare then
+    rr := f.X + f.W - 1
+  elsif r >= 0 then
+    rr := PW - 1 - r
+  else
+    rr := abs(r)
+  end
+  if t = DontCare then
+    tt := f.Y + f.H - 1
+  elsif t >= 0 then
+    tt := -t
+  else
+    tt := -PH - t
+  end
+  if b = DontCare then
+    bb := f.Y
+  elsif b >= 0 then
+    bb := -PH + 1 + b
+  else
+    bb := b
+  end
+
+  if (l = DontCare) & (r # DontCare) then
+    ll := rr - f.W + 1
+  elsif (l # DontCare) & (r = DontCare) then
+    rr := ll + f.W - 1
+  end
+
+  if (t = DontCare) & (b # DontCare) then
+    tt := bb + f.H - 1
+  elsif (t # DontCare) & (b = DontCare) then
+    bb := tt - f.H + 1
+  end
+
+  X^ := val(int16, ll)
+  Y^ := val(int16, bb)
+
+  if Gadgets.lockedsize in f(Gadgets.Frame).state then
+    W^ := f.W
+    H^ := f.H
+  else
+    W^ := val(int16, rr) - X^ + 1
+    H^ := val(int16, tt) - Y^ + 1
+  end
+end SolveGadget
+
+procedure Solve*(F: Panels.Panel; dX, dY, W, H, mode: int16)
+  var
+    f: Display.Frame
+    l, t, r, b: int32
+    M: Display.ModifyMsg
+begin
+  f := F.dsc
+  while f # nil do
+    if HasConstraints(f, @l, @t, @r, @b) then
+      SolveGadget(W, H, f, l, t, r, b, @M.X, @M.Y, @M.W, @M.H)
+      if (M.W > 0) & (M.H > 0) then
+        inc(M.X, dX)
+        inc(M.Y, dY)
+        M.id := outofboundsmodify
+        M.F := f
+        M.mode := Display.state
+        M.dX := M.X - f.X
+        M.dY := M.Y - f.Y
+        M.dW := M.W - f.W
+        M.dH := M.H - f.H
+        Objects.Stamp(@M)
+        M.res := -1
+        M.dlink := nil
+        M.x := 0
+        M.y := 0
+        f.handle(f, @M)
+      end
+    end
+
+    f := f.next
+  end
+end Solve
+
+procedure Handler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    l, t, r, b: int32
+    oX, oY, oW, oH, mode: int16
+    f: Objects.Object
+    A: Display.ModifyMsg
+begin
+  case F of
+  | Panels.Panel:
+    case M of
+    | Display.PModifyMsg:
+      if (M.F = F) & ((M.W # F.W) or (M.H # F.H)) then
+        if ((M.dH = 0) or (M.Y + M.H = F.Y + F.H)) & ((M.dW = 0) or (M.X = F.X)) then
+          Solve(F, M.X - F.X, M.Y + M.H - F.Y - F.H, M.W, M.H, M.mode)
+          Panels.PanelHandler(F, M)
+        else
+          mode := M.mode
+          M.mode := Display.state
+          Panels.PanelHandler(F, M)
+          Solve(F, M.X - F.X, M.Y + M.H - F.Y - F.H, M.W, M.H, M.mode)
+          if mode = Display.display then
+            Gadgets.Update(F)
+          end
+        end
+
+      elsif Panels.IsChild(F, M.F) & (M.id # outofboundsmodify) then
+        // not send to self
+        if HasConstraints(M.F, @l, @t, @r, @b) then
+          oX := M.F.X
+          oY := M.F.Y
+          oW := M.F.W
+          oH := M.F.H
+          M.F.X := M.X
+          M.F.Y := M.Y
+          M.F.W := M.W
+          M.F.H := M.H
+          SolveGadget(F.W, F.H, M.F, l, t, r, b, @M.X, @M.Y, @M.W, @M.H)
+          M.F.X := oX
+          M.F.Y := oY
+          M.F.W := oW
+          M.F.H := oH
+          M.dX := M.X - M.F.X
+          M.dY := M.Y - M.F.Y
+          M.dW := M.W - M.F.W
+          M.dH := M.H - M.F.H
+        end
+
+        Panels.PanelHandler(F, M)
+      else
+        Panels.PanelHandler(F, M)
+      end
+
+    | Gadgets.PUpdateMsg:
+      // when an attribute changes
+      Panels.PanelHandler(F, M) // forward
+      f := M.obj
+      if (f is Gadgets.Frame) & Panels.IsChild(F, f(Gadgets.Frame)) then
+        case f of
+        | Gadgets.Frame:
+          if HasConstraints(f, @l, @t, @r, @b) then
+            SolveGadget(F.W, F.H, f, l, t, r, b, @A.X, @A.Y, @A.W, @A.H)
+            if (A.X # f.X) or (A.Y # f.Y) or (A.W # f.W) or (A.H # f.H) then
+              A.id := outofboundsmodify
+              A.F := f
+              A.mode := Display.display
+              A.dX := A.X - f.X
+              A.dY := A.Y - f.Y
+              A.dW := A.W - f.W
+              A.dH := A.H - f.H
+              Display.Broadcast(@A)
+            end
+          end
+        end
+      end
+
+    | Objects.PAttrMsg:
+      if (M.id = Objects.get) & (M.name = "Gen") then
+        copy(@M.s, "Organizers.NewPanel", 64)
+        M.class := Objects.String
+        M.res := 0
+      elsif (M.id = Objects.set_) & (M.name = "Locked") then
+        Panels.PanelHandler(F, M)
+        F.state := F.state - {Gadgets.lockedsize}
+      else
+        Panels.PanelHandler(F, M)
+      end
+
+    else
+      Panels.PanelHandler(F, M)
+    end
+  end
+end Handler
+
+(*PROCEDURE RestoreBackGround(F: Panels.Panel; x, y: INTEGER; R: Display3.Mask);
+BEGIN
+Panels.methods.RestoreBackGround(F, x, y, R);
+Display3.Line(R, Display.FG, Display.solid, x + 1, y + F.H - 11, x + 10, y + F.H - 2, 1, Display.replace);
+Display3.Line(R, Display.BG, Display.solid, x + 1, y + F.H - 12, x + 10, y + F.H - 3, 1, Display.replace)
+END RestoreBackGround;*)
+
+procedure InsertChild(F: Panels.Panel; f: Display.Frame; u, v: int16)
+  var
+    l, t, r, b: int32
+    x, y, w, h: int16
+begin
+  if HasConstraints(f, @l, @t, @r, @b) then
+    SolveGadget(F.W, F.H, f, l, t, r, b, @x, @y, @w, @h)
+    if (w > 0) & (h > 0) then
+      u := x
+      v := y
+      f.W := w
+      f.H := h
+    end
+  end
+
+  Panels.methods.InsertChild(F, f, u, v)
+end InsertChild
+
+procedure TrackMouse(F: Panels.Panel; M: pointer to Oberon.InputMsg)
+  var
+    T: Display.Frame
+    x, y, t, u, v: int16
+    d: int32
+    Fdlink, Mdlink: Objects.Object
+    flags: set
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  t := y + F.H - 1
+  T := Panels.ThisChild(F, x, y, M.X, M.Y)
+
+  if T # nil then
+    Effects.SetSnap(x, t, F.grid, F.grid)
+    if HasConstraints(T, @d, @d, @d, @d) then
+      // simulated a locked environment
+      flags := F.state
+      F.state := F.state + {Gadgets.lockedcontents}
+      Panels.ToChild(F, T, x, y, M)
+      F.state := flags
+    else
+      Panels.ToChild(F, T, x, y, M)
+    end
+
+    Effects.SetSnap(0, 0, 1, 1)
+  end
+
+  if M.res < 0 then
+    Effects.SetSnap(x, t, F.grid, F.grid)
+    if 2 in M.keys then
+      // left
+      if ~(Panels.noinsert in F.state0) then
+        F.do_.TrackCaret(F, M)
+      end
+    elsif 1 in M.keys then
+      // middle
+      if (T # nil) & (Gadgets.selected in T(Gadgets.Frame).state) then
+        case T of
+        | Gadgets.Frame:
+          if Effects.InCorner(M.X, M.Y, x + T.X, t + T.Y, T.W, T.H) & ~(Gadgets.lockedsize in T.state) then
+            u := M.x
+            v := M.y
+            M.x := x
+            M.y := t
+            Fdlink := F.dlink
+            Mdlink := M.dlink
+            F.dlink := M.dlink
+            M.dlink := F
+            Gadgets.SizeFrame(T, M)
+            F.dlink := Fdlink
+            M.dlink := Mdlink
+            M.x := u
+            M.y := v
+            M.res := 0
+          else
+            F.do_.DragSelection(F, M)
+          end
+        end
+      end
+
+    elsif 0 in M.keys then
+      // right
+      if ~(Panels.noselect in F.state0) then
+        if T = nil then
+          F.do_.TrackSelection(F, M)
+        else
+          F.do_.TrackSelectChild(F, M, T(Gadgets.Frame))
+        end
+      end
+    end
+
+    Effects.SetSnap(0, 0, 1, 1)
+  end
+end TrackMouse
+
+procedure InitPanel*(F: Panels.Panel)
+begin
+  Panels.InitPanel(F)
+  F.handle := Handler
+  F.do_ := methods
+end InitPanel
+
+procedure NewPanel*()
+  var
+    p: Panels.Panel
+begin
+  newgc(p)
+  InitPanel(p)
+  Objects.NewObj := p
+end NewPanel
+
+// Make a normal panel into a organizer, and vice versa
+procedure Exchange*()
+  var
+    F: Display.Frame
+begin
+  if Oberon.Pointer.on then
+    F := Oberon.MarkedFrame()
+    if (F # nil) & (F is Panels.Panel) then
+      case F of
+      | Panels.Panel:
+        if F.do_ # methods then
+          F.handle := Handler
+          F.do_ := methods
+          Solve(F, 0, 0, F.W, F.H, Display.state)
+          Gadgets.Update(F)
+        else
+          F.handle := Panels.PanelHandler
+          F.do_ := Panels.methods
+          Gadgets.Update(F)
+        end
+      end
+    end
+  end
+end Exchange
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewPanel" end return NewPanel end
+  if i = 1 then if name # nil then name^ := "Exchange" end return Exchange end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Organizers", cmd_)
+  newgc(methods)
+  methods^ := Panels.methods^
+  // methods.RestoreBackGround := RestoreBackGround;
+  methods.InsertChild := InsertChild
+  methods.TrackMouse := TrackMouse
+end Organizers.

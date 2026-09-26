@@ -1,0 +1,796 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module RefGadgets [level=5]
+
+import Files, Display, Display3, Printer, Printer3, Effects, Objects, Attributes, Texts, Gadgets, Oberon, Modules
+// portable
+// PS
+
+// Gadget providing drag and drop facilities.
+
+(*
+27.6.96 - added Create command (thanks eos)
+*)
+
+type
+  Reference* = pointer to ReferenceDesc
+  ReferenceDesc* = object (Gadgets.ObjDesc)
+    val_*: Objects.Object
+  end
+
+  Frame* = pointer to FrameDesc
+  FrameDesc* = object (Gadgets.FrameDesc)
+    val_*: Objects.Object
+    locked*: boolean // refuse drops & copy over nor allow delete
+    canDrag*: boolean // allow dragging
+  end
+
+var
+  W: Texts.Writer
+
+// Appends current content of writer to the Oberon log
+procedure ToLog()
+begin
+  Texts.Append(Oberon.Log, W.buf)
+end ToLog
+
+// ------------------------ model stuff ------------------------
+
+// Copies a Reference-Object
+procedure CopyReference*(M: pointer to Objects.CopyMsg; from, to_: Reference)
+begin
+  Gadgets.CopyObject(M, from, to_)
+  to_.val_ := from.val_
+end CopyReference
+
+procedure ReferenceHandler*(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    obj2: Reference
+begin
+  case obj of
+  | Reference:
+    case M of
+    | Objects.PAttrMsg:
+      if (M.id = Objects.get) & (M.name = "Gen") then
+        copy(@M.s, "RefGadgets.NewReference", 64)
+        M.class := Objects.String
+        M.res := 0
+      else
+        Gadgets.objecthandle(obj, M)
+      end
+
+    | Objects.PLinkMsg:
+      if M.id = Objects.get then
+        if M.name = "Value" then
+          M.obj := obj.val_
+          M.res := 0
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if M.name = "Value" then
+          obj.val_ := M.obj
+          M.res := 0
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.enum then
+        M.Enum("Value")
+        Gadgets.objecthandle(obj, M)
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Gadgets.WriteRef(@M.R, obj.lib, obj.val_)
+        Gadgets.objecthandle(obj, M)
+      elsif M.id = Objects.load then
+        Gadgets.ReadRef(@M.R, obj.lib, @obj.val_)
+        Gadgets.objecthandle(obj, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = obj.stamp then
+        M.obj := obj.dlink
+      else
+        newgc(obj2)
+        obj.stamp := M.stamp
+        obj.dlink := obj2
+        CopyReference(M, obj, obj2)
+        M.obj := obj2
+      end
+
+    | Objects.PBindMsg:
+      Gadgets.objecthandle(obj, M)
+      if obj.val_ # nil then
+        obj.val_.handle(obj.val_, M)
+      end
+    else
+      Gadgets.objecthandle(obj, M)
+    end
+  end
+end ReferenceHandler
+
+procedure InitReference*(obj: Reference)
+begin
+  obj.handle := ReferenceHandler
+  obj.val_ := nil
+end InitReference
+
+procedure NewReference*()
+  var
+    obj: Reference
+begin
+  newgc(obj)
+  InitReference(obj)
+  Objects.NewObj := obj
+end NewReference
+
+// ------------------------ frame stuff ------------------------
+
+// sets 'Frame's model to same value
+procedure SetFrameModel(F: Frame)
+begin
+  if (F.obj # nil) & (F.obj is Reference) then
+    F.obj(Reference).val_ := F.val_
+  end
+end SetFrameModel
+
+// sets 'Frame's value to model's value
+procedure UpdateFrameModel(F: Frame)
+begin
+  if (F.obj # nil) & (F.obj is Reference) then
+    F.val_ := F.obj(Reference).val_
+  end
+end UpdateFrameModel
+
+(* Handles attributes of 'Frame'. Memory for attributes 'Cmd' and 'ConsumeCmd' is allocated when needed
+(by Gdagtes default handler). They will be simulated if none really exists. *)
+procedure FrameAttrs(F: Frame; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "RefGadgets.NewFrame", 64)
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      // makes it appear better in texts
+      M.class := Objects.Int
+      M.i := asr(F.H, 1) - 5
+      M.res := 0
+    elsif M.name = "Cmd" then
+      Gadgets.framehandle(F, M)
+      if M.res < 0 then
+        // no such attribute, simulate one
+        M.class := Objects.String
+        copy(@M.s, "", 64)
+        M.res := 0
+      end
+
+    elsif M.name = "ConsumeCmd" then
+      Gadgets.framehandle(F, M)
+      if M.res < 0 then
+        // no such attribute, simulate one
+        M.class := Objects.String
+        copy(@M.s, "", 64)
+        M.res := 0
+      end
+
+    elsif M.name = "Locked" then
+      M.class := Objects.Bool
+      M.b := F.locked
+      M.res := 0
+    elsif M.name = "Drag" then
+      M.class := Objects.Bool
+      M.b := F.canDrag
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Drag" then
+      if M.class = Objects.Bool then
+        F.canDrag := M.b
+        M.res := 0
+      end
+
+    elsif M.name = "Locked" then
+      if M.class = Objects.Bool then
+        F.locked := M.b
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Cmd")
+    M.Enum("ConsumeCmd")
+    M.Enum("Locked")
+    M.Enum("Drag")
+    Gadgets.framehandle(F, M)
+  end
+end FrameAttrs
+
+// Handles links of 'Frame'.
+procedure FrameLinks(F: Frame; M: pointer to Objects.LinkMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Value" then
+      M.obj := F.val_
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Value" then
+      F.val_ := M.obj
+      M.res := 0
+      if F.obj # nil then
+        SetFrameModel(F)
+        Gadgets.Update(F.obj)
+      end
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Value")
+    Gadgets.framehandle(F, M)
+  end
+end FrameLinks
+
+// Draws a 'Frame' gadget. Switch 'pressed' indicates the gadget's state
+procedure Restore(F: Frame; Q: Display3.Mask; x, y, w, h: int16; pressed: boolean)
+  var
+    x0, y0, r, r0: int16
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  Display3.FilledRect3D(Q, Display3.bottomC, Display3.topC, Display3.textbackC, x, y, w, h, 1, Display.replace)
+  if w < h then
+    r := w
+  else
+    r := h
+  end
+  r0 := asr(r - 8, 1)
+  if F.val_ # nil then
+    if pressed then
+      x0 := 1
+      y0 := -1
+      Display3.FilledRect3D(Q, Display3.downC, Display3.upC, Display3.upC, x + 3, y + 3, w - 6, h - 6, 1, Display.replace)
+    else
+      x0 := 0
+      y0 := 0
+      Display3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.upC, x + 3, y + 3, w - 6, h - 6, 1, Display.replace)
+    end
+
+    (* Draw a rectangle if model is of type 'Display.Frame', a filled rectangle if it is of type 'Gadgets.Frame'.
+    If model is of type 'Gadgets.Object' draw a filled circle, in all other cases an empty circle *)
+    if F.val_ is Display.Frame then
+      inc(x0, x + asr(w - r0 + 1, 1))
+      inc(y0, y + asr(h - r0 + 1, 1))
+      Display3.ReplConst(Q, Display3.black, x0, y0, r0, r0, Display.replace)
+    else
+      inc(x0, x + asr(w + 1, 1))
+      inc(y0, y + asr(h + 1, 1))
+      r0 := asr(r0, 1)
+      Display3.Circle(Q, Display3.black, Display.solid, x0, y0, r0, 1, {Display3.filled}, Display.replace)
+    end
+
+  else
+    x0 := x + asr(w - r0 + 1, 1)
+    y0 := y + asr(h - r0 + 1, 1)
+    dec(r0)
+    Display3.Line(Q, Display3.black, Display.solid, x0, y0, x0 + r0, y0 + r0, 2, Display.replace)
+    Display3.Line(Q, Display3.black, Display.solid, x0, y0 + r0, x0 + r0, y0, 2, Display.replace)
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(Q, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end Restore
+
+// Prints a 'Frame' gadget
+procedure Print(F: Frame; M: pointer to Display.DisplayMsg)
+  var
+    Q: Display3.Mask
+    x, y, w, h, r, x0, y0, r0: int16
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @Q)
+  Printer3.FilledRect3D(Q, Display3.bottomC, Display3.topC, Display3.textbackC, x, y, w, h, 1, Display.replace)
+  if w < h then
+    r := w
+  else
+    r := h
+  end
+  r0 := asr(r - P(8), 1)
+  if F.val_ # nil then
+    Printer3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.upC, x + P(3), y + P(3), w - P(6), h - P(6), 1, Display.replace)
+
+    if F.val_ is Display.Frame then
+      x0 := x + asr(w - r0 + 1, 1)
+      y0 := y + asr(h - r0 + 1, 1)
+      Printer3.ReplConst(Q, Display3.black, x0, y0, r0, r0, Display.replace)
+    else
+      x0 := x + asr(w + 1, 1)
+      y0 := y + asr(h + 1, 1)
+      r0 := asr(r0, 1)
+      Printer3.Circle(Q, Display3.black, Display.solid, x0, y0, r0, 1, {Display3.filled}, Display.replace)
+    end
+
+  else
+    x0 := x + asr(w - r0 + 1, 1)
+    y0 := y + asr(h - r0 + 1, 1)
+    dec(r0)
+    Printer3.Line(Q, Display3.black, Display.solid, x0, y0, x0 + r0, y0 + r0, P(2), Display.replace)
+    Printer3.Line(Q, Display3.black, Display.solid, x0, y0 + r0, x0 + r0, y0, P(2), Display.replace)
+  end
+end Print
+
+(* Drops model to frame at point (X, Y). If model is of type 'Display.Frame' a 'ConsumeMsg' with id set to 'drop'
+is sent, otherwise a 'LinkMsg' is sent to frame *)
+procedure DropObject(obj: Objects.Object; X, Y: int16; copy_: boolean)
+  var
+    F: Display.Frame
+    C: Objects.CopyMsg
+    D: Display.ConsumeMsg
+    L: Objects.LinkMsg
+begin
+  if obj # nil then
+    obj.slink := nil
+    if copy_ then
+      C.id := Objects.shallow
+      Objects.Stamp(@C)
+      obj.handle(obj, @C)
+      obj := C.obj
+    end
+    Gadgets.ThisFrame(X, Y, @F, @D.u, @D.v)
+    if F # nil then
+      if (F is Frame) or (obj is Display.Frame) then
+        D.id := Display.drop
+        D.obj := obj
+        D.F := F
+        D.res := -1
+        Display.Broadcast(@D)
+        if D.res < 0 then
+          Texts.WriteString(@W, "[Could not drop frame]")
+          Texts.WriteLn(@W)
+          ToLog()
+        end
+
+      else
+        L.id := Objects.set_
+        copy(@L.name, "Model", 32)
+        L.obj := obj
+        L.res := -1
+        F.handle(F, @L)
+        Gadgets.Update(obj)
+        if L.res < 0 then
+          Texts.WriteString(@W, "[Could not set object as model]")
+          Texts.WriteLn(@W)
+          ToLog()
+        end
+      end
+    end
+  end
+end DropObject
+
+(* Tracks mouse if right button was pressed entering frame handler.
+Allows to delete current value (right, left) or integrate a copy of the value (right, middle). *)
+procedure TrackRight(F: Frame; M: pointer to Oberon.InputMsg)
+  var
+    Q: Display3.Mask
+    x, y, w, h: int16
+    keysum: set
+    C: Objects.CopyMsg
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  w := F.W
+  h := F.H
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  Oberon.RemoveMarks(x, y, w, h)
+  Display3.FillPattern(Q, Display3.white, Display3.selectpat, x, y, x + 4, y + 4, w - 8, h - 8, Display.paint)
+  keysum := M.keys
+  repeat
+    Effects.TrackMouse(@M.keys, @M.X, @M.Y, Effects.Arrow)
+    keysum := keysum + M.keys
+  until M.keys = {}
+
+  Restore(F, Q, x, y, w, h, false)
+  if (keysum = {0,2}) & ~F.locked then
+    // delete value
+    F.val_ := nil
+    if F.obj # nil then
+      SetFrameModel(F)
+      Gadgets.Update(F.obj)
+    else
+      Gadgets.Update(F)
+    end
+
+    Gadgets.ExecuteAttr(F, "ConsumeCmd", M.dlink, nil, F)
+  elsif (keysum = {0,1}) & (F.val_ is Display.Frame) & F.canDrag then
+    // integrate copy of value
+    C.id := Objects.shallow
+    Objects.Stamp(@C)
+    F.val_.handle(F.val_, @C)
+    Gadgets.Integrate(C.obj)
+  end
+
+  M.res := 0
+end TrackRight
+
+(* Tracks mouse if middle button was pressed entering frame handler.
+Allows to execute attibute 'Cmd' or drag and drop value (middle, left) or a copy (middle, right). *)
+procedure TrackMiddle(F: Frame; M: pointer to Oberon.InputMsg)
+  var
+    Q: Display3.Mask
+    x, y, w, h, r, s: int16
+    keysum: set
+    in_, drag: boolean
+    cursor: Oberon.Marker
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  w := F.W
+  h := F.H
+  r := x + w - 1
+  s := y + h - 1
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  Oberon.RemoveMarks(x, y, w, h)
+  Restore(F, Q, x, y, w, h, true)
+  keysum := M.keys
+  in_ := true
+  drag := false
+  cursor := Effects.Arrow
+  repeat
+    Effects.TrackMouse(@M.keys, @M.X, @M.Y, cursor)
+    keysum := keysum + M.keys
+    if ((M.keys = {1,0}) or Oberon.New & (M.keys = {2,0}) or (M.keys = {1,2})) & ~drag & F.canDrag then
+      drag := true
+      if 0 in M.keys then
+        cursor := Effects.CopyHand
+      else
+        cursor := Effects.MoveHand
+      end
+    elsif (keysum = {0,1,2}) & drag then
+      cursor := Effects.Arrow
+    end
+
+    if in_ & ((M.X < x) or (M.Y < y) or (M.X > r) or (M.Y > s) or drag) then
+      // mouse leaves frame or dragging
+      in_ := false
+      Oberon.RemoveMarks(x, y, w, h)
+      Restore(F, Q, x, y, w, h, false)
+    elsif ~in_ & (M.X >= x) & (M.Y >= y) & (M.X <= r) & (M.Y <= s) & ~drag then
+      // mouse enters frame
+      in_ := true
+      Oberon.RemoveMarks(x, y, w, h)
+      Restore(F, Q, x, y, w, h, true)
+    end
+  until M.keys = {}
+
+  Restore(F, Q, x, y, w, h, false)
+  if ~in_ & ~drag then
+    keysum := {}
+  end
+  if (keysum = {1}) or Oberon.New & (keysum = {2}) then
+    Gadgets.ExecuteAttr(F, "Cmd", M.dlink, nil, nil)
+  elsif (keysum # {0,1,2}) & drag then
+    DropObject(F.val_, M.X, M.Y, 0 in keysum)
+  end
+
+  M.res := 0
+end TrackMiddle
+
+(* Tracks mouse if left button was pressed entering frame handler.
+Allows to copy over an object to be set as new value (left, middle). If succeeded
+executes attribute 'ConsumeCmd'. *)
+procedure TrackLeft(F: Frame; M: pointer to Oberon.InputMsg)
+  var
+    Q: Display3.Mask
+    obj: Objects.Object
+    time: int32
+    x, y, w, h: int16
+    keysum: set
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  w := F.W
+  h := F.H
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  Oberon.RemoveMarks(x, y, w, h)
+  Display3.FilledRect3D(Q, Display3.bottomC, Display3.topC, Display3.textbackC, x, y, w, h, 1, Display.replace)
+  keysum := M.keys
+  repeat
+    Effects.TrackMouse(@M.keys, @M.X, @M.Y, Effects.Arrow)
+    keysum := keysum + M.keys
+  until M.keys = {}
+
+  Restore(F, Q, x, y, w, h, false)
+  if (keysum = {1,2}) & ~F.locked then
+    // copy over selected frame to value
+    Gadgets.GetSelection(@obj, @time)
+    if (time > 0) & (obj # nil) then
+      F.val_ := obj
+      if F.obj # nil then
+        SetFrameModel(F)
+        Gadgets.Update(F.obj)
+      else
+        Gadgets.Update(F)
+      end
+
+      Gadgets.ExecuteAttr(F, "ConsumeCmd", M.dlink, obj, F)
+    end
+  end
+
+  M.res := 0
+end TrackLeft
+
+procedure CopyFrame*(M: pointer to Objects.CopyMsg; from, to_: Frame)
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  to_.locked := from.locked
+  to_.canDrag := from.canDrag
+  to_.val_ := from.val_
+end CopyFrame
+
+procedure FrameHandle*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h: int16
+    F1: Frame
+    Q: Display3.Mask
+begin
+  case F of
+  | Frame:
+    case M of
+    | Display.PFrameMsg:
+      if (M.F = nil) or (M.F = F) then
+        // message addressed to box
+        x := M.x + F.X
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        M1 := M
+        case M1 of
+        | Display.PDisplayMsg:
+          if M1.device = Display.screen then
+            if (M1.id = Display.full) or (M1.F = nil) then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+              Restore(F, Q, x, y, w, h, false)
+            elsif M1.id = Display.area then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+              Display3.AdjustMask(Q, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+              Restore(F, Q, x, y, w, h, false)
+            end
+
+          elsif M1.id = Display.printer then
+            Print(F, M1)
+          end
+
+          // WITH Display.DisplayMsg
+
+        | Gadgets.PUpdateMsg:
+          if F.obj # nil then
+            F.obj.handle(F.obj, M1)
+          end
+          if M1.obj = F.obj then
+            if M1.stamp # F.stamp then
+              F.stamp := M1.stamp
+              UpdateFrameModel(F)
+            end
+            Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+            Restore(F, Q, x, y, w, h, false)
+          else
+            Gadgets.framehandle(F, M1)
+          end
+
+          // WITH Gadgets.UpdateMsg
+
+        | Display.PControlMsg:
+          if F.obj # nil then
+            F.obj.handle(F.obj, M1)
+          end
+          if (M1.id = Display.restore) & (M1.stamp # F.stamp) then
+            F.stamp := M1.stamp
+            UpdateFrameModel(F)
+          end
+          // WITH Display.ControlMsg
+
+        | Oberon.PInputMsg:
+          if M1.id = Oberon.track then
+            if Gadgets.InActiveArea(F, M1) & ((M1.keys = {1}) or Oberon.New & (M1.keys = {2})) then
+              if F.val_ # nil then
+                TrackMiddle(F, M1)
+              else
+                repeat
+                  Effects.TrackMouse(@M1.keys, @M1.X, @M1.Y, Effects.Arrow)
+                until M1.keys = {}
+                M1.res := 0
+              end
+
+            elsif ~(Gadgets.selected in F.state) & ~Effects.InBorder(M1.X, M1.Y, x, y, w, h) & (M1.keys = {0}) then
+              if F.val_ # nil then
+                TrackRight(F, M1)
+              else
+                Gadgets.framehandle(F, M1)
+              end
+
+            elsif ~(Gadgets.selected in F.state) & ~Effects.InBorder(M1.X, M1.Y, x, y, w, h) & (M1.keys = {2}) then
+              TrackLeft(F, M1)
+            end
+
+          else
+            Gadgets.framehandle(F, M1)
+          end
+
+          // WITH Oberon.InputMsg
+
+        | Display.PModifyMsg:
+          Gadgets.framehandle(F, M1)
+        | Oberon.PControlMsg:
+          Gadgets.framehandle(F, M1)
+        | Display.PSelectMsg:
+          Gadgets.framehandle(F, M1)
+        | Display.PConsumeMsg:
+          if (M1.id = Display.drop) & ~F.locked then
+            F.val_ := M1.obj
+            F.val_.slink := nil
+            M1.res := 0
+            if F.obj # nil then
+              SetFrameModel(F)
+              Gadgets.Update(F.obj)
+            else
+              Gadgets.Update(F)
+            end
+
+            Gadgets.ExecuteAttr(F, "ConsumeCmd", M1.dlink, M1.obj, F)
+          else
+            Gadgets.framehandle(F, M1)
+          end
+
+          // WITH Display.ConsumeMsg
+
+        else
+          Gadgets.framehandle(F, M1)
+        end
+
+        // IF message addressed to box
+      end
+      // WITH Display.FrameMsg
+
+    | Objects.PAttrMsg:
+      FrameAttrs(F, M(Objects.PAttrMsg))
+    | Objects.PLinkMsg:
+      FrameLinks(F, M(Objects.PLinkMsg))
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Files.WriteBool(@M.R, F.locked)
+        Files.WriteBool(@M.R, F.canDrag)
+        Gadgets.WriteRef(@M.R, F.lib, F.val_)
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        Files.ReadBool(@M.R, @F.locked)
+        Files.ReadBool(@M.R, @F.canDrag)
+        Gadgets.ReadRef(@M.R, F.lib, @F.val_)
+        Gadgets.framehandle(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink // non-first arrival
+      else
+        // first arrival
+        newgc(F1)
+        F.stamp := M.stamp
+        F.dlink := F1
+        CopyFrame(M, F, F1)
+        M.obj := F1
+      end
+
+    | Objects.PBindMsg:
+      Gadgets.framehandle(F, M)
+      if F.val_ # nil then
+        F.val_.handle(F.val_, M)
+      end
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end FrameHandle
+
+procedure InitFrame*(F: Frame)
+begin
+  F.locked := false
+  F.canDrag := true
+  F.val_ := nil
+  F.W := 20
+  F.H := 20
+  F.handle := FrameHandle
+end InitFrame
+
+procedure NewFrame*()
+  var
+    F: Frame
+begin
+  newgc(F)
+  InitFrame(F)
+  Objects.NewObj := F
+end NewFrame
+
+(** Used in the form: RefGadgets.Create <Generator>
+
+Creates a new object and set the value link of the specified RefGadget. A destination
+RefGadget is either the executor, selected or marked gadget. *)
+procedure Create*()
+  var
+    obj, ref: Objects.Object
+    time: int32
+    L: Objects.LinkMsg
+    S: Attributes.Scanner
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if S.class in {Attributes.Name,Attributes.String} then
+    ref := nil
+    case Gadgets.executorObj of
+    | Frame:
+      ref := Gadgets.executorObj
+    else
+      Gadgets.GetSelection(@ref, @time)
+      if (ref = nil) or ~(ref is Frame) then
+        if Oberon.Pointer.on then
+          ref := Oberon.MarkedFrame()
+          if (ref = nil) or ~(ref is Frame) then
+            ref := nil
+          end
+
+        else
+          ref := nil
+        end
+      end
+    end
+
+    if ref # nil then
+      obj := Gadgets.CreateObject(@S.s)
+      if obj # nil then
+        L.id := Objects.set_
+        copy(@L.name, "Value", 32)
+        L.res := -1
+        L.obj := obj
+        ref.handle(ref, @L)
+        Gadgets.Update(ref)
+      end
+    end
+  end
+end Create
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewReference" end return NewReference end
+  if i = 1 then if name # nil then name^ := "NewFrame" end return NewFrame end
+  if i = 2 then if name # nil then name^ := "Create" end return Create end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("RefGadgets", cmd_)
+  Texts.OpenWriter(@W)
+end RefGadgets.

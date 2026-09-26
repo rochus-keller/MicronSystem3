@@ -1,0 +1,2171 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Display3 [level=5]
+
+import Display, Objects, Fonts, Pictures, Oberon, Texts, Modules
+// portable
+// jm 17.1.95 / tk 7.12.95
+
+(** Module Display3 implements the clipped graphic primitives used by the Gadget system. It has a twin module called Printer3 that implements the same primitives for the printer.
+**)
+
+(*
+jm  11.2.93 - mask msg
+jm 15.4.93  fixed center string
+kr 2.6.93  fixed Poly with patterns
+jm 17.09.93 10:46:54 - fixed shift mask
+25.3.94 - fixed problem with Subtract (bug surfaces after 2 years only)
+29.3.94 - Added Pict and ReplPict
+15.11.94 - changed definition of String and CenterString
+- added selectpat (from Effects)
+- removed MakeMask
+12.12.94 - fixed clipping problem with lines (was a stupid mistake from Rege).
+6.1.95 - removed all the rubbish from rege
+- implemented brushes
+Lines (supports width, patterns)
+Poly (supports width, patterns, filled)
+Circle (supports width, patterns, filled)
+Ellipse (supports patterns /no fill & width)
+3.1.96 - fixed Open by setting clipping port to a maximum area
+29.8.96 - fixed Ellipse & Circle (thanks to eos)
+*)
+
+const
+  replace* = Display.replace // Standard display modes. *
+  paint* = Display.paint
+  invert* = Display.invert
+
+  // Display styles *
+  filled* = 1 // Filled
+
+  maxcoord = 8192
+  add = 1
+  subtract = 2
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  Mask* = pointer to MaskDesc // Clipping Mask.
+
+  // Informs a frame of a new mask. This message is always sent directly. *
+  OverlapMsg* = object (Display.FrameMsg)
+    M*: Mask // Use NIL to indicate to a frame that its current mask is invalid.
+  end
+  POverlapMsg* = pointer to OverlapMsg
+
+  (** Message broadcast by a frame (identified by the F field) to indicate that it has an invalid mask and now requires
+  its parent, to calculate a new mask for it and to inform it through the OverlapMsg. *)
+  UpdateMaskMsg* = object (Display.FrameMsg)
+  end
+  PUpdateMaskMsg* = pointer to UpdateMaskMsg
+
+  Run = pointer to RunDesc
+  RunDesc = record
+    x, w, right, value: int16
+
+    next, prev: Run
+  end
+
+  ScanLine = pointer to ScanLineDesc
+  ScanLineDesc = record
+    y, h, top: int16
+    maymerge: boolean
+    run: Run
+    next, prev: ScanLine
+  end
+
+  MaskDesc* = record
+    // Clipping mask descriptor.
+    x*: int16 // Relative mask origin or offset.
+    y*, X*: int16 // Current clipping port in absolute coordinates.
+    Y*, W*, H*, sX, sY, sW, sH: int16
+
+    simple: boolean
+    scanline: ScanLine
+  end
+
+  // Enumerate the set of rectangles in a mask. The clipping port is not enumerated.
+  EnumProc* = procedure(X: int16; Y: int16; W: int16; H: int16)
+
+var
+  selectpat*: AnyPtr // Pattern used to draw gadgets when in a selected state. *
+
+  // Colors
+  FG*: int16 // Foreground (black) and background (white) color indexes.
+  BG*, red*: int16 // Primary color indexes.
+  green*, blue*, black*: int16 // True black and white. *
+  white*, topC*: int16 // Top shadow color.
+  bottomC*: int16 // Bottom shadow color.
+  upC*: int16 // Color of a button.
+  downC*: int16 // Color of the pushed  button
+  groupC*: int16 // Color of containers, i.e. gadgets that have a grouping function like panels.
+  invertC*: int16 // Best color for doing inverts..
+  textC*: int16 // Default text color.
+  textbackC*: int16 // Default text background.
+  textmode*: int16 // Best CopyPattern mode for this display card.
+
+  typ: int16
+  aM: Mask // for enums
+  bM: Mask
+
+  // tmp variables for picture enumerator
+  tmpP: Pictures.Picture
+  tmpM, dX, dY: int16
+
+  compactionflag: boolean
+
+// ========= Brush related =========
+
+const
+  BrushSize = 100 // maximum width of the brush
+
+type
+  Brush = record
+    brul, brur, bufl, bufr: array 100 (* BrushSize *) of int16
+
+    bufh, brushr, x, y, mode: int16
+
+    col: int32
+    M: Mask
+    pat: AnyPtr
+  end
+
+var
+  drawingPolygon: boolean
+  brush: Brush // global Bursh
+
+procedure Min(x, y: int16): int16
+begin
+  if x < y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+procedure Max(x, y: int16): int16
+begin
+  if x > y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Max
+
+procedure ClipAgainst(x, y, w, h: pointer to int16; x1, y1, w1, h1: int16)
+  var
+    r, t, r1, t1: int16
+begin
+  r := x^ + w^ - 1
+  r1 := x1 + w1 - 1
+  t := y^ + h^ - 1
+  t1 := y1 + h1 - 1
+  if x^ < x1 then
+    x^ := x1
+  end
+  if y^ < y1 then
+    y^ := y1
+  end
+  if r > r1 then
+    r := r1
+  end
+  if t > t1 then
+    t := t1
+  end
+  w^ := r - x^ + 1
+  h^ := t - y^ + 1
+end ClipAgainst
+
+procedure Clip(M: Mask; x, y, w, h: pointer to int16)
+  var
+    l, b, t, r, tmp: int16
+begin
+  l := x^
+  b := y^
+  r := x^ + w^ - 1
+  t := y^ + h^ - 1
+  if l < M.sX then
+    l := M.sX
+  end
+  tmp := M.sX + M.sW - 1
+  if r > tmp then
+    r := tmp
+  end
+  if b < M.sY then
+    b := M.sY
+  end
+  tmp := M.sY + M.sH - 1
+  if t > tmp then
+    t := tmp
+  end
+  x^ := l
+  y^ := b
+  w^ := r - l + 1
+  h^ := t - b + 1
+end Clip
+
+procedure Open0(M: Mask)
+  var
+    r: Run
+    s: ScanLine
+begin
+  newgc(s)
+  newgc(r)
+  M.scanline := s
+  s.run := r
+  r.next := nil
+
+  s.y := -maxcoord
+  s.h := 2i2 * maxcoord + 1i2
+  s.top := maxcoord
+  r.x := -maxcoord
+  r.w := 2i2 * maxcoord + 1i2
+  r.right := maxcoord
+end Open0
+
+// Initialize the Mask to the empty region, i.e. everything will be clipped away.
+procedure Open*(M: Mask)
+begin
+  M.scanline := nil
+  M.x := 0
+  M.y := 0
+  M.simple := true
+  M.sX := 0
+  M.sY := 0
+  M.sW := 0
+  M.sH := 0
+  M.X := 0
+  M.Y := 0
+  M.W := maxcoord
+  M.H := maxcoord
+end Open
+
+// Enumerate all the visible areas of a mask. The clipping port is not enumerated. The mask translation vector is taken into account.*
+procedure Enum*(M: Mask; enum: EnumProc)
+  var
+    s: ScanLine
+    r: Run
+begin
+  if M.simple then
+    if (M.sW > 0) & (M.sH > 0) then
+      enum(M.x + M.sX, M.y + M.sY, M.sW, M.sH)
+    end
+  else
+    s := M.scanline
+    while s # nil do
+      r := s.run
+      while r # nil do
+        if r.value # 0 then
+          enum(M.x + r.x, M.y + s.y, r.w, s.h)
+        end
+        r := r.next
+      end
+
+      s := s.next
+    end
+  end
+end Enum
+
+// Enumerate all the invisible areas of a mask. The clipping port is not enumerated. Note that you might obtain coordinates outside of the normal screen area, bounded by approximately -/+ 8192. The mask translation vector is taken into account.*
+procedure EnumInvert*(M: Mask; enum: EnumProc)
+  var
+    s: ScanLine
+    r: Run
+    X, Y, W, H: int16
+begin
+  if M.simple then
+    X := M.x + M.sX
+    Y := M.y + M.sY
+    W := M.sW
+    H := M.sH
+    enum(-maxcoord, -maxcoord, 2i2 * maxcoord + 1i2, Y + maxcoord)
+    enum(-maxcoord, Y + H, 2i2 * maxcoord + 1i2, maxcoord - (Y + H) + 1)
+    enum(-maxcoord, Y, X + maxcoord, H)
+    enum(X + W, Y, maxcoord - (X + W), H)
+  else
+    s := M.scanline
+    while s # nil do
+      r := s.run
+      while r # nil do
+        if r.value = 0 then
+          enum(M.x + r.x, M.y + s.y, r.w, s.h)
+        end
+        r := r.next
+      end
+
+      s := s.next
+    end
+  end
+end EnumInvert
+
+// Enumerate all the visible areas in the given rectangular region. The clipping port is not taken into account.
+procedure EnumRect*(M: Mask; X, Y, W, H: int16; enum: EnumProc)
+  var
+    hleft, wleft, nw, nh, x, y, X0: int16
+    s: ScanLine
+    r: Run
+begin
+  if M.simple then
+    ClipAgainst(@X, @Y, @W, @H, M.x + M.sX, M.y + M.sY, M.sW, M.sH) // enum(M.x + M.sX, M.y + M.sY, M.sW, M.sH);
+    if (W > 0) & (H > 0) then
+      enum(X, Y, W, H)
+    end
+  else
+    x := M.x
+    y := M.y
+    hleft := H
+    r := nil
+    s := M.scanline
+    while s.top + y < Y do
+      s := s.next
+    end
+    X0 := X
+    while hleft > 0 do
+      nh := Min(s.top + y - Y + 1, hleft)
+      r := s.run
+      while r.right + x < X do
+        r := r.next
+      end
+      wleft := W
+      while wleft > 0 do
+        nw := r.right + x - X + 1
+        if wleft < nw then
+          nw := wleft
+        end
+        if r.value > 0 then
+          enum(X, Y, nw, nh)
+        end
+        inc(X, nw)
+        dec(wleft, nw)
+        r := r.next
+      end
+
+      inc(Y, nh)
+      dec(hleft, nh)
+      s := s.next
+      r := nil
+      X := X0
+    end
+  end
+end EnumRect
+
+procedure SplitScan(s: ScanLine; y: int16)
+  // s.y < y < s.top
+  var
+    ns: ScanLine
+    nr, r, tmp: Run
+begin
+  newgc(ns)
+  ns.y := y
+  ns.top := s.top
+  ns.h := s.top - y + 1
+  r := s.run // NEWRun(nr);
+  newgc(nr)
+  ns.run := nr
+  while r # nil do
+    nr.x := r.x
+    nr.w := r.w
+    nr.right := r.right
+    nr.value := r.value
+    if r.next # nil then
+      // NEWRun(tmp);
+      newgc(tmp)
+      nr.next := tmp
+      nr := tmp
+    else
+      nr.next := nil
+    end
+
+    r := r.next
+  end
+
+  ns.next := s.next
+  s.next := ns
+  s.top := y - 1
+  s.h := s.top - s.y + 1
+end SplitScan
+
+procedure MergeScanLine(s: ScanLine)
+  var
+    r, rt: Run
+    noinc: boolean
+begin
+  r := s.run
+  while r # nil do
+    // Merge
+    if r.value > 0 then
+      r.value := 1
+    end
+    rt := r.next
+    noinc := false
+    if rt # nil then
+      if rt.value > 0 then
+        rt.value := 1
+      end
+      if (rt.value = r.value) & (r.right + 1 = rt.x) then
+        inc(r.w, rt.w) // DisposeRun(rt);
+        r.right := rt.right
+        r.next := rt.next
+        noinc := true
+      end
+    end
+
+    if ~noinc then
+      r := r.next
+    end
+  end
+end MergeScanLine
+
+procedure Compact(M: Mask)
+  var
+    r, rt, thesinglerect: Run
+    bs, st, thesinglescanline: ScanLine
+    noofrects: int16
+    merge, noinc: boolean
+begin
+  if ~compactionflag then
+    return
+  end
+  bs := M.scanline
+  while bs # nil do
+    if bs.maymerge then
+      MergeScanLine(bs)
+    end
+    bs := bs.next
+  end
+
+  bs := M.scanline
+  while bs # nil do
+    st := bs.next
+    noinc := false
+    if st # nil then
+      r := bs.run
+      rt := st.run
+      merge := true
+      while merge & (r # nil) do
+        if (r.value = rt.value) & (r.x = rt.x) & (r.w = rt.w) then
+        else
+          merge := false
+        end
+        r := r.next
+        rt := rt.next
+      end
+
+      if merge then
+        inc(bs.h, st.h)
+        inc(bs.top, st.h)
+        bs.next := st.next
+        noinc := true
+      end
+    end
+
+    if ~noinc then
+      bs := bs.next
+    end
+  end
+
+  bs := M.scanline
+  noofrects := 0
+  while (bs # nil) & (noofrects <= 1) do
+    r := bs.run
+    while (r # nil) & (noofrects <= 1) do
+      if r.value > 0 then
+        inc(noofrects)
+        thesinglerect := r
+        thesinglescanline := bs
+      end
+
+      r := r.next
+    end
+
+    bs := bs.next
+  end
+
+  if noofrects = 1 then
+    // super compact
+    M.scanline := nil
+
+    M.simple := true
+    M.sX := thesinglerect.x
+    M.sY := thesinglescanline.y
+    M.sW := thesinglerect.w
+    M.sH := thesinglescanline.h
+  end
+end Compact
+
+procedure DoLine(s: ScanLine; x, y, w, h: int16)
+  var
+    splittop, splitbottom: boolean
+    r, rt: Run
+    wleft, nw: int16
+begin
+  splitbottom := y > s.y
+  splittop := y + h - 1 < s.top
+  r := s.run
+  while r.right < x do
+    r := r.next
+  end
+  wleft := w
+  while (wleft > 0) & (r # nil) do
+    nw := Min(wleft, r.right - x + 1)
+    // x, y, nw, h
+    if r.value = 1 then
+    // draw okay in this run
+    else
+      if splittop then
+        SplitScan(s, y + h)
+        splittop := false
+      end
+
+      if splitbottom then
+        SplitScan(s, y)
+        rt := s.next.run
+        while rt.x # r.x do
+          rt := rt.next
+        end
+        r := rt
+        s := s.next
+        splitbottom := false
+      end
+
+      if x > r.x then
+        // split left
+        newgc(rt)
+        rt.next := r.next
+        rt.x := x
+        rt.w := r.right - x + 1
+        rt.right := r.right
+        rt.value := 2
+        r.w := x - r.x
+        r.right := r.x + r.w - 1
+        r.value := 0
+        r.next := rt
+        nw := 0
+        s.maymerge := true
+      elsif x + wleft - 1 < r.right then
+        // split right
+        newgc(rt)
+        rt.next := r.next
+        rt.x := x + wleft
+        rt.w := r.right - rt.x + 1
+        rt.right := r.right
+        rt.value := 0
+        r.w := nw
+        r.right := r.x + r.w - 1
+        r.value := 1
+        r.next := rt
+        s.maymerge := true
+      else
+        r.value := 1
+        s.maymerge := true
+      end
+    end
+
+    inc(x, nw)
+    dec(wleft, nw)
+    r := r.next
+  end
+end DoLine
+
+procedure ExclLine(s: ScanLine; x, y, w, h: int16)
+  var
+    splittop, splitbottom: boolean
+    r, rt: Run
+    wleft, nw: int16
+begin
+  splitbottom := y > s.y
+  splittop := y + h - 1 < s.top
+  r := s.run
+  while r.right < x do
+    r := r.next
+  end
+  wleft := w
+  while (wleft > 0) & (r # nil) do
+    nw := Min(wleft, r.right - x + 1)
+    // x, y, nw, h
+    if r.value = 0 then
+    else
+      if splittop then
+        SplitScan(s, y + h)
+        splittop := false
+      end
+
+      if splitbottom then
+        SplitScan(s, y)
+        rt := s.next.run
+        while rt.x # r.x do
+          rt := rt.next
+        end
+        r := rt
+        s := s.next
+        splitbottom := false
+      end
+
+      if x > r.x then
+        // split left
+        newgc(rt)
+        rt.next := r.next
+        rt.x := x
+        rt.w := r.right - x + 1
+        rt.right := r.right
+        if x + wleft - 1 < r.right then
+          rt.value := 2
+        else
+          rt.value := 0
+        end
+        r.w := x - r.x
+        r.right := r.x + r.w - 1
+        r.value := 2
+        r.next := rt
+        nw := 0
+        s.maymerge := true
+      elsif x + wleft - 1 < r.right then
+        // split right
+        newgc(rt)
+        rt.next := r.next
+        rt.x := x + wleft
+        rt.w := r.right - rt.x + 1
+        rt.right := r.right
+        rt.value := 1
+        r.w := nw
+        r.right := r.x + r.w - 1
+        r.value := 0
+        s.maymerge := true
+        r.next := rt
+      else
+        r.value := 0
+        s.maymerge := true
+      end
+    end
+
+    inc(x, nw)
+    dec(wleft, nw)
+    r := r.next
+  end
+end ExclLine
+
+// Make a copy of a mask.
+procedure Copy*(from: Mask; to_: pointer to Mask)
+  var
+    r, Tr, Nr: Run
+    s, Ns, Ts: ScanLine
+begin
+  newgc(to_^)
+  to_^^ := from^
+  if from.scanline # nil then
+    s := from.scanline
+    newgc(Ns)
+    to_^.scanline := Ns
+    while s # nil do
+      Ns^ := s^
+      Ns.prev := nil
+      // copy run
+      r := s.run
+      newgc(Nr)
+      Ns.run := Nr
+      while r # nil do
+        Nr^ := r^
+        Nr.prev := nil
+        if r.next # nil then
+          newgc(Tr)
+          Nr.next := Tr
+          Nr := Tr
+        else
+          Nr.next := nil
+        end
+
+        r := r.next
+      end
+
+      // end copy run
+      if s.next # nil then
+        newgc(Ts)
+        Ns.next := Ts
+        Ns := Ts
+      else
+        Ns.next := nil
+      end
+
+      s := s.next
+    end
+  end
+end Copy
+
+// Add the rectangle X, Y, W, H as a visible/drawable area to the mask.
+procedure Add*(M: Mask; X, Y, W, H: int16)
+  var
+    hleft, nh: int16
+    s: ScanLine
+begin
+  X := X - M.x // adjust for offset
+  Y := Y - M.y
+  if M.simple then
+    if M.sW + M.sH = 0 then
+      M.sX := X
+      M.sY := Y
+      M.sW := W
+      M.sH := H
+      return
+    else
+      M.simple := false
+      Open0(M)
+      compactionflag := false
+      Add(M, M.sX + M.x, M.sY + M.y, M.sW, M.sH)
+      compactionflag := true
+    end
+  end
+
+  hleft := H
+  s := M.scanline
+  while s # nil do
+    s.maymerge := false
+    s := s.next
+  end
+  s := M.scanline
+  while s.top < Y do
+    s := s.next
+  end
+  while hleft > 0 do
+    nh := Min(s.top - Y + 1, hleft)
+    DoLine(s, X, Y, W, nh)
+    inc(Y, nh)
+    dec(hleft, nh)
+    s := s.next
+  end
+
+  Compact(M)
+end Add
+
+// Clip the current clipping port of the mask to the rectangle X, Y, W, H. The result is an updated clipping port.
+procedure AdjustMask*(M: Mask; X, Y, W, H: int16)
+begin
+  ClipAgainst(@X, @Y, @W, @H, M.X, M.Y, M.W, M.H)
+  M.X := X
+  M.Y := Y
+  M.W := W
+  M.H := H
+end AdjustMask
+
+// Remove area X, Y, W, H from the mask i.e. make area undrawable.
+procedure Subtract*(M: Mask; X, Y, W, H: int16)
+  var
+    hleft, nh: int16
+    s: ScanLine
+begin
+  if M.simple then
+    M.simple := false
+    Open0(M)
+    compactionflag := false
+    Add(M, M.x + M.sX, M.y + M.sY, M.sW, M.sH)
+    compactionflag := true
+  end
+
+  X := X - M.x
+  Y := Y - M.y
+  hleft := H
+  s := M.scanline
+  while s # nil do
+    s.maymerge := false
+    s := s.next
+  end
+  s := M.scanline
+  while s.top < Y do
+    s := s.next
+  end
+  while hleft > 0 do
+    nh := Min(s.top - Y + 1, hleft)
+    ExclLine(s, X, Y, W, nh)
+    inc(Y, nh)
+    dec(hleft, nh)
+    s := s.next
+  end
+
+  Compact(M)
+end Subtract
+
+// Interset the mask with the rectangle X, Y, W, H. The visible areas are restricted to this rectangle.
+procedure Intersect*(M: Mask; X, Y, W, H: int16)
+begin
+  if M.simple then
+    X := X - M.x
+    Y := Y - M.y
+    Clip(M, @X, @Y, @W, @H)
+    M.sX := X
+    M.sY := Y
+    M.sW := W
+    M.sH := H
+  else
+    Subtract(M, -maxcoord, -maxcoord, 2i2 * maxcoord + 1i2, Y + maxcoord) // + 1
+    Subtract(M, -maxcoord, Y + H, 2i2 * maxcoord + 1i2, maxcoord - (Y + H) + 1)
+    Subtract(M, -maxcoord, Y, X + maxcoord, H) // + 1
+    Subtract(M, X + W, Y, maxcoord - (X + W), H)
+  end
+end Intersect
+
+procedure IntersectMasks1(x, y, w, h: int16)
+begin
+  if typ = add then
+    Add(bM, x, y, w, h)
+  elsif typ = subtract then
+    Subtract(bM, x, y, w, h)
+  end
+end IntersectMasks1
+
+procedure IntersectMasks0(X, Y, W, H: int16)
+begin
+  EnumRect(aM, X, Y, W, H, IntersectMasks1)
+end IntersectMasks0
+
+// Intersect the masks A and B resulting in R.
+procedure IntersectMasks*(A, B: Mask; R: pointer to Mask)
+begin
+  // R is an out parameter only
+
+  if (A = nil) or (B = nil) then
+    R^ := nil
+  else
+    newgc(R^)
+    Open(R^)
+    R^.x := A.x
+    R^.y := A.y
+    aM := B
+    bM := R^
+    typ := add
+    Enum(A, IntersectMasks0)
+    aM := nil
+    bM := nil
+  end
+end IntersectMasks
+
+// Subtracts the visible areas of B from A to give mask R.
+procedure SubtractMasks*(A, B: Mask; R: pointer to Mask)
+begin
+  if (A = nil) or (B = nil) then
+    R^ := nil
+  else
+    Copy(A, R)
+    aM := A
+    bM := R^
+    typ := subtract
+    Enum(B, IntersectMasks0)
+    aM := nil
+    bM := nil
+  end
+end SubtractMasks
+
+// Translate the mask so that the resulting origin/offset is 0, 0. This is done by "adding in" the translation vector.
+procedure Shift*(M: Mask)
+  var
+    s, first, last: ScanLine
+    r, f, l: Run
+begin
+  if M # nil then
+    if M.simple then
+      inc(M.sX, M.x)
+      inc(M.sY, M.y)
+    elsif (M.x # 0) or (M.y # 0) then
+      s := M.scanline
+      first := s
+      while s # nil do
+        inc(s.y, M.y)
+        inc(s.top, M.y)
+        r := s.run
+        f := r
+        while r # nil do
+          inc(r.x, M.x)
+          inc(r.right, M.x)
+          l := r
+          r := r.next
+        end
+
+        f.x := -maxcoord // !
+        l.right := maxcoord
+        f.w := f.right - f.x + 1 // !
+        l.w := l.right - l.x + 1
+        last := s
+        s := s.next
+      end
+
+      first.y := -maxcoord // !
+      last.top := maxcoord
+      first.h := first.top - first.y + 1 // !
+      last.h := last.top - last.y + 1
+    end
+
+    M.x := 0
+    M.y := 0
+  end
+end Shift
+
+// Returns TRUE if the visible areas of the mask form a single rectangle. The result, when TRUE, is returned. The clipping port is not taken into account.
+procedure Rectangular*(M: Mask; X, Y, W, H: pointer to int16): boolean
+begin
+  X^ := M.x + M.sX
+  Y^ := M.y + M.sY
+  W^ := M.sW
+  H^ := M.sH
+  return M.simple
+end Rectangular
+
+// --------- CopyMask ----
+
+// Using Display.CopyBlock, copy the area M to position X, Y. The point M.x, M.y is copied to screen coordinates X, Y.
+procedure CopyMask*(M: Mask; X, Y, mode: int16)
+  var
+    s, sp: ScanLine
+    r, rp: Run
+    rruns, rscans: boolean
+begin
+  if M.simple then
+    Display.CopyBlock(M.x + M.sX, M.y + M.sY, M.sW, M.sH, X + M.sX, Y + M.sY, mode)
+  else
+    rruns := X > M.x
+    rscans := Y > M.y
+    if rscans then
+      s := M.scanline
+      sp := nil
+      while s # nil do
+        s.prev := sp
+        sp := s
+        s := s.next
+      end
+
+      s := sp
+    else
+      s := M.scanline
+    end
+
+    while s # nil do
+      if rruns then
+        r := s.run
+        rp := nil
+        while r # nil do
+          r.prev := rp
+          rp := r
+          r := r.next
+        end
+
+        r := rp
+        while r # nil do
+          if r.value > 0 then
+            Display.CopyBlock(M.x + r.x, M.y + s.y, r.w, s.h, X + r.x, Y + s.y, mode)
+          end
+
+          r := r.prev
+        end
+
+      else
+        r := s.run
+        while r # nil do
+          if r.value > 0 then
+            Display.CopyBlock(M.x + r.x, M.y + s.y, r.w, s.h, X + r.x, Y + s.y, mode)
+          end
+
+          r := r.next
+        end
+      end
+
+      if ~rscans then
+        s := s.next
+      else
+        s := s.prev
+      end
+    end
+  end
+end CopyMask
+
+// Display.ReplConst through a mask.
+procedure ReplConst*(M: Mask; col: int32; X, Y, W, H, mode: int16)
+  var
+    hleft, wleft, nw, nh, x, y, X0: int16
+    s: ScanLine
+    r: Run
+begin
+  if M = nil then
+    Display.ReplConst(col, X, Y, W, H, mode)
+  elsif M.simple then
+    ClipAgainst(@X, @Y, @W, @H, M.X, M.Y, M.W, M.H)
+    ClipAgainst(@X, @Y, @W, @H, M.x + M.sX, M.y + M.sY, M.sW, M.sH)
+    Display.ReplConst(col, X, Y, W, H, mode)
+  else
+    ClipAgainst(@X, @Y, @W, @H, M.X, M.Y, M.W, M.H)
+    x := M.x
+    y := M.y
+    hleft := H
+    s := M.scanline
+    while s.top + y < Y do
+      s := s.next
+    end
+
+    X0 := X
+    while hleft > 0 do
+      nh := Min(s.top + y - Y + 1, hleft)
+      r := s.run
+      while r.right + x < X do
+        r := r.next
+      end
+      wleft := W
+      while wleft > 0 do
+        nw := r.right + x - X + 1
+        if wleft < nw then
+          nw := wleft
+        end
+        if r.value > 0 then
+          Display.ReplConst(col, X, Y, nw, nh, mode)
+        end
+        inc(X, nw)
+        dec(wleft, nw)
+        r := r.next
+      end
+
+      inc(Y, nh)
+      dec(hleft, nh)
+      s := s.next
+      r := nil
+      X := X0
+    end
+  end
+end ReplConst
+
+// Is this rectangle completely visible? The clipping port is taken into acount. *
+procedure Visible*(M: Mask; X, Y, W, H: int16): boolean
+  var
+    x, y, X0, hleft, wleft, nh, nw: int16
+    s: ScanLine
+    r: Run
+begin
+  if M = nil then
+    return true
+  elsif (X < M.X) or (Y < M.Y) or (X + W > M.X + M.W) or (Y + H > M.Y + M.H) then
+    return false
+  elsif M.simple then
+    x := M.x
+    y := M.y
+    return (X >= M.sX + x) & (Y >= M.sY + y) & (X + W <= M.sX + M.sW + x) & (Y + H <= M.sY + M.sH + y)
+  else
+    // jm mod
+    dec(X, M.x) // eos: shift rectangle into local mask coords
+    dec(Y, M.y)
+    s := M.scanline
+    while s.top < Y do
+      s := s.next
+    end
+    hleft := H
+    X0 := X
+    while hleft > 0 do
+      nh := Min(s.top - Y + 1, hleft)
+      r := s.run
+      while r.right < X do
+        r := r.next
+      end
+      wleft := W
+      while wleft > 0 do
+        if r.value = 0 then
+          return false // gs
+        end
+        nw := r.right - X + 1
+        if wleft < nw then
+          nw := wleft
+        end
+        inc(X, nw)
+        dec(wleft, nw)
+        r := r.next
+      end
+
+      inc(Y, nh)
+      dec(hleft, nh)
+      s := s.next
+      X := X0
+    end
+
+    return true
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end Visible
+
+// Display.Dot through a clipping mask.
+procedure Dot*(M: Mask; col: int32; X, Y, mode: int16)
+  var
+    x, y: int16
+    s: ScanLine
+    r: Run
+begin
+  if M = nil then
+    Display.Dot(col, X, Y, mode)
+  elsif M.simple then
+    x := M.x
+    y := M.y
+    if (X >= M.X) & (Y >= M.Y) & (X < M.X + M.W) & (Y < M.Y + M.H) then
+      if (X >= M.sX + x) & (Y >= M.sY + y) & (X < M.sX + M.sW + x) & (Y < M.sY + M.sH + y) then
+        Display.Dot(col, X, Y, mode)
+      end
+    end
+
+  else
+    if (X >= M.X) & (Y >= M.Y) & (X < M.X + M.W) & (Y < M.Y + M.H) then
+      x := M.x
+      y := M.y
+      s := M.scanline
+      while s.top + y < Y do
+        s := s.next
+      end
+      r := s.run
+      while r.right + x < X do
+        r := r.next
+      end
+      if r.value > 0 then
+        Display.Dot(col, X, Y, mode)
+      end
+    end
+  end
+end Dot
+
+// Display.FillPattern through a clipping mask. pX, pY is the pattern pin-point.
+procedure FillPattern*(M: Mask; col: int32; pat: AnyPtr; pX, pY, X, Y, W, H, mode: int16)
+  var
+    hleft, nh, wleft, nw, x, y, X0: int16
+    s: ScanLine
+    r: Run
+begin
+  if pat = Display.solid then
+    ReplConst(M, col, X, Y, W, H, mode)
+    return
+  end
+
+  if M = nil then
+    Display.FillPattern(col, pat, pX, pY, X, Y, W, H, mode)
+  elsif M.simple then
+    ClipAgainst(@X, @Y, @W, @H, M.X, M.Y, M.W, M.H)
+    ClipAgainst(@X, @Y, @W, @H, M.x + M.sX, M.y + M.sY, M.sW, M.sH)
+    Display.FillPattern(col, pat, pX, pY, X, Y, W, H, mode)
+  else
+    ClipAgainst(@X, @Y, @W, @H, M.X, M.Y, M.W, M.H)
+    x := M.x
+    y := M.y
+    s := M.scanline
+    while s.top + y < Y do
+      s := s.next
+    end
+    hleft := H
+    X0 := X
+    while hleft > 0 do
+      nh := s.top + M.y - Y + 1
+      if hleft < nh then
+        nh := hleft
+      end
+      r := s.run
+      while r.right + x < X do
+        r := r.next
+      end
+      wleft := W
+      while wleft > 0 do
+        nw := r.right + x - X + 1
+        if wleft < nw then
+          nw := wleft
+        end
+        if r.value > 0 then
+          Display.FillPattern(col, pat, pX, pY, X, Y, nw, nh, mode)
+        end
+        inc(X, nw)
+        dec(wleft, nw)
+        r := r.next
+      end
+
+      inc(Y, nh)
+      dec(hleft, nh)
+      s := s.next
+      r := nil
+      X := X0
+    end
+  end
+end FillPattern
+
+// Same as Display.CopyPattern, but through a clipping mask.
+procedure CopyPattern*(M: Mask; col: int32; pat: AnyPtr; X, Y, mode: int16)
+  var
+    W, H, X0, hleft, wleft, nw, nh, ax, ay, cx, cy, cw, ch, x, y: int16
+    s: ScanLine
+    r: Run
+begin
+  Display.GetDim(pat, @W, @H)
+  if (M = nil) or Visible(M, X, Y, W, H) then
+    Display.CopyPattern(col, pat, X, Y, mode)
+  elsif (X >= M.X + M.W) or (X + W <= M.X) or (Y >= M.Y + M.H) or (Y + H <= M.Y) then
+  // skip
+  elsif M.simple then
+    Display.SetClip(M.X, M.Y, M.W, M.H)
+    Display.AdjustClip(M.sX + M.x, M.sY + M.y, M.sW, M.sH)
+    Display.CopyPattern(col, pat, X, Y, mode)
+    Display.ResetClip()
+  else
+    ax := X
+    ay := Y
+    Display.SetClip(M.X, M.Y, M.W, M.H)
+    Display.GetClip(@cx, @cy, @cw, @ch)
+    x := M.x
+    y := M.y
+    s := M.scanline
+    while s.top + y < Y do
+      s := s.next
+    end
+    hleft := H
+    X0 := X
+    while hleft > 0 do
+      nh := Min(s.top + M.y - Y + 1, hleft)
+      r := s.run
+      while r.right + x < X do
+        r := r.next
+      end
+      wleft := W
+      while wleft > 0 do
+        nw := r.right + x - X + 1
+        if wleft < nw then
+          nw := wleft
+        end
+        if r.value > 0 then
+          Display.AdjustClip(r.x + x, s.y + y, r.w, s.h)
+          Display.CopyPattern(col, pat, ax, ay, mode)
+          Display.SetClip(cx, cy, cw, ch)
+        end
+
+        inc(X, nw)
+        dec(wleft, nw)
+        r := r.next
+      end
+
+      inc(Y, nh)
+      dec(hleft, nh)
+      s := s.next
+      r := nil
+      X := X0
+    end
+
+    Display.ResetClip()
+  end
+end CopyPattern
+
+// ---------- Extra output primitives --------
+
+// Draw rectangle outline in the specified size, line width and pattern.
+procedure Rect*(M: Mask; col: int32; pat: AnyPtr; X, Y, W, H, width, mode: int16)
+  var
+    mX, mW: int16
+begin
+  width := Min(width, Min(asr(H, 1), asr(W, 1)))
+  FillPattern(M, col, pat, X, Y, X, Y, width, H, mode)
+  FillPattern(M, col, pat, X, Y, X + W - width, Y, width, H, mode)
+  if (X < Display.Width) & (X + W >= Display.Width) & (M # nil) & (M.X < Display.Width) & (M.X + M.W >= Display.Width) then
+    mX := M.X
+    mW := M.W
+    M.W := Display.Width - M.X
+    FillPattern(M, col, pat, X, Y, X + width, Y, W - 2 * width, width, mode)
+    FillPattern(M, col, pat, X, Y, X + width, Y + H - width, W - 2 * width, width, mode)
+    M.W := mW - M.W
+    M.X := Display.Width
+    FillPattern(M, col, pat, X, Y, X + width, Y, W - 2 * width, width, mode)
+    FillPattern(M, col, pat, X, Y, X + width, Y + H - width, W - 2 * width, width, mode)
+    M.X := mX
+    M.W := mW
+  else
+    FillPattern(M, col, pat, X, Y, X + width, Y, W - 2 * width, width, mode)
+    FillPattern(M, col, pat, X, Y, X + width, Y + H - width, W - 2 * width, width, mode)
+  end
+end Rect
+
+// Draw rectangle outline in width using top and bottom shadow (3D effects ).
+procedure Rect3D*(M: Mask; topcol, botcol: int32; X, Y, W, H, width, mode: int16)
+begin
+  width := Min(width, Min(asr(H, 1), asr(W, 1)))
+  while width > 0 do
+    ReplConst(M, botcol, X, Y, W, 1, mode)
+    ReplConst(M, topcol, X, Y + H - 1, W, 1, mode)
+    ReplConst(M, topcol, X, Y, 1, H, mode)
+    ReplConst(M, botcol, X + W - 1, Y, 1, H, mode)
+    dec(width)
+    inc(X)
+    inc(Y)
+    dec(W, 2)
+    dec(H, 2)
+  end
+end Rect3D
+
+// Fill rectangle with 3D shadow effects. incol specifies the "inside" color.
+procedure FilledRect3D*(M: Mask; topcol, botcol, incol: int32; X, Y, W, H, width, mode: int16)
+begin
+  width := Min(width, Min(asr(H, 1), asr(W, 1)))
+  while width > 0 do
+    ReplConst(M, botcol, X, Y, W, 1, mode)
+    ReplConst(M, topcol, X, Y + H - 1, W, 1, mode)
+    ReplConst(M, topcol, X, Y, 1, H, mode)
+    ReplConst(M, botcol, X + W - 1, Y, 1, H, mode)
+    dec(width)
+    inc(X)
+    inc(Y)
+    dec(W, 2)
+    dec(H, 2)
+  end
+
+  ReplConst(M, incol, X, Y, W, H, mode)
+end FilledRect3D
+
+// BRUSHES
+
+procedure BrushJump(b: pointer to Brush; x, y: int16)
+  var
+    i: int16
+begin
+  if (b.x # x) or (b.y # y) then
+    b.x := x
+    b.y := y
+    for i := 0 to b.bufh - 1 do
+      b.bufl[i] := b.brul[i] + b.x
+      b.bufr[i] := b.brur[i] + b.x
+    end
+  end
+end BrushJump
+
+procedure BrushWalk(b: pointer to Brush; x, y: int16)
+  var
+    i, dx, dy, t: int16
+begin
+  dx := x - b.x
+  dy := y - b.y
+  t := b.bufh - 1
+  if dy = 0 then
+    // horizontal move
+    if dx < 0 then
+      for i := 0 to t do
+        b.bufl[i] := Min(b.bufl[i], b.brul[i] + x)
+      end
+    elsif dx > 0 then
+      for i := 0 to t do
+        b.bufr[i] := Max(b.bufr[i], b.brur[i] + x)
+      end
+    end
+
+  elsif dy > 0 then
+    // up
+    FillPattern(b.M, b.col, b.pat, 0, 0, b.bufl[0], b.y - b.brushr, b.bufr[0] - b.bufl[0] + 1, 1, b.mode)
+    for i := 0 to b.bufh - 2 do
+      b.bufl[i] := Min(b.bufl[i + 1], b.brul[i] + x)
+      b.bufr[i] := Max(b.bufr[i + 1], b.brur[i] + x)
+    end
+
+    b.bufl[t] := b.brul[t] + x
+    b.bufr[t] := b.brur[t] + x
+
+  else
+    // dy < 0
+    // down
+    FillPattern(b.M, b.col, b.pat, 0, 0, b.bufl[t], b.y - b.brushr + b.bufh - 1, b.bufr[t] - b.bufl[t] + 1, 1, b.mode)
+
+    for i := b.bufh - 1 to 1 by -1 do
+      b.bufl[i] := Min(b.bufl[i - 1], b.brul[i] + x)
+      b.bufr[i] := Max(b.bufr[i - 1], b.brur[i] + x)
+    end
+
+    b.bufl[0] := b.brul[0] + x
+    b.bufr[0] := b.brur[0] + x
+  end
+
+  b.x := x
+  b.y := y
+end BrushWalk
+
+procedure BrushFlush(b: pointer to Brush)
+  var
+    i: int16
+begin
+  for i := 0 to b.bufh - 1 do
+    FillPattern(b.M, b.col, b.pat, 0, 0, b.bufl[i], b.y + i - b.brushr, b.bufr[i] - b.bufl[i] + 1, 1, b.mode)
+  end
+end BrushFlush
+
+procedure InitBrush(b: pointer to Brush; M: Mask; pat: AnyPtr; col: int32; w, mode: int16)
+  var
+    r, x, y, d, dx, dy: int16
+
+  procedure Set(x, y: int16; b: pointer to Brush; r: pointer to int16)
+  begin
+    b.brul[y + r^] := -x + 1
+    b.brur[y + r^] := x
+    b.brul[-y + r^] := -x + 1
+    b.brur[-y + r^] := x
+    if y + r^ > b.bufh then
+      b.bufh := y + r^
+    end
+  end Set
+begin
+  b.bufh := 0
+  b.M := M
+  b.col := col
+  b.mode := mode
+  b.pat := pat
+  if w >= BrushSize then
+    w := BrushSize - 1i1
+  end
+
+  b.x := (-32768i2)
+  b.y := (-32768i2)
+  r := asr(w, 1) // radius
+  if r < 0 then
+    r := 1
+  end
+  x := r
+  y := 0
+  d := 2 * r
+  dx := 4 * r
+  dy := 0
+  Set(x, y, b, @r)
+  while y # r do
+    while d <= 1 do
+      dec(x)
+      dec(dx, 4)
+      inc(d, dx)
+    end
+    inc(y)
+    Set(x, y, b, @r)
+    inc(dy, 4)
+    dec(d, dy)
+  end
+
+  b.brushr := r
+  inc(b.bufh)
+end InitBrush
+
+// --------------------- Scan line based primitives ---------------------
+
+// Draw a line in the specified pattern and width. Round brushes are used to draw thick lines.
+procedure Line*(M: Mask; col: int32; pat: AnyPtr; X, Y, X1, Y1, width, mode: int16)
+  var
+    x, y, dx, dy, inx, iny, d, dy2, dx2: int16
+begin
+  dx := asr(width, 1)
+  dx2 := width + 1
+  if Visible(M, Min(X, X1) - dx, Min(Y, Y1) - dx, abs(X1 - X) + dx2, abs(Y1 - Y) + dx2) then
+    M := nil
+  end
+  x := X
+  y := Y
+  dx := X1 - X
+  dy := Y1 - Y
+  if width > 1 then
+    if drawingPolygon then
+    else
+      InitBrush(@brush, M, pat, col, width, mode)
+      BrushJump(@brush, x, y)
+    end
+
+    if abs(dy) > abs(dx) then
+      d := -abs(dx)
+      dy2 := 2 * abs(dy)
+      dx2 := 2 * abs(dx)
+      if dx < 0 then
+        inx := -1
+      else
+        inx := 1
+      end
+      if dy < 0 then
+        iny := -1
+      else
+        iny := 1
+      end
+      while y # Y1 do
+        inc(y, iny)
+        inc(d, dx2)
+        if d > 0 then
+          inc(x, inx)
+          dec(d, dy2)
+        end
+        BrushWalk(@brush, x, y)
+      end
+
+    else
+      d := -abs(dx)
+      dy2 := 2 * abs(dy)
+      dx2 := 2 * abs(dx)
+      if dx < 0 then
+        inx := -1
+      else
+        inx := 1
+      end
+      if dy < 0 then
+        iny := -1
+      else
+        iny := 1
+      end
+      while x # X1 do
+        inc(x, inx)
+        inc(d, dy2)
+        if d > 0 then
+          inc(y, iny)
+          dec(d, dx2)
+        end
+        BrushWalk(@brush, x, y)
+      end
+    end
+
+    if ~drawingPolygon then
+      BrushFlush(@brush)
+    end
+  else
+    if abs(dy) > abs(dx) then
+      d := -abs(dx)
+      dy2 := 2 * abs(dy)
+      dx2 := 2 * abs(dx)
+      if dx < 0 then
+        inx := -1
+      else
+        inx := 1
+      end
+      if dy < 0 then
+        iny := -1
+      else
+        iny := 1
+      end
+      while y # Y1 do
+        inc(y, iny)
+        inc(d, dx2)
+        if d > 0 then
+          inc(x, inx)
+          dec(d, dy2)
+        end
+        if pat = Display.solid then
+          Dot(M, col, x, y, mode)
+        else
+          FillPattern(M, col, pat, 0, 0, x, y, 1, 1, mode)
+        end
+      end
+
+    else
+      d := -abs(dx)
+      dy2 := 2 * abs(dy)
+      dx2 := 2 * abs(dx)
+      if dx < 0 then
+        inx := -1
+      else
+        inx := 1
+      end
+      if dy < 0 then
+        iny := -1
+      else
+        iny := 1
+      end
+      while x # X1 do
+        inc(x, inx)
+        inc(d, dy2)
+        if d > 0 then
+          inc(y, iny)
+          dec(d, dx2)
+        end
+        if pat = Display.solid then
+          Dot(M, col, x, y, mode)
+        else
+          FillPattern(M, col, pat, 0, 0, x, y, 1, 1, mode)
+        end
+      end
+    end
+  end
+end Line
+
+procedure FilledPoly(M: Mask; col: int32; pat: AnyPtr; X, Y: pointer to array of int16; n, mode: int16)
+
+  type
+    Run = pointer to RunDesc0
+    RunDesc0 = record
+      next: Run
+      x: int16
+    end
+
+  var
+    scan: array 2000 of Run
+    free, s: Run
+    i, miny, maxy, x0, x1: int16
+
+  procedure New(s: pointer to Run; free: pointer to Run)
+  begin
+    if free^ = nil then
+      newgc(s^)
+    else
+      s^ := free^
+      free^ := free^.next
+      s^.next := nil
+    end
+  end New
+
+  procedure Free(s: pointer to Run; free: pointer to Run)
+    var
+      s0: Run
+  begin
+    if s^ # nil then
+      s0 := s^
+      while s0.next # nil do
+        s0 := s0.next
+      end
+      s0.next := free^
+      free^ := s^
+      s^ := nil
+    end
+  end Free
+
+  procedure Insert(s: pointer to Run; x: int16; free: pointer to Run)
+    var
+      t, t0: Run
+  begin
+    if s^ = nil then
+      New(s, free)
+      s^.x := x
+    else
+      New(@t, free)
+      t.x := x
+      if x < s^.x then
+        t.next := s^
+        s^ := t
+      else
+        t0 := s^
+        while (t0.next # nil) & (t0.next.x < x) do
+          t0 := t0.next
+        end
+        if t0.next = nil then
+          t0.next := t
+        else
+          t.next := t0.next
+          t0.next := t
+        end
+      end
+    end
+  end Insert
+
+  procedure line(x1, y1, x2, y2: int16; free: pointer to Run; scan: pointer to array 2000 of Run)
+    // standard bresenham
+    var
+      x, y, d, dx, dy, incx, incy: int16
+  begin
+    // Seg(x1,y1);
+    x := x1
+    y := y1
+    dx := (x2 - x1) * 2
+    dy := (y2 - y1) * 2
+    incx := 0
+    if dx < 0 then
+      incx := -1
+      dx := -dx
+    elsif dx > 0 then
+      incx := 1
+    end
+
+    incy := 0
+    if dy < 0 then
+      incy := -1
+      dy := -dy
+    elsif dy > 0 then
+      incy := 1
+    end
+    d := incx * (x1 - x2)
+    while y # y2 do
+      inc(y, incy)
+      inc(d, dx)
+      while d > 0 do
+        inc(x, incx)
+        dec(d, dy)
+      end
+      if incy > 0 then
+        Insert(@scan[y], x, free)
+      else
+        Insert(@scan[y + 1], x, free)
+      end
+    end
+  end line
+begin
+  free := nil
+  miny := 32767
+  maxy := (-32768i2)
+  i := 0
+  while i < n do
+    if Y[i] < miny then
+      miny := Y[i]
+    end
+    if Y[i] > maxy then
+      maxy := Y[i]
+    end
+    inc(i)
+  end
+  i := 0
+  while i <= maxy - miny do
+    scan[i] := nil
+    inc(i)
+  end
+  i := 1
+  while i < n do
+    line(X[i - 1], Y[i - 1] - miny, X[i], Y[i] - miny, @free, @scan)
+    inc(i)
+  end
+
+  line(X[n - 1], Y[n - 1] - miny, X[0], Y[0] - miny, @free, @scan)
+
+  i := 0
+  while i <= maxy - miny do
+    s := scan[i]
+    while s # nil do
+      x0 := s.x
+      s := s.next
+      if s = nil then
+        x1 := x0
+      else
+        x1 := s.x
+        s := s.next
+      end
+      FillPattern(M, col, pat, 0, 0, x0, i + miny, x1 - x0 + 1, 1, mode)
+    end
+
+    Free(@scan[i], @free)
+    inc(i)
+  end
+end FilledPoly
+
+// Draw a polygon in pattern pat. n specifies the number of vertices listed in the arrays X and Y. Style may be {filled}.
+procedure Poly*(M: Mask; col: int32; pat: AnyPtr; X, Y: pointer to array of int16; n, width: int16; style: set; mode: int16)
+  var
+    i: int16
+begin
+  if filled in style then
+    FilledPoly(M, col, pat, X, Y, n, mode)
+  else
+    drawingPolygon := true
+    if width > 1 then
+      InitBrush(@brush, M, pat, col, width, mode)
+      BrushJump(@brush, X[0], Y[0])
+    end
+    i := 0
+    while i < n - 1 do
+      Line(M, col, pat, X[i], Y[i], X[i + 1], Y[i + 1], width, mode)
+      inc(i)
+    end
+
+    drawingPolygon := false
+    if width > 1 then
+      BrushFlush(@brush)
+    end
+  end
+end Poly
+
+// Draw an ellipse. Implementation restriction: cannot fill an ellipse or draw an ellipse with line width > 1
+procedure Ellipse*(M: Mask; col: int32; pat: AnyPtr; X, Y, a, b, width: int16; style: set; mode: int16)
+  var
+    x1, y1: int16
+    d, dx, dy, x2, y2, a1, a2, a8, b1, b2, b8: int32
+
+  procedure Dot4(x1, x2, y1, y2: int16; M: pointer to Mask; col: pointer to int32; mode: pointer to int16; pat: pointer to AnyPtr)
+  begin
+    if pat^ = Display.solid then
+      Dot(M^, col^, x1, y1, mode^)
+      Dot(M^, col^, x1, y2, mode^)
+      Dot(M^, col^, x2, y1, mode^)
+      Dot(M^, col^, x2, y2, mode^)
+    else
+      FillPattern(M^, col^, pat^, 0, 0, x1, y1, 1, 1, mode^)
+      FillPattern(M^, col^, pat^, 0, 0, x1, y2, 1, 1, mode^)
+      FillPattern(M^, col^, pat^, 0, 0, x2, y1, 1, 1, mode^)
+      FillPattern(M^, col^, pat^, 0, 0, x2, y2, 1, 1, mode^)
+    end
+  end Dot4
+begin
+  if Visible(M, X - a, Y - b, 2 * a + 1, 2 * b + 1) then
+    M := nil
+  end
+  if (a < 600) & (b < 600) then
+    a1 := a
+    a2 := a1 * a1
+    a8 := 8 * a2
+    b1 := b
+    b2 := b1 * b1
+    b8 := 8 * b2
+    x1 := a
+    y1 := 0
+    x2 := a1 * b2
+    y2 := 0
+    dx := b8 * (a1 - 1)
+    dy := 4 * a2
+    d := b2 * (1 - 4 * a1)
+    while y2 < x2 do
+      Dot4(X - x1, X + x1, Y - y1, Y + y1, @M, @col, @mode, @pat) // -1
+      // -1
+      inc(d, dy)
+      inc(dy, a8)
+      inc(y1)
+      inc(y2, a2)
+      if d >= 0 then
+        dec(d, dx)
+        dec(dx, b8)
+        dec(x1)
+        dec(x2, b2)
+      end
+    end
+
+    inc(d, 4 * (x2 + y2) - b2 + a2)
+    while x1 >= 0 do
+      Dot4(X - x1, X + x1, Y - y1, Y + y1, @M, @col, @mode, @pat) // -1
+      // -1
+      dec(d, dx)
+      dec(dx, b8)
+      dec(x1)
+      if d < 0 then
+        inc(d, dy)
+        inc(dy, a8)
+        inc(y1)
+      end
+    end
+  end
+end Ellipse
+
+// Draw a circle in radius r using pattern pat at position X, Y. Thick line widths are allowed.
+procedure Circle*(M: Mask; col: int32; pat: AnyPtr; X, Y, r, width: int16; style: set; mode: int16)
+  var
+    x, y, dx, dy, d, e: int16
+begin
+  if filled in style then
+    if Visible(M, X - r, Y - r, 2 * r + 1, 2 * r + 1) then
+      M := nil
+    end
+    x := r
+    y := 0
+    e := 0
+    dx := 2
+    dy := 2
+    while y <= x do
+      FillPattern(M, col, pat, X, Y, X - x, Y + y, 2 * x + 1, 1, mode)
+      FillPattern(M, col, pat, X, Y, X - x, Y - y, 2 * x + 1, 1, mode)
+      inc(y)
+      inc(e, y * dy - 1)
+      if e > x then
+        dec(x)
+        dec(e, x * dx + 1)
+        FillPattern(M, col, pat, X, Y, X - y, Y + x, 2 * y + 1, 1, mode)
+        FillPattern(M, col, pat, X, Y, X - y, Y - x, 2 * y + 1, 1, mode)
+      end
+    end
+
+  elsif width > 1 then
+    d := r + asr(width + 1, 1)
+    if Visible(M, X - d, Y - d, 2 * d + 1, 2 * d + 1) then
+      M := nil
+    end
+    x := X + r
+    y := Y
+    InitBrush(@brush, M, pat, col, width, mode)
+    BrushJump(@brush, x, y)
+
+    d := 2 * r
+    dx := 4 * r
+    dy := 0
+    while y # Y + r do
+      while d <= 1 do
+        dec(x)
+        BrushWalk(@brush, x, y)
+        dec(dx, 4)
+        inc(d, dx)
+      end
+      inc(y)
+      BrushWalk(@brush, x, y)
+      inc(dy, 4)
+      dec(d, dy)
+    end
+
+    while x # X do
+      dec(x)
+      BrushWalk(@brush, x, y)
+      dec(dx, 4)
+      inc(d, dx)
+    end
+    d := -d
+    while x # X - r do
+      while d <= 1 do
+        dec(y)
+        BrushWalk(@brush, x, y)
+        dec(dy, 4)
+        inc(d, dy)
+      end
+      dec(x)
+      BrushWalk(@brush, x, y)
+      inc(dx, 4)
+      dec(d, dx)
+    end
+
+    while y # Y do
+      dec(y)
+      BrushWalk(@brush, x, y)
+      dec(dy, 4)
+      inc(d, dy)
+    end
+    d := -d
+    while y # Y - r do
+      while d <= 1 do
+        inc(x)
+        BrushWalk(@brush, x, y)
+        dec(dx, 4)
+        inc(d, dx)
+      end
+      dec(y)
+      BrushWalk(@brush, x, y)
+      inc(dy, 4)
+      dec(d, dy)
+    end
+
+    while x # X do
+      inc(x)
+      BrushWalk(@brush, x, y)
+      dec(dx, 4)
+      inc(d, dx)
+    end
+    d := -d
+    while x # X + r do
+      while d <= 1 do
+        inc(y)
+        BrushWalk(@brush, x, y)
+        dec(dy, 4)
+        inc(d, dy)
+      end
+      inc(x)
+      BrushWalk(@brush, x, y)
+      inc(dx, 4)
+      dec(d, dx)
+    end
+
+    while y # Y do
+      inc(y)
+      BrushWalk(@brush, x, y)
+      dec(dy, 4)
+      inc(d, dy)
+    end
+    BrushFlush(@brush)
+  else
+    // IF Visible(M, X - r, Y - r, 2 * r + 1, 2 * r + 1) THEN M := NIL END;
+    Ellipse(M, col, pat, X, Y, r, r, width, style, mode)
+  end
+end Circle
+
+// ---- end of scanline primitives ----
+
+// Draw string s in font fnt and color col at position X, Y.
+procedure String*(M: Mask; col: int32; X, Y: int16; fnt: Fonts.Font; const s: pointer to array of char; mode: int16)
+  var
+    r: Objects.Object
+    p: int16
+begin
+  p := 0
+  while s[p] # 0X do
+    fnt.GetObj(fnt, val(int16, ord(s[p])), @r)
+    case r of
+    | Fonts.Char:
+      CopyPattern(M, col, r.pat (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; Oberon: CopyPattern(M, col, r.pat, X + r.x, Y + r.y, mode); *), X + r.x, Y + r.y, mode)
+      inc(X, r.dx)
+      inc(p)
+    end
+  end
+end String
+
+// Draw a string s in font fnt centered in the rectangle X, Y, W, H. Line breaks will be inserted as needed.
+procedure CenterString*(M: Mask; col: int32; X, Y, W, H: int16; fnt: Fonts.Font; const s: pointer to array of char; mode: int16)
+  var
+    s00: array 256 of char
+    s00_i: int32
+    len_, p, h, lspc, i, y: int16
+    r: Objects.Object
+    s0: array 64 of char
+begin
+  s00_i := 0
+  while (s00_i < 255) & (s[s00_i] # 0X) do s00[s00_i] := s[s00_i]; inc(s00_i) end
+  s00[s00_i] := 0X
+  len_ := 0
+  p := 0
+  while s00[p] # 0X do
+    fnt.GetObj(fnt, val(int16, ord(s00[p])), @r)
+    inc(p)
+    inc(len_, r(Fonts.Char).dx)
+  end
+
+  if len_ < W - 4 then
+    // normal print
+    String(M, col, asr(W - len_, 1) + X, Y + asr(H, 1) - asr(fnt.height, 1) + abs(fnt.minY), fnt, @s00, mode)
+  else
+    // formatted print
+    p := 0
+    len_ := 0
+    h := 0
+    lspc := -1
+    while s00[p] # 0X do
+      fnt.GetObj(fnt, val(int16, ord(s00[p])), @r)
+      if len_ + r(Fonts.Char).dx >= W then
+        // too long next line
+        if s00[p] = " " then
+          lspc := -1
+          s00[p] := 1X
+          inc(h, fnt.height)
+          len_ := 0
+        elsif lspc > 0 then
+          // space exists
+          p := lspc
+          lspc := -1
+          s00[p] := 1X
+          inc(h, fnt.height)
+          len_ := 0
+        else
+          inc(len_, r(Fonts.Char).dx)
+        end
+
+      else
+        inc(len_, r(Fonts.Char).dx)
+        if s00[p] = " " then
+          lspc := p
+        end
+      end
+
+      inc(p)
+    end
+    inc(h, fnt.height)
+
+    // print
+    p := 0
+    i := 0
+    len_ := 0
+    y := Y + asr(H, 1) + asr(h, 1) + abs(fnt.minY)
+    while s00[p] # 0X do
+      fnt.GetObj(fnt, val(int16, ord(s00[p])), @r)
+      if s00[p] = 1X then
+        // break
+        s0[i] := 0X
+        i := 0
+        dec(y, fnt.height)
+        String(M, col, X + asr(W, 1) - asr(len_, 1), y, fnt, @s0, mode)
+        len_ := 0
+      else
+        fnt.GetObj(fnt, val(int16, ord(s00[p])), @r)
+        inc(len_, r(Fonts.Char).dx)
+        s0[i] := s00[p]
+        inc(i)
+      end
+
+      inc(p)
+    end
+    dec(y, fnt.height)
+    if i > 0 then
+      s0[i] := 0X
+      String(M, col, X + asr(W, 1) - asr(len_, 1), y, fnt, @s0, mode)
+    end
+  end
+end CenterString
+
+// Return the size of a string in width w and height h. dsr returns the baseline offset as a positive value.
+procedure StringSize*(const s: pointer to array of char; fnt: Fonts.Font; w, h, dsr: pointer to int16)
+  var
+    p: int16
+    r: Objects.Object
+begin
+  w^ := 0
+  h^ := fnt.height
+  dsr^ := abs(fnt.minY)
+  p := 0
+  while s[p] # 0X do
+    fnt.GetObj(fnt, val(int16, ord(s[p])), @r)
+    inc(w^, r(Fonts.Char).dx)
+    inc(p)
+  end
+end StringSize
+
+procedure EnumPict(X, Y, W, H: int16)
+begin
+  Pictures.DisplayBlock(tmpP, X + dX, Y + dY, W, H, X, Y, tmpM)
+end EnumPict
+
+// Draw the area X, Y, W, H of picture P at position DX, DY on the display.
+procedure Pict*(M: Mask; P: Pictures.Picture; X, Y, W, H, DX, DY, mode: int16)
+begin
+  dX := X - DX
+  dY := Y - DY
+  ClipAgainst(@DX, @DY, @W, @H, M.X, M.Y, M.W, M.H)
+  tmpP := P
+  tmpM := mode
+  EnumRect(M, DX, DY, W, H, EnumPict)
+  tmpP := nil // for GC
+end Pict
+
+// Replicate a picture filling area X, Y, W, H on the display. px, py is the picture pin-point.
+procedure ReplPict*(M: Mask; P: Pictures.Picture; px, py, X, Y, W, H, mode: int16)
+  var
+    x, y, w, h, pw, ph, w0, x0: int16
+begin
+  pw := P.width
+  ph := P.height
+  w0 := W
+  x0 := X
+
+  while H > 0 do
+    y := obmod(Y - py, ph)
+    h := Min(H, ph - y)
+    W := w0
+    X := x0
+    while W > 0 do
+      x := obmod(X - px, pw)
+      w := Min(W, pw - x)
+      Pict(M, P, x, y, w, h, X, Y, mode)
+      inc(X, w)
+      dec(W, w)
+    end
+
+    inc(Y, h)
+    dec(H, h)
+  end
+end ReplPict
+
+procedure Init()
+  var
+    s: Texts.Scanner
+begin
+  Oberon.OpenScanner(@s, "Gadgets.Hardlook")
+  if ((s.class = Texts.Name) or (s.class = Texts.String)) & (val(int32, band(ord(s.s[0]), 0DFH)) = 59H) then
+    bottomC := Display.FG // hardlook
+  else
+    bottomC := 12 // softlook
+  end
+end Init
+
+begin
+  Modules.Register("Display3", nil)
+  drawingPolygon := false
+  selectpat := Display.grey1
+  FG := 15
+  BG := 0
+  red := 1
+  green := 2
+  blue := 3
+
+  black := Display.FG
+  white := Display.BG
+  if Display.Depth(0) = 1 then
+    topC := Display.FG
+    upC := Display.BG
+    downC := Display.BG
+    groupC := Display.BG
+    invertC := Display.FG
+    textC := Display.FG
+    textbackC := Display.BG
+    bottomC := Display.FG
+  else
+    topC := Display.BG
+    upC := 13
+    downC := 12
+    groupC := 13
+    if Display.TrueColor(0) then
+      invertC := white
+    else
+      invertC := 3
+    end
+    textC := Display.FG
+    textbackC := 14
+    Init()
+  end
+
+  textmode := Display.paint
+end Display3.

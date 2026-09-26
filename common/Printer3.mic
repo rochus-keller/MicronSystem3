@@ -1,0 +1,1381 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Printer3 [level=5]
+
+import Display3, Objects, Display, Printer, Fonts, Pictures, Modules
+// portable
+// jm 18.1.95
+
+// Module Printer3 implements clipped printing through display masks. It has a twin module Display3 for displaying graphics.
+
+(* kr 14. 4. 93 printer patterns
+kr Tue, 24-Aug-1993 Printer.String fixed
+jm 29.3.94 - added Pict support
+- fixed line printing with empty mask
+20.4.94 - Fixed CenterString
+4.5.94 - improved metric handling
+8.12.94 - removed NewPattern, CopyPattern
+*)
+
+const
+  replConst = 0
+  replPattern = 2
+  line = 3
+
+  SizeHack = false // jsedlacek - not needed after fix in TextFields?
+
+type 
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+
+var
+  Pattern*: array 9 of AnyPtr // Display patterns that correspond to the printer patterns.
+  class, ex, ey, ex1, ey1, pattern: int16
+
+  // tmp vars for printing pictures
+  tmpP: Pictures.Picture
+  tX, tY, tW, tH: int16
+
+// ========= Brush related =========
+
+const
+  BrushSize = 100 // maximum width of the brush
+
+type
+  Brush = record
+    brul, brur, bufl, bufr: array 100 (* BrushSize *) of int16
+
+    bufh, brushr, x, y, mode: int16
+
+    col: int32
+    M: Display3.Mask
+    pat: AnyPtr
+  end
+
+var
+  drawingPolygon: boolean
+  brush: Brush // global Brush
+
+(* not portable
+PROCEDURE NewPattern*(pat: Display.Pattern): Display.Pattern;
+VAR x, y, b, l, r, t, w, h, i, W, H : INTEGER; s : SET; d : ARRAY 256, 4 OF SET; p, s0 : LONGINT; D, P : LONGINT;
+k : SHORTINT;
+ptr : POINTER TO RECORD END;
+BEGIN
+y := 0;
+WHILE y < 256 DO
+x := 0; WHILE x < 4 DO d[y,x] := {}; INC(x);END;
+INC(y);
+END;
+
+(* zoom pattern *)
+D := Display.Unit; P := Unit;
+Display.GetDim(pat, w, h);
+p := SYSTEM.VAL(LONGINT,pat) + 2;
+y := 0;
+WHILE y < h DO x := 0;
+SYSTEM.GET(p,s);
+WHILE x < w DO
+IF x IN s THEN
+l := SHORT(x * D DIV P); r := SHORT((x +1) * D DIV P);
+b := SHORT(y * D DIV P); t := SHORT((y +1) * D DIV P);
+WHILE b < t DO i := l;
+WHILE i < r DO
+INCL(d[b, i DIV 32], i MOD 32);
+INC(i)
+END;
+INC(b);
+END
+END;
+INC(x);
+END;
+INC(p,LONG(w + 7) DIV 8 );
+INC(y);
+END;
+
+(* copy pattern *)
+H := SHORT(h * D DIV P);
+W := SHORT(w * D DIV P);
+SYSTEM.NEW(ptr, (W +7) DIV 8 * 8 * H + 8);
+p := SYSTEM.VAL(LONGINT,ptr);
+k := SHORT(W); SYSTEM.PUT(p,k); INC(p);
+k := SHORT(H); SYSTEM.PUT(p,k); INC(p);
+y := 0;
+WHILE y < H DO x := 0;
+WHILE x < W DO
+SYSTEM.PUT(p,d[y,x DIV 32]);
+IF W - x >= 32 THEN r := 4 ELSE r := (W - x + 7) DIV 8 END;
+INC(x,32); INC(p,LONG(r));
+END;
+INC(y);
+END ;
+RETURN SYSTEM.VAL(LONGINT,ptr);
+END NewPattern;
+*)
+
+procedure Min(x, y: int16): int16
+begin
+  if x < y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+procedure Max(x, y: int16): int16
+begin
+  if x > y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Max
+
+procedure ClipAgainst(x, y, w, h: pointer to int16; x1, y1, w1, h1: int16)
+  var
+    r, t, r1, t1: int16
+begin
+  r := x^ + w^ - 1
+  r1 := x1 + w1 - 1
+  t := y^ + h^ - 1
+  t1 := y1 + h1 - 1
+  if x^ < x1 then
+    x^ := x1
+  end
+  if y^ < y1 then
+    y^ := y1
+  end
+  if r > r1 then
+    r := r1
+  end
+  if t > t1 then
+    t := t1
+  end
+  w^ := r - x^ + 1
+  h^ := t - y^ + 1
+end ClipAgainst
+
+procedure IntersectLine(x1, y1, x2, y2: pointer to int16; X, Y, W, H: int16): boolean
+  const
+    left = 0
+    right = 1
+    bottom = 2
+    top = 3
+  var
+    c1, c2: set
+    R, T, x0, y0: int16
+    dx, dy: int32
+
+  procedure Code(x, y: int16; R: pointer to int16; T: pointer to int16; X: pointer to int16; Y: pointer to int16): set
+    var
+      c: set
+  begin
+    c := {}
+    if x < X^ then
+      c := c + {left}
+    elsif x > R^ then
+      c := c + {right}
+    end
+    if y < Y^ then
+      c := c + {bottom}
+    elsif y > T^ then
+      c := c + {top}
+    end
+    return c
+  end Code
+
+  procedure Clip(x, y: pointer to int16; c: pointer to set; R: pointer to int16; T: pointer to int16; X: pointer to int16; Y: pointer to int16; dx: pointer to int32; dy: pointer to int32; x0: pointer to int16; y0: pointer to int16)
+  begin
+    if left in c^ then
+      y^ := val(int16, y0^ + obdiv(dy^ * (X^ - x0^), dx^))
+      x^ := X^
+    elsif right in c^ then
+      y^ := val(int16, y0^ + obdiv(dy^ * (R^ - x0^), dx^))
+      x^ := R^
+    elsif bottom in c^ then
+      x^ := val(int16, x0^ + obdiv(dx^ * (Y^ - y0^), dy^))
+      y^ := Y^
+    elsif top in c^ then
+      x^ := val(int16, x0^ + obdiv(dx^ * (T^ - y0^), dy^))
+      y^ := T^
+    end
+
+    c^ := Code(x^, y^, R, T, X, Y)
+  end Clip
+begin
+  R := X + W
+  T := Y + H
+  c1 := Code(x1^, y1^, @R, @T, @X, @Y)
+  c2 := Code(x2^, y2^, @R, @T, @X, @Y)
+  dy := y2^ - y1^
+  dx := x2^ - x1^
+  x0 := x1^
+  y0 := y1^
+  while (c1 + c2 # {}) & (c1 * c2 = {}) do
+    if c1 = {} then
+      Clip(x2, y2, @c2, @R, @T, @X, @Y, @dx, @dy, @x0, @y0)
+    else
+      Clip(x1, y1, @c1, @R, @T, @X, @Y, @dx, @dy, @x0, @y0)
+    end
+  end
+
+  return c1 * c2 = {}
+end IntersectLine
+
+procedure PPat(pat: AnyPtr): int16
+  var
+    i: int16
+begin
+  i := 0
+  while i < 9 do
+    if pat = Pattern[i] then
+      return i
+    end
+    inc(i)
+  end
+
+  if pat = Display.grey0 then
+    return 4
+  elsif pat = Display.grey1 then
+    return 4
+  elsif pat = Display.grey2 then
+    return 4
+  elsif pat = Display.solid then
+    return 5
+  else
+    return 5
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end PPat
+
+procedure UseCol(col: int32)
+  var
+    r, g, b: int16
+begin
+  Display.GetColor(col, @r, @g, @b)
+  Printer.UseColor(r, g, b)
+end UseCol
+
+procedure Enum(X, Y, W, H: int16)
+  var
+    u, v, u1_, v1: int16
+begin
+  case class of
+    0 (* replConst *):
+    Printer.ReplConst(X, Y, W, H)
+  | 2 (* replPattern *):
+    Printer.ReplPattern(X, Y, W, H, pattern)
+  | 3 (* line *):
+    u := ex
+    v := ey
+    u1_ := ex1
+    v1 := ey1
+    if IntersectLine(@u, @v, @u1_, @v1, X, Y, W, H) then
+      Printer.Line(u, v, u1_, v1)
+      Printer.ReplConst(u1_, v1, 1, 1)
+    end
+  end
+end Enum
+
+// Block fill X, Y, W, H using color col.
+procedure ReplConst*(M: Display3.Mask; col: int32; X, Y, W, H, mode: int16)
+begin
+  UseCol(col)
+  if M = nil then
+    Printer.ReplConst(X, Y, W, H)
+  else
+    ClipAgainst(@X, @Y, @W, @H, M.X, M.Y, M.W, M.H)
+    if (W > 0) & (H > 0) then
+      class := replConst
+      Display3.EnumRect(M, X, Y, W, H, Enum)
+    end
+  end
+
+  UseCol(Display3.black)
+end ReplConst
+
+// Print dot in color col at X, Y.
+procedure Dot*(M: Display3.Mask; col: int32; X, Y, mode: int16)
+begin
+  UseCol(col)
+  if M = nil then
+    Printer.ReplConst(X, Y, 1, 1)
+  elsif Display3.Visible(M, X, Y, 1, 1) then
+    Printer.ReplConst(X, Y, 1, 1)
+  end
+
+  UseCol(Display3.black)
+end Dot
+
+// Replicate fill pattern pat in area X, Y, W, H, using color col. pX, pY is the pattern pin-point.
+procedure FillPattern*(M: Display3.Mask; col: int32; pat: AnyPtr; pX, pY, X, Y, W, H, mode: int16)
+begin
+  UseCol(col)
+  pattern := PPat(pat)
+  if M = nil then
+    if pat = Display.solid then
+      Printer.ReplConst(X, Y, W, H)
+    else
+      Printer.ReplPattern(X, Y, W, H, pattern)
+    end
+
+  else
+    ClipAgainst(@X, @Y, @W, @H, M.X, M.Y, M.W, M.H)
+    if (W > 0) & (H > 0) then
+      if pat = Display.solid then
+        class := replConst
+      else
+        class := replPattern
+      end
+
+      Display3.EnumRect(M, X, Y, W, H, Enum)
+    end
+  end
+
+  UseCol(Display3.black)
+end FillPattern
+
+// Print rectangle outline X, Y, W, H of width and in pattern pat.
+procedure Rect*(M: Display3.Mask; col: int32; pat: AnyPtr; X, Y, W, H, width, mode: int16)
+begin
+  width := Min(width, Min(asr(H, 1), asr(W, 1)))
+  ReplConst(M, col, X, Y, width, H, mode)
+  ReplConst(M, col, X + W - width, Y, width, H, mode)
+  ReplConst(M, col, X + width, Y, W - 2 * width, width, mode)
+  ReplConst(M, col, X + width, Y + H - width, W - 2 * width, width, mode)
+end Rect
+
+// Print a rectangle outline X, Y, W, H of width width in 3D effect using top shadow topcol and bottom shadow botcol.
+procedure Rect3D*(M: Display3.Mask; topcol, botcol: int32; X, Y, W, H, width, mode: int16)
+begin
+  width := Min(width, Min(asr(H, 1), asr(W, 1)))
+  while width > 0 do
+    ReplConst(M, botcol, X, Y, W, 1, mode)
+    ReplConst(M, topcol, X, Y + H - 1, W, 1, mode)
+    ReplConst(M, topcol, X, Y, 1, H, mode)
+    ReplConst(M, botcol, X + W - 1, Y, 1, H, mode)
+    dec(width)
+    inc(X)
+    inc(Y)
+    dec(W, 2)
+    dec(H, 2)
+  end
+end Rect3D
+
+// Print a filled rectangle X, Y, W, H of width width in 3D effect using top shadow topcol and bottom shadow botcol. The "inside" color is incol.
+procedure FilledRect3D*(M: Display3.Mask; topcol, botcol, incol: int32; X, Y, W, H, width, mode: int16)
+begin
+  width := Min(width, Min(asr(H, 1), asr(W, 1)))
+  while width > 0 do
+    ReplConst(M, botcol, X, Y, W, 1, mode)
+    ReplConst(M, topcol, X, Y + H - 1, W, 1, mode)
+    ReplConst(M, topcol, X, Y, 1, H, mode)
+    ReplConst(M, botcol, X + W - 1, Y, 1, H, mode)
+    dec(width)
+    inc(X)
+    inc(Y)
+    dec(W, 2)
+    dec(H, 2)
+  end
+
+  ReplConst(M, incol, X, Y, W, H, mode)
+end FilledRect3D
+
+// BRUSHES
+
+procedure BrushJump(b: pointer to Brush; x, y: int16)
+  var
+    i: int16
+begin
+  if (b.x # x) or (b.y # y) then
+    b.x := x
+    b.y := y
+    for i := 0 to b.bufh - 1 do
+      b.bufl[i] := b.brul[i] + b.x
+      b.bufr[i] := b.brur[i] + b.x
+    end
+  end
+end BrushJump
+
+procedure BrushWalk(b: pointer to Brush; x, y: int16)
+  var
+    i, dx, dy, t: int16
+begin
+  dx := x - b.x
+  dy := y - b.y
+  t := b.bufh - 1
+  if dy = 0 then
+    // horizontal move
+    if dx < 0 then
+      for i := 0 to t do
+        b.bufl[i] := Min(b.bufl[i], b.brul[i] + x)
+      end
+    elsif dx > 0 then
+      for i := 0 to t do
+        b.bufr[i] := Max(b.bufr[i], b.brur[i] + x)
+      end
+    end
+
+  elsif dy > 0 then
+    // up
+    FillPattern(b.M, b.col, b.pat, 0, 0, b.bufl[0], b.y - b.brushr, b.bufr[0] - b.bufl[0] + 1, 1, b.mode)
+    for i := 0 to b.bufh - 2 do
+      b.bufl[i] := Min(b.bufl[i + 1], b.brul[i] + x)
+      b.bufr[i] := Max(b.bufr[i + 1], b.brur[i] + x)
+    end
+
+    b.bufl[t] := b.brul[t] + x
+    b.bufr[t] := b.brur[t] + x
+
+  else
+    // dy < 0
+    // down
+    FillPattern(b.M, b.col, b.pat, 0, 0, b.bufl[t], b.y - b.brushr + b.bufh - 1, b.bufr[t] - b.bufl[t] + 1, 1, b.mode)
+
+    for i := b.bufh - 1 to 1 by -1 do
+      b.bufl[i] := Min(b.bufl[i - 1], b.brul[i] + x)
+      b.bufr[i] := Max(b.bufr[i - 1], b.brur[i] + x)
+    end
+
+    b.bufl[0] := b.brul[0] + x
+    b.bufr[0] := b.brur[0] + x
+  end
+
+  b.x := x
+  b.y := y
+end BrushWalk
+
+procedure BrushFlush(b: pointer to Brush)
+  var
+    i: int16
+begin
+  for i := 0 to b.bufh - 1 do
+    FillPattern(b.M, b.col, b.pat, 0, 0, b.bufl[i], b.y + i - b.brushr, b.bufr[i] - b.bufl[i] + 1, 1, b.mode)
+  end
+end BrushFlush
+
+procedure InitBrush(b: pointer to Brush; M: Display3.Mask; pat: AnyPtr; col: int32; w, mode: int16)
+  var
+    r, x, y, d, dx, dy: int16
+
+  procedure Set(x, y: int16; b: pointer to Brush; r: pointer to int16)
+  begin
+    b.brul[y + r^] := -x + 1
+    b.brur[y + r^] := x
+    b.brul[-y + r^] := -x + 1
+    b.brur[-y + r^] := x
+    if y + r^ > b.bufh then
+      b.bufh := y + r^
+    end
+  end Set
+begin
+  b.bufh := 0
+  b.M := M
+  b.col := col
+  b.mode := mode
+  b.pat := pat
+  if w >= BrushSize then
+    w := BrushSize - 1i1
+  end
+
+  b.x := (-32768i2)
+  b.y := (-32768i2)
+  r := asr(w, 1) // radius
+  if r < 0 then
+    r := 1
+  end
+  x := r
+  y := 0
+  d := 2 * r
+  dx := 4 * r
+  dy := 0
+  Set(x, y, b, @r)
+  while y # r do
+    while d <= 1 do
+      dec(x)
+      dec(dx, 4)
+      inc(d, dx)
+    end
+    inc(y)
+    Set(x, y, b, @r)
+    inc(dy, 4)
+    dec(d, dy)
+  end
+
+  b.brushr := r
+  inc(b.bufh)
+end InitBrush
+
+// --------------------- Scan line based primitives ---------------------
+
+// Print a line of width width between X, Y and X1, Y1 in color col using pattern pat. Hair-lines (of width = 1) cannot be patterned.
+procedure Line*(M: Display3.Mask; col: int32; pat: AnyPtr; X, Y, X1, Y1, width, mode: int16)
+  var
+    x, y, dx, dy, inx, iny, d, dy2, dx2: int16
+begin
+  if width > 1 then
+    x := X
+    y := Y
+    dx := X1 - X
+    dy := Y1 - Y
+    if drawingPolygon then
+    else
+      InitBrush(@brush, M, pat, col, width, mode)
+      BrushJump(@brush, x, y)
+    end
+
+    if abs(dy) > abs(dx) then
+      d := -abs(dx)
+      dy2 := 2 * abs(dy)
+      dx2 := 2 * abs(dx)
+      if dx < 0 then
+        inx := -1
+      else
+        inx := 1
+      end
+      if dy < 0 then
+        iny := -1
+      else
+        iny := 1
+      end
+      while y # Y1 do
+        inc(y, iny)
+        inc(d, dx2)
+        if d > 0 then
+          inc(x, inx)
+          dec(d, dy2)
+        end
+        BrushWalk(@brush, x, y)
+      end
+
+    else
+      d := -abs(dx)
+      dy2 := 2 * abs(dy)
+      dx2 := 2 * abs(dx)
+      if dx < 0 then
+        inx := -1
+      else
+        inx := 1
+      end
+      if dy < 0 then
+        iny := -1
+      else
+        iny := 1
+      end
+      while x # X1 do
+        inc(x, inx)
+        inc(d, dy2)
+        if d > 0 then
+          inc(y, iny)
+          dec(d, dx2)
+        end
+        BrushWalk(@brush, x, y)
+      end
+    end
+
+    if ~drawingPolygon then
+      BrushFlush(@brush)
+    end
+  else
+    // width = 1
+    if X = X1 then
+      ReplConst(M, col, X, Min(Y, Y1), 1, abs(Y - Y1), mode)
+    elsif Y = Y1 then
+      ReplConst(M, col, Min(X, X1), Y, abs(X - X1), 1, mode)
+    elsif M # nil then
+      UseCol(col)
+      ex := X
+      ey := Y
+      ex1 := X1
+      ey1 := Y1
+      class := line
+      Display3.EnumRect(M, Min(X, X1), Min(Y, Y1), abs(X - X1), abs(Y - Y1), Enum)
+      UseCol(Display3.black)
+    else
+      UseCol(col)
+      Printer.Line(X, Y, X1, Y1)
+      Printer.ReplConst(X1, Y1, 1, 1)
+      UseCol(Display3.black)
+    end
+  end
+end Line
+
+procedure FilledPoly(M: Display3.Mask; col: int32; pat: AnyPtr; X, Y: pointer to array of int16; n, mode: int16)
+
+  type
+    Run = pointer to RunDesc0
+    RunDesc0 = record
+      next: Run
+      x: int16
+    end
+
+  var
+    scan: array 2000 of Run
+    free, s: Run
+    i, miny, maxy, x0, x1: int16
+
+  procedure New(s: pointer to Run; free: pointer to Run)
+  begin
+    if free^ = nil then
+      newgc(s^)
+    else
+      s^ := free^
+      free^ := free^.next
+      s^.next := nil
+    end
+  end New
+
+  procedure Free(s: pointer to Run; free: pointer to Run)
+    var
+      s0: Run
+  begin
+    if s^ # nil then
+      s0 := s^
+      while s0.next # nil do
+        s0 := s0.next
+      end
+      s0.next := free^
+      free^ := s^
+      s^ := nil
+    end
+  end Free
+
+  procedure Insert(s: pointer to Run; x: int16; free: pointer to Run)
+    var
+      t, t0: Run
+  begin
+    if s^ = nil then
+      New(s, free)
+      s^.x := x
+    else
+      New(@t, free)
+      t.x := x
+      if x < s^.x then
+        t.next := s^
+        s^ := t
+      else
+        t0 := s^
+        while (t0.next # nil) & (t0.next.x < x) do
+          t0 := t0.next
+        end
+        if t0.next = nil then
+          t0.next := t
+        else
+          t.next := t0.next
+          t0.next := t
+        end
+      end
+    end
+  end Insert
+
+  procedure line(x1, y1, x2, y2: int16; free: pointer to Run; scan: pointer to array 2000 of Run)
+    // standard bresenham
+    var
+      x, y, d, dx, dy, incx, incy: int16
+  begin
+    // Seg(x1,y1);
+    x := x1
+    y := y1
+    dx := (x2 - x1) * 2
+    dy := (y2 - y1) * 2
+    incx := 0
+    if dx < 0 then
+      incx := -1
+      dx := -dx
+    elsif dx > 0 then
+      incx := 1
+    end
+
+    incy := 0
+    if dy < 0 then
+      incy := -1
+      dy := -dy
+    elsif dy > 0 then
+      incy := 1
+    end
+    d := incx * (x1 - x2)
+    while y # y2 do
+      inc(y, incy)
+      inc(d, dx)
+      while d > 0 do
+        inc(x, incx)
+        dec(d, dy)
+      end
+      if incy > 0 then
+        Insert(@scan[y], x, free)
+      else
+        Insert(@scan[y + 1], x, free)
+      end
+    end
+  end line
+begin
+  free := nil
+  miny := 32767
+  maxy := (-32768i2)
+  i := 0
+  while i < n do
+    if Y[i] < miny then
+      miny := Y[i]
+    end
+    if Y[i] > maxy then
+      maxy := Y[i]
+    end
+    inc(i)
+  end
+  i := 0
+  while i <= maxy - miny do
+    scan[i] := nil
+    inc(i)
+  end
+  i := 1
+  while i < n do
+    line(X[i - 1], Y[i - 1] - miny, X[i], Y[i] - miny, @free, @scan)
+    inc(i)
+  end
+
+  line(X[n - 1], Y[n - 1] - miny, X[0], Y[0] - miny, @free, @scan)
+
+  i := 0
+  while i <= maxy - miny do
+    s := scan[i]
+    while s # nil do
+      x0 := s.x
+      s := s.next
+      if s = nil then
+        x1 := x0
+      else
+        x1 := s.x
+        s := s.next
+      end
+      FillPattern(M, col, pat, 0, 0, x0, i + miny, x1 - x0 + 1, 1, mode)
+    end
+
+    Free(@scan[i], @free)
+    inc(i)
+  end
+end FilledPoly
+
+// Print a polygon of n vertices in color col and pattern pat. The vertices are passed in the arrays X and Y. Style can be {Display3.filled}.
+procedure Poly*(M: Display3.Mask; col: int32; pat: AnyPtr; X, Y: pointer to array of int16; n, width: int16; style: set; mode: int16)
+  var
+    i: int16
+begin
+  if Display3.filled in style then
+    FilledPoly(M, col, pat, X, Y, n, mode)
+  else
+    drawingPolygon := true
+    if width > 1 then
+      InitBrush(@brush, M, pat, col, width, mode)
+      BrushJump(@brush, X[0], Y[0])
+    end
+    i := 0
+    while i < n - 1 do
+      Line(M, col, pat, X[i], Y[i], X[i + 1], Y[i + 1], width, mode)
+      inc(i)
+    end
+
+    drawingPolygon := false
+    if width > 1 then
+      BrushFlush(@brush)
+    end
+  end
+end Poly
+
+// Print an ellipse of horizontal radius a and vertical radius b at position X, Y. Implementation restriction: Ellipses cannot be filled or drawn with a thick brush.
+procedure Ellipse*(M: Display3.Mask; col: int32; pat: AnyPtr; X, Y, a, b, width: int16; style: set; mode: int16)
+  var
+    x1, y1: int16
+    d, dx, dy, x2, y2, a1, a2, a8, b1, b2, b8: int32
+
+  procedure Dot4(x1, x2, y1, y2: int16; col: int32; mode: int16; M: pointer to Display3.Mask; pat: pointer to AnyPtr)
+  begin
+    if pat^ = Display.solid then
+      Dot(M^, col, x1, y1, mode)
+      Dot(M^, col, x1, y2, mode)
+      Dot(M^, col, x2, y1, mode)
+      Dot(M^, col, x2, y2, mode)
+    else
+      FillPattern(M^, col, pat^, 0, 0, x1, y1, 1, 1, mode)
+      FillPattern(M^, col, pat^, 0, 0, x1, y2, 1, 1, mode)
+      FillPattern(M^, col, pat^, 0, 0, x2, y1, 1, 1, mode)
+      FillPattern(M^, col, pat^, 0, 0, x2, y2, 1, 1, mode)
+    end
+  end Dot4
+begin
+  a1 := a
+  a2 := a1 * a1
+  a8 := 8 * a2
+  b1 := b
+  b2 := b1 * b1
+  b8 := 8 * b2
+  x1 := a
+  y1 := 0
+  x2 := a1 * b2
+  y2 := 0
+  dx := b8 * (a1 - 1)
+  dy := 4 * a2
+  d := b2 * (1 - 4 * a1)
+  while y2 < x2 do
+    Dot4(X - x1 - 1, X + x1, Y - y1 - 1, Y + y1, col, mode, @M, @pat)
+    inc(d, dy)
+    inc(dy, a8)
+    inc(y1)
+    inc(y2, a2)
+    if d >= 0 then
+      dec(d, dx)
+      dec(dx, b8)
+      dec(x1)
+      dec(x2, b2)
+    end
+  end
+
+  inc(d, 4 * (x2 + y2) - b2 + a2)
+  while x1 >= 0 do
+    Dot4(X - x1 - 1, X + x1, Y - y1 - 1, Y + y1, col, mode, @M, @pat)
+    dec(d, dx)
+    dec(dx, b8)
+    dec(x1)
+    if d < 0 then
+      inc(d, dy)
+      inc(dy, a8)
+      inc(y1)
+    end
+  end
+end Ellipse
+
+// Print a circle of radius r and width width using pattern pat and color col at X, Y. Style can be {Display3.filled}.
+procedure Circle*(M: Display3.Mask; col: int32; pat: AnyPtr; X, Y, r, width: int16; style: set; mode: int16)
+  var
+    x, y, dx, dy, d, e: int16
+begin
+  if Display3.filled in style then
+    x := r
+    y := 0
+    e := 0
+    dx := 2
+    dy := 2
+    while y <= x do
+      FillPattern(M, col, pat, X, Y, X - x, Y + y, 2 * x, 1, mode)
+      FillPattern(M, col, pat, X, Y, X - x, Y - y, 2 * x, 1, mode)
+      inc(y)
+      inc(e, y * dy - 1)
+      if e > x then
+        dec(x)
+        dec(e, x * dx + 1)
+        FillPattern(M, col, pat, X, Y, X - y, Y + x, 2 * y, 1, mode)
+        FillPattern(M, col, pat, X, Y, X - y, Y - x, 2 * y, 1, mode)
+      end
+    end
+
+  elsif width > 1 then
+    x := X + r
+    y := Y
+    InitBrush(@brush, M, pat, col, width, mode)
+    BrushJump(@brush, x, y)
+
+    d := 2 * r
+    dx := 4 * r
+    dy := 0
+    while y # Y + r do
+      while d <= 1 do
+        dec(x)
+        BrushWalk(@brush, x, y)
+        dec(dx, 4)
+        inc(d, dx)
+      end
+      inc(y)
+      BrushWalk(@brush, x, y)
+      inc(dy, 4)
+      dec(d, dy)
+    end
+
+    while x # X do
+      dec(x)
+      BrushWalk(@brush, x, y)
+      dec(dx, 4)
+      inc(d, dx)
+    end
+    d := -d
+    while x # X - r do
+      while d <= 1 do
+        dec(y)
+        BrushWalk(@brush, x, y)
+        dec(dy, 4)
+        inc(d, dy)
+      end
+      dec(x)
+      BrushWalk(@brush, x, y)
+      inc(dx, 4)
+      dec(d, dx)
+    end
+
+    while y # Y do
+      dec(y)
+      BrushWalk(@brush, x, y)
+      dec(dy, 4)
+      inc(d, dy)
+    end
+    d := -d
+    while y # Y - r do
+      while d <= 1 do
+        inc(x)
+        BrushWalk(@brush, x, y)
+        dec(dx, 4)
+        inc(d, dx)
+      end
+      dec(y)
+      BrushWalk(@brush, x, y)
+      inc(dy, 4)
+      dec(d, dy)
+    end
+
+    while x # X do
+      inc(x)
+      BrushWalk(@brush, x, y)
+      dec(dx, 4)
+      inc(d, dx)
+    end
+    d := -d
+    while x # X + r do
+      while d <= 1 do
+        inc(y)
+        BrushWalk(@brush, x, y)
+        dec(dy, 4)
+        inc(d, dy)
+      end
+      inc(x)
+      BrushWalk(@brush, x, y)
+      inc(dx, 4)
+      dec(d, dx)
+    end
+
+    while y # Y do
+      inc(y)
+      BrushWalk(@brush, x, y)
+      dec(dy, 4)
+      inc(d, dy)
+    end
+    BrushFlush(@brush)
+  elsif pat = Display.solid then
+    // single pixel circle
+    if Display3.Visible(M, X - r, Y - r, 2 * r, 2 * r) then
+      UseCol(col)
+      Printer.Circle(X, Y, r)
+      UseCol(Display3.black)
+    else
+      Ellipse(M, col, pat, X, Y, r, r, width, {}, mode)
+    end
+
+  else
+    Ellipse(M, col, pat, X, Y, r, r, width, {}, mode)
+  end
+end Circle
+
+procedure PP(x: int16): int16
+begin
+  return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+end PP
+
+// lookup the size of a character on the printer/does not use a font cache
+procedure Lookup(font, metric: Fonts.Font; ch: char; minY, maxY, dx, y, h: pointer to int16)
+  var
+    obj: Objects.Object
+begin
+  if metric # nil then
+    metric.GetObj(metric, val(int16, ord(ch)), @obj)
+    case obj of
+    | Fonts.Char:
+      minY^ := metric.minY
+      maxY^ := metric.maxY
+      dx^ := obj.dx
+      y^ := obj.y
+      h^ := obj.h
+    end
+
+  else
+    font.GetObj(font, val(int16, ord(ch)), @obj)
+    case obj of
+    | Fonts.Char:
+      minY^ := PP(font.minY)
+      maxY^ := PP(font.maxY)
+      dx^ := PP(obj.dx)
+      y^ := PP(obj.y)
+      h^ := PP(obj.h)
+    end
+  end
+end Lookup
+
+// Returns the size of a string on the printer. Width is w, height is h, and the descender offset is dsr.
+procedure StringSize*(const s: pointer to array of char; fnt: Fonts.Font; w, h, dsr: pointer to int16)
+  var
+    metric: Fonts.Font
+    p, dx, d: int16
+begin
+  metric := Printer.GetMetric(fnt)
+  w^ := 0
+  p := 0
+  while s[p] # 0X do
+    Lookup(fnt, metric, s[p], @d, @d, @dx, @d, @d)
+    inc(w^, dx)
+    inc(p)
+  end
+
+  if metric # nil then
+    dsr^ := abs(metric.minY)
+    h^ := metric.height
+  else
+    dsr^ := PP(abs(fnt.minY))
+    h^ := PP(fnt.height)
+  end
+end StringSize
+
+procedure StringSize0(font, metric: Fonts.Font; const s: pointer to array of char; x, y, w, h: pointer to int16; dx: pointer to array of int16; dx_len: int32)
+  var
+    i, minY, maxY, cdx, d: int16
+begin
+  w^ := 0
+  i := 0
+  x^ := 0
+  while s[i] # 0X do
+    Lookup(font, metric, s[i], @minY, @maxY, @cdx, @d, @d)
+    if i < val(int16, dx_len) then
+      dx[i] := cdx
+    end
+    inc(w^, cdx)
+    inc(i)
+  end
+
+  if metric # nil then
+    y^ := metric.minY // ???
+    h^ := metric.maxY + abs(metric.minY)
+  else
+    y^ := PP(font.minY)
+    h^ := PP(font.height)
+  end
+end StringSize0
+
+// Print string s using font fnt in color col at X, Y.
+procedure String*(M: Display3.Mask; col: int32; X, Y: int16; fnt: Fonts.Font; const s: pointer to array of char; mode: int16)
+  var
+    metric: Fonts.Font
+    W, H, x, y, i, ofs: int16
+    dX: array 256 of int16
+    t: array 2 of char
+begin
+  metric := Printer.GetMetric(fnt)
+  StringSize0(fnt, metric, s, @x, @y, @W, @H, @dX, 256)
+
+  (* DEBUG
+  UseCol(1);
+  IF M # NIL THEN Display3.Enum(M, Printer.ReplConst) END;
+  UseCol(15);
+  Printer.ReplConst(X + x, Y + y, W, 1); Printer.ReplConst(X + x, Y + y, 1, H);
+  *)
+  UseCol(col)
+
+  if SizeHack then
+    inc(x, 3)
+    inc(y, 3)
+    dec(H, 4)
+    dec(W, 9)
+    ofs := 9
+  else
+    ofs := 0
+  end
+
+  if Display3.Visible(M, X + x, Y + y, W, H) then
+    Printer.String(X, Y, s, fnt)
+  else
+    i := 0
+    t[1] := 0X
+    while (s[i] # 0X) & (i < val(int16, 256)) do
+      t[0] := s[i]
+      if Display3.Visible(M, X + x, Y + y, dX[i] - ofs, H) then
+        Printer.String(X, Y, @t, fnt)
+      end
+
+      inc(X, dX[i])
+      inc(i)
+    end
+  end
+
+  UseCol(Display3.black)
+end String
+
+// Print string s centered in area X, Y, W, H using color col and font fnt. Line-breaks will be inserted if the string is too long.
+procedure CenterString*(M: Display3.Mask; col: int32; X, Y, W, H: int16; fnt: Fonts.Font; const s: pointer to array of char; mode: int16)
+  var
+    s00: array 256 of char
+    s00_i: int32
+    metric: Fonts.Font
+    len_, p, h, lspc, i, y: int16
+    s0: array 48 of char
+    cdx, d, fheight, fminy: int16
+begin
+  s00_i := 0
+  while (s00_i < 255) & (s[s00_i] # 0X) do s00[s00_i] := s[s00_i]; inc(s00_i) end
+  s00[s00_i] := 0X
+  metric := Printer.GetMetric(fnt)
+  len_ := 0
+  p := 0
+  while s00[p] # 0X do
+    Lookup(fnt, metric, s00[p], @d, @d, @cdx, @d, @d)
+    inc(p)
+    inc(len_, cdx)
+  end
+
+  if metric # nil then
+    fminy := metric.minY
+    fheight := metric.height
+  else
+    fminy := PP(fnt.minY)
+    fheight := PP(fnt.height)
+  end
+
+  if len_ < W - 4 then
+    // normal print
+    String(M, col, asr(W - len_, 1) + X, Y + asr(H, 1) - asr(fheight, 1) + abs(fminy), fnt, @s00, mode)
+  else
+    // formatted print
+    p := 0
+    len_ := 0
+    h := 0
+    lspc := -1
+    while s00[p] # 0X do
+      Lookup(fnt, metric, s00[p], @d, @d, @cdx, @d, @d)
+      if len_ + cdx >= W then
+        // too long next line
+        if s00[p] = " " then
+          lspc := -1
+          s00[p] := 1X
+          inc(h, fheight)
+          len_ := 0
+        elsif lspc > 0 then
+          // space exists
+          p := lspc
+          lspc := -1
+          s00[p] := 1X
+          inc(h, fheight)
+          len_ := 0
+        else
+          inc(len_, cdx)
+        end
+
+      else
+        inc(len_, cdx)
+        if s00[p] = " " then
+          lspc := p
+        end
+      end
+
+      inc(p)
+    end
+    inc(h, fheight)
+
+    // print
+    p := 0
+    i := 0
+    len_ := 0
+    y := Y + asr(H, 1) + asr(h, 1) + abs(fminy)
+    while s00[p] # 0X do
+      Lookup(fnt, metric, s00[p], @d, @d, @cdx, @d, @d)
+      if s00[p] = 1X then
+        // break
+        s0[i] := 0X
+        i := 0
+        dec(y, fheight)
+        String(M, col, X + asr(W, 1) - asr(len_, 1), y, fnt, @s0, mode)
+        len_ := 0
+      else
+        inc(len_, cdx)
+        s0[i] := s00[p]
+        inc(i)
+      end
+
+      inc(p)
+    end
+    dec(y, fheight)
+    if i > 0 then
+      s0[i] := 0X
+      String(M, col, X + asr(W, 1) - asr(len_, 1), y, fnt, @s0, mode)
+    end
+  end
+end CenterString
+
+procedure Print(px, py, pw, ph, X, Y, W, H: int16; P: Pictures.Picture)
+begin
+  // picture
+  // printer
+
+  Printer.Picture(P, px, py, pw, ph, X, Y, W, H, Display.replace)
+end Print
+
+procedure PrintEnum(X, Y, W, H: int16)
+  var
+    px, py, pw, ph: int16
+begin
+  px := X - tX // in printer coordinates
+  py := Y - tY
+  pw := W
+  ph := H
+
+  // map printer pixels to picture pixels
+  px := val(int16, obdiv(val(int32, px) * tmpP.width, tW))
+  py := val(int16, obdiv(val(int32, py) * tmpP.height, tH))
+  pw := val(int16, obdiv(val(int32, pw) * tmpP.width, tW))
+  ph := val(int16, obdiv(val(int32, ph) * tmpP.height, tH))
+
+  // expand/reduce the px, py, pw, ph of the picture to printer coords X, Y, W, H
+  Print(px, py, pw, ph, X, Y, W, H, tmpP)
+end PrintEnum
+
+// Picture is stretched/reduce to fit at X, Y, W, H on the printer.
+procedure Pict*(M: Display3.Mask; P: Pictures.Picture; X, Y, W, H, mode: int16)
+  // printer coordinates
+  var
+    x, y, w, h: int16
+begin
+  x := X
+  y := Y
+  w := W
+  h := H
+  ClipAgainst(@x, @y, @w, @h, M.X, M.Y, M.W, M.H)
+  tmpP := P
+  tX := X
+  tY := Y
+  tW := W
+  tH := H
+  Display3.EnumRect(M, x, y, w, h, PrintEnum)
+end Pict
+
+// Replicate picture P. px, py is the picture origin, X, Y, W, H is printer coordinates of the area to be filled.
+procedure ReplPict*(M: Display3.Mask; P: Pictures.Picture; px, py, X, Y, W, H, mode: int16)
+  var
+    x, y, w, h, pw, ph, w0, x0, a, b, c, d: int16
+begin
+  a := M.X
+  b := M.Y
+  c := M.W
+  d := M.H
+  pw := PP(P.width)
+  ph := PP(P.height)
+  w0 := W
+  x0 := X
+  while H > 0 do
+    y := obmod(Y - py, ph)
+    h := Min(H, ph - y)
+    W := w0
+    X := x0
+    while W > 0 do
+      x := obmod(X - px, pw)
+      w := Min(W, pw - x)
+      M.X := X
+      M.Y := Y
+      M.W := w
+      M.H := h
+      Pict(M, P, X - x, Y - y, pw, ph, mode)
+      inc(X, w)
+      dec(W, w)
+    end
+
+    inc(Y, h)
+    dec(H, h)
+  end
+
+  M.X := a
+  M.Y := b
+  M.W := c
+  M.H := d
+end ReplPict
+
+procedure InitPat()
+  var
+    patS: array 9 of array 8 of set
+    i: int16
+begin
+  patS[0][0] := {0..31}
+  patS[0][1] := {0..31}
+  patS[0][2] := {0..31}
+  patS[0][3] := {0..31}
+  for i := 0 to 3 do
+    patS[0][i + 4] := patS[0][i]
+  end
+
+  patS[1][0] := {}
+  patS[1][1] := {}
+  patS[1][2] := {}
+  patS[1][3] := {0,4,8,12,16,20,24,28}
+  for i := 0 to 3 do
+    patS[1][i + 4] := patS[1][i]
+  end
+
+  patS[2][0] := {0,4,8,12,16,20,24,28}
+  patS[2][1] := {}
+  patS[2][2] := {2,6,10,14,18,22,26,30}
+  patS[2][3] := {}
+  for i := 0 to 3 do
+    patS[2][i + 4] := patS[2][i]
+  end
+
+  patS[3][0] := {}
+  patS[3][1] := {0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30}
+  patS[3][2] := {}
+  patS[3][3] := {0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30}
+  for i := 0 to 3 do
+    patS[3][i + 4] := patS[3][i]
+  end
+
+  patS[4][0] := {0,4,8,12,16,20,24,28}
+  patS[4][1] := {2,6,10,14,18,22,26,30}
+  patS[4][2] := {0,4,8,12,16,20,24,28}
+  patS[4][3] := {2,6,10,14,18,22,26,30}
+  for i := 0 to 3 do
+    patS[4][i + 4] := patS[4][i]
+  end
+
+  patS[5][0] := {0..31}
+  patS[5][1] := {0..31}
+  patS[5][2] := {0..31}
+  patS[5][3] := {0..31}
+  for i := 0 to 3 do
+    patS[5][i + 4] := patS[5][i]
+  end
+
+  patS[6][0] := {0,4,8,12,16,20,24,28}
+  patS[6][1] := {1,5,9,13,17,21,25,29}
+  patS[6][2] := {2,6,10,14,18,22,26,30}
+  patS[6][3] := {3,7,11,15,19,23,27,31}
+  for i := 0 to 3 do
+    patS[6][i + 4] := patS[6][i]
+  end
+
+  patS[7][0] := {3,7,11,15,19,23,27,31}
+  patS[7][1] := {2,6,10,14,18,22,26,30}
+  patS[7][2] := {1,5,9,13,17,21,25,29}
+  patS[7][3] := {0,4,8,12,16,20,24,28}
+  for i := 0 to 3 do
+    patS[7][i + 4] := patS[7][i]
+  end
+
+  patS[8][0] := {0,4,8,12,16,20,24,28}
+  patS[8][1] := {0,4,8,12,16,20,24,28}
+  patS[8][2] := {0,4,8,12,16,20,24,28}
+  patS[8][3] := {0,4,8,12,16,20,24,28}
+  for i := 0 to 3 do
+    patS[8][i + 4] := patS[8][i]
+  end
+
+  i := 0
+  while i < 9 do
+    Pattern[i] := Display.NewPattern(32, 8, @patS[i])
+    inc(i)
+  end
+end InitPat
+
+begin
+  Modules.Register("Printer3", nil)
+  drawingPolygon := false
+  InitPat()
+end Printer3.

@@ -1,0 +1,335 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Links [level=5]
+
+import Files, Objects, Modules
+
+// portable
+
+(** The Links module manage a set of named references to objects for the gadgets.
+*)
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  Link* = pointer to LinkDesc
+  LinkDesc* = record
+    next*: Link
+    name*: array 32 of char
+    obj*: Objects.Object
+  end
+
+procedure Atom(lib: Objects.Library; const name: pointer to array of char): int16
+  var
+    ref: int16
+begin
+  Objects.GetKey(@lib.dict, name, @ref)
+  return ref
+end Atom
+
+procedure WriteRef(r: pointer to Files.Rider; lib: Objects.Library; obj: Objects.Object)
+begin
+  if obj = nil then
+    Files.WriteInt(r, -1)
+  else
+    if obj.lib # nil then
+      if obj.lib # lib then
+        if obj.lib.name = "" then
+          // private library
+          Files.WriteInt(r, -1)
+        // Warning: Object belonging to private library referenced in
+        else
+          Files.WriteInt(r, obj.ref)
+          Files.WriteInt(r, Atom(lib, @obj.lib.name))
+        end
+
+      else
+        Files.WriteInt(r, obj.ref)
+        Files.WriteInt(r, Atom(lib, "")) // belongs to this library
+      end
+
+    else
+      Files.WriteInt(r, -1)
+      // Warning: Object without library referenced in lib.name
+    end
+  end
+end WriteRef
+
+procedure ReadRef(r: pointer to Files.Rider; lib: Objects.Library; obj: pointer to Objects.Object)
+  var
+    i, l: int16
+    F: Objects.Library
+    name: array 32 of char
+begin
+  Files.ReadInt(r, @i)
+  if i = -1 then
+    obj^ := nil
+  else
+    Files.ReadInt(r, @l)
+    Objects.GetName(@lib.dict, l, @name, 32)
+    if name[0] = 0X then
+      F := lib
+      copy(@name, @lib.name, 32)
+    else
+      F := Objects.ThisLibrary(@name)
+    end
+    if F # nil then
+      F.GetObj(F, i, obj)
+      if obj^ = nil then
+      end // Warning: Object imported from does not exist (NIL pointer)
+
+    else
+      // Warning: not found
+      obj^ := nil
+    end
+  end
+end ReadRef
+
+// Store links to a file. Only (ref, lib) references to links are written.
+procedure StoreLinks*(R: pointer to Files.Rider; lib: Objects.Library; list: Link)
+begin
+  Files.Write(R, val(byte, ord("3"))) // magic number
+  while list # nil do
+    Files.WriteString(R, @list.name, 32)
+    WriteRef(R, lib, list.obj)
+    list := list.next
+  end
+
+  Files.WriteString(R, "", 1)
+end StoreLinks
+
+// Load links from a file.
+procedure LoadLinks*(R: pointer to Files.Rider; lib: Objects.Library; list: pointer to Link)
+  var
+    ch: char
+    s: array 32 of char
+    a, a0: Link
+begin
+  list^ := nil
+  Files.Read(R, cast(BytePtr, @ch))
+  assert(ch = "3")
+  Files.ReadString(R, @s, 32)
+  while s # "" do
+    newgc(a)
+    copy(@a.name, @s, 32)
+    ReadRef(R, lib, @a.obj)
+    if (a.obj # nil) & (a.obj is Objects.Dummy) then
+      a.obj := nil
+    end
+    if list^ = nil then
+      list^ := a
+    else
+      a0.next := a
+    end
+    a0 := a
+    Files.ReadString(R, @s, 32)
+  end
+end LoadLinks
+
+procedure CopyPtr(M: pointer to Objects.CopyMsg; obj: Objects.Object): Objects.Object
+begin
+  if obj = nil then
+    return nil
+  else
+    if M.id = Objects.deep then
+      M.obj := nil
+      obj.handle(obj, M)
+      return M.obj
+    else
+      // shallow
+      return obj
+    end
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end CopyPtr
+
+// Copy links.  Both shallow and deep copies are supported.
+procedure CopyLinks*(M: pointer to Objects.CopyMsg; in_: Link; out: pointer to Link)
+  var
+    L, a, a0: Link
+begin
+  L := in_
+  out^ := nil
+  while L # nil do
+    newgc(a)
+    copy(@a.name, @L.name, 32)
+    a.obj := CopyPtr(M, L.obj)
+    if out^ = nil then
+      out^ := a
+    else
+      a0.next := a
+    end
+    a0 := a
+    L := L.next
+  end
+end CopyLinks
+
+// Bind all linked objects.
+procedure BindLinks*(list: Link; M: pointer to Objects.BindMsg)
+begin
+  while list # nil do
+    if list.obj # nil then
+      list.obj.handle(list.obj, M)
+    end
+
+    list := list.next
+  end
+end BindLinks
+
+// Insert a link in a list. An existing link with the same name is discarded.
+procedure InsertLink*(list: pointer to Link; const name: pointer to array of char; val_: Link)
+  var
+    l, p0: Link
+begin
+  if val_ # nil then
+    copy(@val_.name, name, 32)
+    val_.next := nil
+    if list^ = nil then
+      list^ := val_
+    else
+      p0 := nil
+      l := list^
+      while (l # nil) & (l.name # name^) do
+        p0 := l
+        l := l.next
+      end
+      if l = nil then
+        // at end of list
+        p0.next := val_
+      else
+        if p0 = nil then
+          // in beginning of list
+          val_.next := list^.next
+          list^ := val_
+        else
+          // in middle of list
+          p0.next := val_
+          val_.next := l.next
+        end
+      end
+    end
+  end
+end InsertLink
+
+// Link Locate.
+procedure FindLink*(const name: pointer to array of char; list: Link): Link
+begin
+  while list # nil do
+    if name^ = list.name then
+      return list
+    end
+    list := list.next
+  end
+
+  return nil
+end FindLink
+
+// Delete a link.
+procedure DeleteLink*(list: pointer to Link; const name: pointer to array of char)
+  var
+    a, p: Link
+begin
+  a := list^
+  p := nil
+  while (a # nil) & (name^ # a.name) do
+    p := a
+    a := a.next
+  end
+  if a # nil then
+    // found
+    if p = nil then
+      // first
+      list^ := a.next
+    else
+      p.next := a.next
+    end
+  end
+end DeleteLink
+
+(** Default handling of setting, retrieving and enumerating a list of links. Parameter list might be modified
+during a set operation. *)
+procedure HandleLinkMsg*(list: pointer to Link; M: pointer to Objects.LinkMsg)
+  var
+    p: Link
+begin
+  if M.id = Objects.enum then
+    p := list^
+    while p # nil do
+      M.Enum(@p.name)
+      p := p.next
+    end
+
+  elsif M.id = Objects.set_ then
+    p := list^
+    while (p # nil) & (p.name # M.name) do
+      p := p.next
+    end
+    if p # nil then
+      p.obj := M.obj
+    else
+      newgc(p)
+      p.next := list^
+      list^ := p
+      copy(@p.name, @M.name, 32)
+      p.obj := M.obj
+    end
+
+    M.res := 0
+  elsif M.id = Objects.get then
+    p := list^
+    while (p # nil) & (p.name # M.name) do
+      p := p.next
+    end
+    if p # nil then
+      M.obj := p.obj
+      M.res := 0
+    end
+  end
+end HandleLinkMsg
+
+// Forward a message to all linked objects in the list. USE WITH CARE, MESSAGE CYCLES!
+procedure Broadcast*(list: Link; M: pointer to Objects.ObjMsg)
+begin
+  while list # nil do
+    if list.obj # nil then
+      list.obj.handle(list.obj, M)
+    end
+
+    list := list.next
+  end
+end Broadcast
+
+// Get the named link of obj.
+procedure GetLink*(obj: Objects.Object; const name: pointer to array of char; ob1: pointer to Objects.Object)
+  var
+    L: Objects.LinkMsg
+begin
+  if obj # nil then
+    L.id := Objects.get
+    L.res := -1
+    copy(@L.name, name, 32)
+    L.obj := nil
+    obj.handle(obj, @L)
+    ob1^ := L.obj
+  else
+    ob1^ := nil
+  end
+end GetLink
+
+// Set the named link of obj.
+procedure SetLink*(obj: Objects.Object; const name: pointer to array of char; ob1: Objects.Object)
+  var
+    L: Objects.LinkMsg
+begin
+  if obj # nil then
+    L.id := Objects.set_
+    L.res := -1
+    copy(@L.name, name, 32)
+    L.obj := ob1
+    obj.handle(obj, @L)
+  end
+end SetLink
+
+begin
+  Modules.Register("Links", nil)
+end Links.

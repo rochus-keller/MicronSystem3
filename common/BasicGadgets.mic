@@ -1,0 +1,2147 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module BasicGadgets [level=5]
+
+import Objects, Gadgets, Display, Display3, Effects, Oberon, Texts, Files, Printer, Printer3, Fonts, Strings, Modules
+// portable
+// jm 18.1.95
+
+(** Contains an implementation of the model gadgets Boolean, String, Integer, and Real, and of the visual gadgets Button, Checkbox and Slider. The buttons and checkboxes can also be used as radio-buttons by linking to them an Integer model gadget.
+*)
+(*
+JM 3.2.93 - New radio button look
+- SetValues improved
+- Gadgets.UpdateMsg goes to abstract gadgets too
+JM 8.2.93 - Cancel combination for button clicks improved
+jm 9.2.93 - new abstract object rooted in gadgets
+- Respond on Viewers.ViewerMsg
+jm 11.2.93 - Display.ControlMsg
+jm 3.2.93 - popout buttons improved
+23.7.93 - simplified copy of abstract objects
+19.4.94 - popout attribute is now set by default for buttons
+19.4.94 - Added Break
+21.4.95 - fixed command execution of checkboxes
+27.9.95 - fixed slider update model
+13.10.95 - Changed popout behavior of buttons
+3.5.96 - YesVal of checkboxes now always returns a value (ps - 3.5.96)
+8.5.96 - Add Look-Link to Buttons (ps - 8.5.96)
+29.7.96 - fixed NIL-trap in SetValues (ps - 29.7.96)
+20.11.96 - add 2 new button attributes (iw)
+25.4.97 - fixed bug in ButtonAttr (YesVal)
+*)
+
+const
+  VersionNo = 2
+  VersionNewButton = 4
+  VersionAbstract = 4
+  VersionNewCheckbox = 3
+
+  MaxLen = 64
+
+// --- Things ---
+
+type
+  Boolean* = pointer to BooleanDesc
+  BooleanDesc* = object (Gadgets.ObjDesc)
+    val_*: boolean
+  end
+
+  String* = pointer to StringDesc
+  StringDesc* = object (Gadgets.ObjDesc)
+    val_*: array 64 (* MaxLen *) of char
+  end
+
+  Integer* = pointer to IntegerDesc
+  IntegerDesc* = object (Gadgets.ObjDesc)
+    val_*: int32
+  end
+
+  Real* = pointer to RealDesc
+  RealDesc* = object (Gadgets.ObjDesc)
+    val_*: longreal
+  end
+
+  // --- Gadgets ---
+
+  Button* = pointer to ButtonDesc
+  ButtonDesc* = object (Gadgets.FrameDesc)
+    caption*: array 32 of char // Caption shown inside the button.
+    val_*: boolean // Pushed/popped out.
+    popout*: boolean // Button should pop out immediately after pressed.
+    setval*: int16 // Button is pressed should the button model have this value.
+    look*: Objects.Object // Object dropped inside of button, used as button representation instead of caption.
+    led*: boolean // visibility of a led if Button is pressed
+    ledcol*: int16 // Color of LED when Button is pressed
+    inM, outM: Display3.Mask
+  end
+
+  CheckBox* = pointer to CheckBoxDesc
+  CheckBoxDesc* = object (Gadgets.FrameDesc)
+    val_*: boolean // State.
+    setval*: int16 // checkbox is ticked should the checkbox model have this value.
+  end
+
+  Slider* = pointer to SliderDesc
+  SliderDesc* = object (Gadgets.FrameDesc)
+    min_*: int32 // Minimum, maximum and current value
+    max_*, val_*: int32
+    B, BW: int16
+  end
+
+var
+  W: Texts.Writer
+
+procedure Log()
+begin
+  Texts.Append(Oberon.Log, W.buf)
+end Log
+
+procedure Min(x, y: int16): int16
+begin
+  if x < y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+procedure KillMasks(F: Objects.Object)
+  var
+    O: Display3.OverlapMsg
+begin
+  O.F := nil
+  O.M := nil
+  O.x := 0
+  O.y := 0
+  O.res := -1
+  O.dlink := nil
+  F.handle(F, @O)
+end KillMasks
+
+// --- Version check ---
+
+procedure WriteVersion(R: pointer to Files.Rider)
+begin
+  Files.WriteNum(R, VersionNo)
+end WriteVersion
+
+procedure ReadVersion(R: pointer to Files.Rider)
+  var
+    x: int32
+begin
+  Files.ReadNum(R, @x)
+  if x # VersionNo then
+    Texts.WriteString(@W, "Version ")
+    Texts.WriteInt(@W, VersionNo, 3)
+    Texts.WriteString(@W, " of BasicGadgets cannot read version ")
+    Texts.WriteInt(@W, x, 3)
+    Texts.WriteLn(@W)
+    Log()
+    halt(42)
+  end
+end ReadVersion
+
+// ---------- abstract objects ----------
+
+procedure CopyBoolean*(M: pointer to Objects.CopyMsg; from, to_: Boolean)
+begin
+  Gadgets.CopyObject(M, from, to_)
+  to_.val_ := from.val_
+end CopyBoolean
+
+procedure BooleanHandler*(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    obj2: Boolean
+    x: int16
+    ver: int32
+begin
+  case obj of
+  | Boolean:
+    case M of
+    | Objects.PAttrMsg:
+      if M.id = Objects.get then
+        if M.name = "Gen" then
+          copy(@M.s, "BasicGadgets.NewBoolean", 64)
+          M.class := Objects.String
+          M.res := 0
+        elsif M.name = "Value" then
+          M.b := obj.val_
+          M.class := Objects.Bool
+          M.res := 0
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if M.name = "Value" then
+          if M.class = Objects.Bool then
+            obj.val_ := M.b
+            M.res := 0
+          end
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.enum then
+        M.Enum("Value")
+        Gadgets.objecthandle(obj, M)
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Files.WriteNum(@M.R, VersionAbstract)
+        Files.WriteBool(@M.R, obj.val_)
+        Gadgets.objecthandle(obj, M)
+      // WriteVersion(M.R); IF obj.val THEN Files.WriteInt(M.R, 1); ELSE Files.WriteInt(M.R, 0); END;
+      elsif M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if ver = VersionNo then
+          // old
+          Files.ReadInt(@M.R, @x)
+          obj.val_ := x = 1
+        elsif ver = VersionAbstract then
+          Files.ReadBool(@M.R, @obj.val_)
+          Gadgets.objecthandle(obj, M)
+        else
+          Texts.WriteString(@W, "Version ")
+          Texts.WriteInt(@W, VersionAbstract, 3)
+          Texts.WriteString(@W, " of boolean cannot read version ")
+          Texts.WriteInt(@W, ver, 3)
+          Texts.WriteLn(@W)
+          Log()
+          halt(42)
+        end
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = obj.stamp then
+        M.obj := obj.dlink
+      else
+        newgc(obj2)
+        obj.stamp := M.stamp
+        obj.dlink := obj2
+        CopyBoolean(M, obj, obj2)
+        M.obj := obj2
+      end
+
+    else
+      Gadgets.objecthandle(obj, M)
+    end
+  end
+end BooleanHandler
+
+procedure InitBoolean*(obj: Boolean)
+begin
+  obj.handle := BooleanHandler
+end InitBoolean
+
+procedure NewBoolean*()
+  var
+    obj: Boolean
+begin
+  newgc(obj)
+  InitBoolean(obj)
+  Objects.NewObj := obj
+end NewBoolean
+
+procedure CopyString*(M: pointer to Objects.CopyMsg; from, to_: String)
+begin
+  Gadgets.CopyObject(M, from, to_)
+  copy(@to_.val_, @from.val_, 64 (* MaxLen *))
+end CopyString
+
+procedure StringHandler*(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    obj2: String
+    ver: int32
+begin
+  case obj of
+  | String:
+    case M of
+    | Objects.PAttrMsg:
+      if M.id = Objects.get then
+        if M.name = "Gen" then
+          copy(@M.s, "BasicGadgets.NewString", 64)
+          M.class := Objects.String
+          M.res := 0
+        elsif M.name = "Value" then
+          copy(@M.s, @obj.val_, 64)
+          M.class := Objects.String
+          M.res := 0
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if M.name = "Value" then
+          if M.class = Objects.String then
+            copy(@obj.val_, @M.s, 64 (* MaxLen *))
+            M.res := 0
+          elsif M.class = Objects.Int then
+            Strings.IntToStr(M.i, @obj.val_, 64 (* MaxLen *))
+            M.res := 0
+          elsif M.class = Objects.Real then
+            Strings.RealToStr(val(longreal, M.x), @obj.val_, 64 (* MaxLen *))
+            M.res := 0
+          elsif M.class = Objects.LongReal then
+            Strings.RealToStr(M.y, @obj.val_, 64 (* MaxLen *))
+            M.res := 0
+          end
+
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.enum then
+        M.Enum("Value")
+        Gadgets.objecthandle(obj, M)
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Files.WriteNum(@M.R, VersionAbstract)
+        Files.WriteString(@M.R, @obj.val_, 64 (* MaxLen *))
+        Gadgets.objecthandle(obj, M)
+      elsif M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if ver = VersionNo then
+          // old
+          Files.ReadString(@M.R, @obj.val_, 64 (* MaxLen *))
+        elsif ver = VersionAbstract then
+          Files.ReadString(@M.R, @obj.val_, 64 (* MaxLen *))
+          Gadgets.objecthandle(obj, M)
+        else
+          Texts.WriteString(@W, "Version ")
+          Texts.WriteInt(@W, VersionAbstract, 3)
+          Texts.WriteString(@W, " of string cannot read version ")
+          Texts.WriteInt(@W, ver, 3)
+          Texts.WriteLn(@W)
+          Log()
+          halt(42)
+        end
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = obj.stamp then
+        M.obj := obj.dlink
+      else
+        newgc(obj2)
+        obj.stamp := M.stamp
+        obj.dlink := obj2
+        CopyString(M, obj, obj2)
+        M.obj := obj2
+      end
+
+    else
+      Gadgets.objecthandle(obj, M)
+    end
+  end
+end StringHandler
+
+procedure InitString*(obj: String)
+begin
+  obj.handle := StringHandler
+  copy(@obj.val_, "", 64 (* MaxLen *))
+end InitString
+
+procedure NewString*()
+  var
+    obj: String
+begin
+  newgc(obj)
+  InitString(obj)
+  Objects.NewObj := obj
+end NewString
+
+procedure CopyInteger*(M: pointer to Objects.CopyMsg; from, to_: Integer)
+begin
+  Gadgets.CopyObject(M, from, to_)
+  to_.val_ := from.val_
+end CopyInteger
+
+procedure IntegerHandler*(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    obj2: Integer
+    ver: int32
+begin
+  case obj of
+  | Integer:
+    case M of
+    | Objects.PAttrMsg:
+      if M.id = Objects.get then
+        if M.name = "Gen" then
+          copy(@M.s, "BasicGadgets.NewInteger", 64)
+          M.class := Objects.String
+          M.res := 0
+        elsif M.name = "Value" then
+          M.i := obj.val_
+          M.class := Objects.Int
+          M.res := 0
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if M.name = "Value" then
+          if M.class = Objects.Int then
+            obj.val_ := M.i
+            M.res := 0
+          elsif M.class = Objects.String then
+            Strings.StrToInt(@M.s, @obj.val_)
+            M.res := 0
+          elsif M.class = Objects.Real then
+            obj.val_ := val(int32, floor(M.x))
+            M.res := 0
+          elsif M.class = Objects.LongReal then
+            obj.val_ := val(int32, floor(M.x))
+            M.res := 0
+          end
+
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.enum then
+        M.Enum("Value")
+        Gadgets.objecthandle(obj, M)
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Files.WriteNum(@M.R, VersionAbstract)
+        Files.WriteLInt(@M.R, obj.val_)
+        Gadgets.objecthandle(obj, M)
+      elsif M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if ver = VersionNo then
+          // old
+          Files.ReadLInt(@M.R, @obj.val_)
+        elsif ver = VersionAbstract then
+          Files.ReadLInt(@M.R, @obj.val_)
+          Gadgets.objecthandle(obj, M)
+        else
+          Texts.WriteString(@W, "Version ")
+          Texts.WriteInt(@W, VersionAbstract, 3)
+          Texts.WriteString(@W, " of integer cannot read version ")
+          Texts.WriteInt(@W, ver, 3)
+          Texts.WriteLn(@W)
+          Log()
+          halt(42)
+        end
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = obj.stamp then
+        M.obj := obj.dlink
+      else
+        newgc(obj2)
+        obj.stamp := M.stamp
+        obj.dlink := obj2
+        CopyInteger(M, obj, obj2)
+        M.obj := obj2
+      end
+
+    else
+      Gadgets.objecthandle(obj, M)
+    end
+  end
+end IntegerHandler
+
+procedure InitInteger*(obj: Integer)
+begin
+  obj.handle := IntegerHandler
+  obj.val_ := 0
+end InitInteger
+
+procedure NewInteger*()
+  var
+    obj: Integer
+begin
+  newgc(obj)
+  InitInteger(obj)
+  Objects.NewObj := obj
+end NewInteger
+
+procedure CopyReal*(M: pointer to Objects.CopyMsg; from, to_: Real)
+begin
+  Gadgets.CopyObject(M, from, to_)
+  to_.val_ := from.val_
+end CopyReal
+
+procedure RealHandler*(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    obj2: Real
+    ver: int32
+begin
+  case obj of
+  | Real:
+    case M of
+    | Objects.PAttrMsg:
+      if M.id = Objects.get then
+        if M.name = "Gen" then
+          copy(@M.s, "BasicGadgets.NewReal", 64)
+          M.class := Objects.String
+          M.res := 0
+        elsif M.name = "Value" then
+          M.y := obj.val_
+          M.class := Objects.LongReal
+          M.res := 0
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if M.name = "Value" then
+          if M.class = Objects.LongReal then
+            obj.val_ := M.y
+            M.res := 0
+          elsif M.class = Objects.Real then
+            obj.val_ := val(longreal, M.x)
+            M.res := 0
+          elsif M.class = Objects.Int then
+            obj.val_ := val(longreal, M.i)
+            M.res := 0
+          elsif M.class = Objects.String then
+            Strings.StrToReal(@M.s, @obj.val_)
+            M.res := 0
+          end
+
+        else
+          Gadgets.objecthandle(obj, M)
+        end
+
+      elsif M.id = Objects.enum then
+        M.Enum("Value")
+        Gadgets.objecthandle(obj, M)
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Files.WriteNum(@M.R, VersionAbstract)
+        Files.WriteLReal(@M.R, obj.val_)
+        Gadgets.objecthandle(obj, M)
+      elsif M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if ver = VersionNo then
+          // old
+          Files.ReadLReal(@M.R, @obj.val_)
+        elsif ver = VersionAbstract then
+          Files.ReadLReal(@M.R, @obj.val_)
+          Gadgets.objecthandle(obj, M)
+        else
+          Texts.WriteString(@W, "Version ")
+          Texts.WriteInt(@W, VersionAbstract, 3)
+          Texts.WriteString(@W, " of real cannot read version ")
+          Texts.WriteInt(@W, ver, 3)
+          Texts.WriteLn(@W)
+          Log()
+          halt(42)
+        end
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = obj.stamp then
+        M.obj := obj.dlink
+      else
+        newgc(obj2)
+        obj.stamp := M.stamp
+        obj.dlink := obj2
+        CopyReal(M, obj, obj2)
+        M.obj := obj2
+      end
+
+    else
+      Gadgets.objecthandle(obj, M)
+    end
+  end
+end RealHandler
+
+procedure InitReal*(obj: Real)
+begin
+  obj.handle := RealHandler
+  obj.val_ := val(longreal, 0)
+end InitReal
+
+procedure NewReal*()
+  var
+    obj: Real
+begin
+  newgc(obj)
+  InitReal(obj)
+  Objects.NewObj := obj
+end NewReal
+
+procedure Field(F: Gadgets.Frame; name: pointer to array of char; name_len: int32)
+  var
+    A: Objects.AttrMsg
+begin
+  A.id := Objects.get
+  copy(@A.name, "Field", 32)
+  A.class := Objects.Inval
+  copy(@A.s, "", 64)
+  F.handle(F, @A)
+  if (A.res >= 0) & (A.class = Objects.String) & (A.s # "") then
+    copy(name, @A.s, name_len)
+  else
+    copy(name, "Value", name_len)
+  end
+end Field
+
+// ------ Gadgets ------
+
+procedure ButtonUpdateModel(F: Button)
+  var
+    A: Objects.AttrMsg
+begin
+  if F.obj # nil then
+    A.id := Objects.get
+    Field(F, @A.name, 32)
+    A.class := Objects.Inval
+    A.res := -1
+    F.obj.handle(F.obj, @A)
+    if A.res >= 0 then
+      if A.class = Objects.Bool then
+        F.val_ := A.b
+      elsif A.class = Objects.Int then
+        F.val_ := A.i = F.setval
+      end
+    end
+  end
+end ButtonUpdateModel
+
+procedure ButtonSetModel(F: Button)
+  var
+    A: Objects.AttrMsg
+begin
+  if F.obj # nil then
+    A.id := Objects.get
+    Field(F, @A.name, 32)
+    A.class := Objects.Inval
+    A.res := -1
+    F.obj.handle(F.obj, @A)
+    if A.res >= 0 then
+      A.dlink := F.dlink
+      if A.class = Objects.Bool then
+        A.b := F.val_
+        A.id := Objects.set_
+        A.res := -1
+        F.obj.handle(F.obj, @A)
+      elsif A.class = Objects.Int then
+        if F.val_ then
+          A.i := F.setval
+          A.id := Objects.set_
+          A.res := -1
+          F.obj.handle(F.obj, @A)
+        end
+      end
+    end
+  end
+end ButtonSetModel
+
+procedure ButtonSetLook(F: Button; f: Gadgets.Frame): boolean
+  // ps - 8.5.96
+  var
+    CM: Display.ControlMsg
+    B: Objects.BindMsg
+begin
+  if Gadgets.Recursive(F, f) then
+    Texts.WriteString(@W, "Not allowed, will cause recursive structures")
+    Log()
+    return false
+  elsif (F.lib # nil) & (f.lib # nil) & (F.lib # f.lib) & (f.lib.name # "") then
+    Texts.WriteString(@W, "Across library movement not allowed")
+    Log()
+    return false
+  else
+    CM.id := Display.remove // <<< remove
+    CM.F := f
+    Display.Broadcast(@CM)
+    if F.lib # nil then
+      B.lib := F.lib
+      f.handle(f, @B)
+    end
+    F.look := f
+    KillMasks(F)
+    return true
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end ButtonSetLook
+
+(** Goes through the list of selected gadgets (must be buttons and checkboxes) and assigns to each of
+them a different SetValue attribute numbered from 0. This is useful to create mutual exclusive radio-buttons *)
+procedure SetValues*()
+  var
+    M: Display.SelectMsg
+    b, c: Objects.Object
+    val_: int16
+begin
+  M.id := Display.get
+  M.F := nil
+  M.time := -1
+  M.obj := nil
+  Display.Broadcast(@M)
+  if M.time # -1 then
+    b := M.obj
+    val_ := 0
+    while b # nil do
+      case b of
+      | Button:
+        if (b.obj # nil) & (b.obj is Integer) then
+          c := b.obj
+          b.setval := val_
+          inc(val_)
+        end
+
+      | CheckBox:
+        if (b.obj # nil) & (b.obj is Integer) then
+          c := b.obj
+          b.setval := val_
+          inc(val_)
+        end
+
+      end
+
+      b := b.slink
+    end
+
+    if c # nil then
+      Gadgets.Update(c) // ps - 29.7.96
+    end
+  end
+end SetValues
+
+procedure ForceString(F: Display.Frame; M: pointer to Objects.AttrMsg)
+begin
+  Gadgets.framehandle(F, M)
+  if M.res < 0 then
+    M.class := Objects.String
+    copy(@M.s, "", 64)
+    M.res := 0
+  end
+end ForceString
+
+procedure ButtonAttr(F: Button; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "BasicGadgets.NewButton", 64)
+      M.res := 0
+    elsif M.name = "Caption" then
+      M.class := Objects.String
+      copy(@M.s, @F.caption, 64)
+      M.res := 0
+    elsif M.name = "Value" then
+      M.class := Objects.Bool
+      M.b := F.val_
+      M.res := 0
+    elsif M.name = "Popout" then
+      M.class := Objects.Bool
+      M.b := F.popout
+      M.res := 0
+    elsif M.name = "SetVal" then
+      M.class := Objects.Int
+      M.i := F.setval
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := asr(F.H, 1) - 5
+      M.res := 0
+    elsif M.name = "YesVal" then
+      if F.val_ then
+        Gadgets.framehandle(F, M)
+        if M.res < 0 then
+          M.class := Objects.String
+          copy(@M.s, "", 64)
+        end
+      else
+        M.class := Objects.String
+        copy(@M.s, "", 64)
+      end
+
+      M.res := 0
+    elsif M.name = "Field" then
+      ForceString(F, M)
+    elsif M.name = "Cmd" then
+      ForceString(F, M)
+    elsif M.name = "Led" then
+      M.class := Objects.Bool
+      M.b := F.led
+      M.res := 0
+    elsif M.name = "LedColor" then
+      M.class := Objects.Int
+      M.i := F.ledcol
+      M.res := 0
+    elsif M.name = "Color" then
+      Gadgets.framehandle(F, M)
+      if M.res < 0 then
+        M.class := Objects.Int
+        M.i := Display3.upC
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  elsif M.id = Objects.set_ then
+    if M.name = "Caption" then
+      if M.class = Objects.String then
+        copy(@F.caption, @M.s, 32)
+        M.res := 0
+      end
+    elsif M.name = "Value" then
+      if M.class = Objects.Bool then
+        if F.popout then
+          M.b := false // small hack
+        end
+        F.val_ := M.b
+        M.res := 0
+        if F.obj # nil then
+          ButtonSetModel(F)
+          Gadgets.Update(F.obj)
+        end
+      end
+
+    elsif M.name = "Popout" then
+      if M.class = Objects.Bool then
+        F.popout := M.b
+        M.res := 0
+        if F.val_ then
+          // pushed in
+          F.val_ := false
+          if F.obj # nil then
+            ButtonSetModel(F)
+            Gadgets.Update(F.obj)
+          end
+        end
+      end
+
+    elsif M.name = "SetVal" then
+      if M.class = Objects.Int then
+        F.setval := val(int16, M.i)
+        if F.obj # nil then
+          Gadgets.Update(F.obj)
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "Led" then
+      if M.class = Objects.Bool then
+        F.led := M.b
+        M.res := 0
+      end
+    elsif M.name = "LedColor" then
+      if M.class = Objects.Int then
+        F.ledcol := val(int16, M.i)
+        M.res := 0
+      end
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Caption")
+    M.Enum("Value")
+    M.Enum("Popout")
+    M.Enum("Led")
+    M.Enum("LedColor")
+    M.Enum("Color")
+    M.Enum("SetVal")
+    M.Enum("YesVal")
+    M.Enum("Field")
+    M.Enum("Cmd")
+    Gadgets.framehandle(F, M)
+  end
+end ButtonAttr
+
+procedure RestoreButton(R: Display3.Mask; F: Button; x, y, w, h, u, v, w1, h1: int16; dlink: Objects.Object)
+  var
+    D: Display.DisplayMsg
+    L: Gadgets.Frame
+    O: Display3.OverlapMsg
+    A: Objects.AttrMsg
+    ll, lr, lb, lt: int16
+    col: int32
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  A.id := Objects.get
+  copy(@A.name, "Color", 32)
+  A.class := Objects.Inval
+  A.i := Display3.upC
+  A.res := -1
+  F.handle(F, @A)
+  if A.class = Objects.Int then
+    col := A.i
+  else
+    col := Display3.upC
+  end
+  if F.val_ then
+    Display3.Rect3D(R, Display3.bottomC, Display3.topC, x, y, w, h, 1, Display.replace)
+    Display3.Rect3D(R, Display3.downC, Display3.upC, x + 1, y + 1, w - 2, h - 2, 1, Display.replace)
+    Display3.ReplConst(R, col, x + 2, y + 2, w - 4, h - 4, Display.replace) // inside
+
+    if F.caption # "" then
+      Display3.CenterString(R, Display3.textC, x + 3, y + 1, w - 4, h - 4, Fonts.Default, @F.caption, Display3.textmode)
+    elsif F.look # nil then
+      L := F.look(Gadgets.Frame)
+      ll := x + asr(w, 1) - asr(L.W, 1) + 1
+      lr := ll + L.W - 1
+      lb := y + asr(h, 1) - asr(L.H, 1) - 1
+      lt := lb + L.H - 1
+      u := x + u
+      v := y + h - 1 + v
+      if u < ll then
+        dec(w1, ll - u)
+        u := ll
+      end
+      if v < lb then
+        dec(h1, lb - y)
+        v := lb
+      end
+      if u + w1 - 1 > lr then
+        w1 := lr + 1 - u
+      end
+      if v + h1 - 1 > lt then
+        h1 := lt + 1 - v
+      end
+      O.F := L
+      O.res := -1
+      O.M := F.inM
+      O.x := 0
+      O.y := 0
+      O.dlink := nil
+      L.handle(L, @O)
+      D.device := Display.screen
+      D.id := Display.area
+      D.F := L
+      D.dlink := dlink
+      D.x := ll - L.X
+      D.y := lb - L.Y
+      D.u := u - ll
+      D.v := v - lt
+      D.w := w1
+      D.h := h1
+      D.res := -1
+      L.handle(L, @D)
+    end
+
+    if F.led then
+      Display3.ReplConst(R, F.ledcol, x + 4, y + h - 7, 10, 3, Display.replace)
+      Display3.ReplConst(R, Display3.black, x + 4, y + h - 8, 10, 1, Display.replace)
+      Display3.ReplConst(R, Display3.black, x + 14, y + h - 8, 1, 4, Display.replace)
+    end
+
+  else
+    Display3.Rect3D(R, Display3.bottomC, Display3.topC, x, y, w, h, 1, Display.replace)
+    Display3.Rect3D(R, Display3.topC, Display3.bottomC, x + 1, y + 1, w - 2, h - 2, 1, Display.replace)
+    Display3.ReplConst(R, col, x + 2, y + 2, w - 4, h - 4, Display.replace) // inside
+    if F.caption # "" then
+      Display3.CenterString(R, Display3.textC, x + 2, y + 2, w - 4, h - 4, Fonts.Default, @F.caption, Display3.textmode)
+    elsif F.look # nil then
+      L := F.look(Gadgets.Frame)
+      ll := x + asr(w, 1) - asr(L.W, 1)
+      lr := ll + L.W - 1
+      lb := y + asr(h, 1) - asr(L.H, 1)
+      lt := lb + L.H - 1
+      u := x + u
+      v := y + h - 1 + v
+      if u < ll then
+        dec(w1, ll - u)
+        u := ll
+      end
+      if v < lb then
+        dec(h1, lb - y)
+        v := lb
+      end
+      if u + w1 - 1 > lr then
+        w1 := lr + 1 - u
+      end
+      if v + h1 - 1 > lt then
+        h1 := lt + 1 - v
+      end
+      O.F := L
+      O.res := -1
+      O.M := F.outM
+      O.x := 0
+      O.y := 0
+      O.dlink := nil
+      L.handle(L, @O)
+      D.device := Display.screen
+      D.id := Display.area
+      D.F := L
+      D.dlink := dlink
+      D.x := ll - L.X
+      D.y := lb - L.Y
+      D.u := u - ll
+      D.v := v - lt
+      D.w := w1
+      D.h := h1
+      D.res := -1
+      L.handle(L, @D)
+    end
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreButton
+
+procedure PrintButton(F: Button; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask
+    x, y, w, h: int16
+    D: Display.DisplayMsg
+    L: Gadgets.Frame
+    O: Display3.OverlapMsg
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  if F.val_ then
+    Printer3.Rect3D(R, Display3.bottomC, Display3.topC, x, y, w, h, P(1), Display.replace)
+    Printer3.Rect3D(R, Display3.downC, Display3.upC, x + P(1), y + P(1), w - P(2), h - P(2), P(1), Display.replace)
+    Printer3.ReplConst(R, Display3.upC, x + P(2), y + P(2), w - P(4), h - P(4), Display.replace) // inside
+
+    if F.caption # "" then
+      Printer3.CenterString(R, Display3.textC, x + P(3), y + P(1), w - P(4), h - P(4), Fonts.Default, @F.caption, Display3.textmode)
+    elsif F.look # nil then
+      L := F.look(Gadgets.Frame)
+      O.res := -1
+      O.M := F.inM
+      O.x := 0
+      O.y := 0
+      O.dlink := nil
+      L.handle(L, @O)
+      D.device := Display.printer
+      D.id := Display.full
+      D.F := nil
+      D.dlink := M.dlink
+      D.x := x + asr(w, 1) - P(asr(L.W, 1)) + P(1)
+      D.y := y + asr(h, 1) - P(asr(L.H, 1)) - P(1)
+      D.res := -1
+      L.handle(L, @D)
+    end
+
+    if F.led then
+      Printer3.ReplConst(R, F.ledcol, x + P(4), y + h - P(7), P(10), P(3), Display.replace)
+      Printer3.ReplConst(R, Display3.black, x + P(4), y + h - P(8), P(10), P(1), Display.replace)
+      Printer3.ReplConst(R, Display3.black, x + P(14), y + h - P(8), P(1), P(4), Display.replace)
+    end
+
+  else
+    Printer3.Rect3D(R, Display3.bottomC, Display3.topC, x, y, w, h, P(1), Display.replace)
+    Printer3.Rect3D(R, Display3.topC, Display3.bottomC, x + P(1), y + P(1), w - P(2), h - P(2), P(1), Display.replace)
+    Printer3.ReplConst(R, Display3.upC, x + P(2), y + P(2), w - P(4), h - P(4), Display.replace) // inside
+    if F.caption # "" then
+      Printer3.CenterString(R, Display3.textC, x + P(2), y + P(2), w - P(4), h - P(4), Fonts.Default, @F.caption, Display3.textmode)
+    elsif F.look # nil then
+      L := F.look(Gadgets.Frame)
+      O.res := -1
+      O.M := F.outM
+      O.x := 0
+      O.y := 0
+      O.dlink := nil
+      L.handle(L, @O)
+      D.device := Display.printer
+      D.id := Display.full
+      D.F := nil
+      D.dlink := M.dlink
+      D.x := x + asr(w, 1) - P(asr(L.W, 1))
+      D.y := y + asr(h, 1) - P(asr(L.H, 1))
+      D.res := -1
+      L.handle(L, @D)
+    end
+  end
+end PrintButton
+
+procedure CopyButton*(M: pointer to Objects.CopyMsg; from, to_: Button)
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  copy(@to_.caption, @from.caption, 32)
+  to_.val_ := from.val_
+  to_.popout := from.popout
+  to_.look := Gadgets.CopyPtr(M, from.look)
+  to_.setval := from.setval
+  to_.led := from.led
+  to_.ledcol := from.ledcol
+end CopyButton
+
+procedure ButtonHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M3: Display.PFrameMsg
+    F2: Button
+    x, y, w, h: int16
+    keysum: set
+    ver: int32
+    f: Gadgets.Frame
+    R: Display3.Mask
+begin
+  case F of
+  | Button:
+    case M of
+    | Objects.PAttrMsg:
+      ButtonAttr(F, M)
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        if ~F.led or (F.ledcol # Display3.red) then
+          Files.WriteNum(@M.R, VersionNewButton)
+          if F.led then
+            Files.WriteInt(@M.R, 1)
+          else
+            Files.WriteInt(@M.R, 0)
+          end
+          Files.WriteInt(@M.R, F.ledcol)
+        else
+          Files.WriteNum(@M.R, 3)
+        end
+
+        Files.WriteString(@M.R, @F.caption, 32)
+        if F.val_ then
+          Files.WriteInt(@M.R, 1)
+        else
+          Files.WriteInt(@M.R, 0)
+        end
+        if F.popout then
+          Files.WriteInt(@M.R, 1)
+        else
+          Files.WriteInt(@M.R, 0)
+        end
+        Files.WriteInt(@M.R, F.setval)
+        Gadgets.WriteRef(@M.R, F.lib, F.look)
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if ver = VersionNo then
+          Files.ReadString(@M.R, @F.caption, 32)
+          Files.ReadInt(@M.R, @x)
+          F.val_ := x = 1
+          Files.ReadInt(@M.R, @x)
+          F.popout := x = 1
+          Gadgets.framehandle(F, M)
+          if (F.obj # nil) & (F.obj is Integer) then
+            Files.ReadInt(@M.R, @x)
+            F.setval := val(int16, val(int8, x))
+          end
+        elsif ver >= 3 then
+          if ver = VersionNewButton then
+            Files.ReadInt(@M.R, @x)
+            F.led := x = 1
+            Files.ReadInt(@M.R, @F.ledcol)
+          end
+
+          Files.ReadString(@M.R, @F.caption, 32)
+          Files.ReadInt(@M.R, @x)
+          F.val_ := x = 1
+          Files.ReadInt(@M.R, @x)
+          F.popout := x = 1
+          if F.popout then
+            F.val_ := false
+          end
+          Files.ReadInt(@M.R, @F.setval)
+          Gadgets.ReadRef(@M.R, F.lib, @F.look)
+          Gadgets.framehandle(F, M)
+        else
+          Texts.WriteString(@W, "Version ")
+          Texts.WriteInt(@W, VersionNewButton, 3)
+          Texts.WriteString(@W, " of buttons cannot read version ")
+          Texts.WriteInt(@W, ver, 3)
+          Texts.WriteLn(@W)
+          Log()
+          halt(42)
+        end
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F2)
+        F.stamp := M.stamp
+        F.dlink := F2
+        CopyButton(M, F, F2)
+        M.obj := F2
+      end
+
+    | Objects.PBindMsg:
+      Gadgets.framehandle(F, M)
+      if F.look # nil then
+        F.look.handle(F.look, M)
+      end
+    | Objects.PLinkMsg:
+      // ps - 8.5.96
+      if M.id = Objects.get then
+        if M.name = "Look" then
+          M.obj := F.look
+          M.res := 0
+        else
+          Gadgets.framehandle(F, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if M.name = "Look" then
+          if M.obj = nil then
+            F.look := nil
+            M.res := 0
+          elsif M.obj = F.look then
+            M.res := 0
+          elsif M.obj is Gadgets.Frame then
+            if ButtonSetLook(F, M.obj(Gadgets.Frame)) then
+              M.res := 0
+            end
+          end
+
+        else
+          Gadgets.framehandle(F, M)
+        end
+
+      elsif M.id = Objects.enum then
+        M.Enum("Look")
+        Gadgets.framehandle(F, M)
+      end
+
+    | Display.PFrameMsg:
+      if M.res >= 0 then
+        return
+      end
+      x := M.x + F.X
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      M3 := M
+      case M3 of
+      | Display.PDisplayMsg:
+        if M3.device = Display.screen then
+          if (M3.F = nil) or (M3.id = Display.full) & (M3.F = F) then
+            Gadgets.MakeMask(F, x, y, M3.dlink, @R)
+            RestoreButton(R, F, x, y, w, h, 0, 1 - h, w, h, M3.dlink)
+          elsif (M3.id = Display.area) & (M3.F = F) then
+            Gadgets.MakeMask(F, x, y, M3.dlink, @R)
+            Display3.AdjustMask(R, x + M3.u, y + h - 1 + M3.v, M3.w, M3.h)
+            RestoreButton(R, F, x, y, w, h, M3.u, M3.v, M3.w, M3.h, M3.dlink)
+          end
+
+        elsif M3.device = Display.printer then
+          PrintButton(F, M3)
+        end
+
+      | Display.PConsumeMsg:
+        // ps - 8.5.96
+        if (M3.id = Display.drop) & (M3.F = F) & (F.caption = "") & (M3.obj is Gadgets.Frame) & (F.look = nil) then
+          if ButtonSetLook(F, M3.obj(Gadgets.Frame)) then
+            M3.res := 0
+            Gadgets.Update(F)
+          end
+
+        else
+          Gadgets.framehandle(F, M3)
+        end
+
+      | Display3.POverlapMsg:
+        Gadgets.framehandle(F, M3)
+        if F.look # nil then
+          f := F.look(Gadgets.Frame)
+          if F.mask = nil then
+            KillMasks(F.look)
+            F.inM := nil
+            F.outM := nil
+          else
+            Display3.Copy(M3.M, @F.outM)
+            Display3.Intersect(F.outM, 2, -h + 3, w - 4, h - 4)
+            Display3.Intersect(F.outM, asr(w, 1) - asr(f.W, 1), asr(-h + 1, 1) - asr(f.H, 1), f.W, f.H)
+            F.outM.x := -(asr(w, 1) - asr(f.W, 1))
+            F.outM.y := -(asr(-h + 1, 1) - asr(f.H, 1) + f.H) + 1
+            Display3.Shift(F.outM)
+
+            Display3.Copy(M3.M, @F.inM)
+            Display3.Intersect(F.inM, 2, -h + 3, w - 4, h - 4)
+            Display3.Intersect(F.inM, asr(w, 1) - asr(f.W, 1) + 1, asr(-h + 1, 1) - asr(f.H, 1) - 1, f.W, f.H)
+            F.inM.x := -(asr(w, 1) - asr(f.W, 1) + 1)
+            F.inM.y := -(asr(-h + 1, 1) - asr(f.H, 1) + f.H - 1) + 1
+            Display3.Shift(F.inM)
+          end
+        end
+
+      | Gadgets.PUpdateMsg:
+        if F.obj # nil then
+          F.obj.handle(F.obj, M3)
+        end
+        if M3.obj = F.obj then
+          if M3.stamp # F.stamp then
+            F.stamp := M3.stamp
+            ButtonUpdateModel(F)
+          end
+
+          Gadgets.MakeMask(F, x, y, M3.dlink, @R)
+          RestoreButton(R, F, x, y, w, h, 0, 1 - h, w, h, M3.dlink)
+        else
+          Gadgets.framehandle(F, M3)
+        end
+
+      | Display.PControlMsg:
+        // !!!
+        if F.obj # nil then
+          F.obj.handle(F.obj, M3)
+        end
+        if (M3.id = Display.restore) & (M3.stamp # F.stamp) then
+          F.stamp := M3.stamp
+          ButtonUpdateModel(F)
+        end
+
+      | Oberon.PInputMsg:
+        if (M3.id = Oberon.track) & ((1 in M3.keys) or Oberon.New & (2 in M3.keys)) & Gadgets.InActiveArea(F, M3) then
+          F.val_ := ~F.val_
+          if F.obj # nil then
+            ButtonSetModel(F)
+            Gadgets.Update(F.obj)
+          else
+            Gadgets.Update(F)
+          end
+
+          if F.popout then
+            keysum := M3.keys
+            repeat
+              if F.val_ # Effects.Inside(M3.X, M3.Y, x, y, w, h) then
+                F.val_ := ~F.val_
+                if F.obj # nil then
+                  ButtonSetModel(F)
+                  Gadgets.Update(F.obj)
+                else
+                  Gadgets.Update(F)
+                end
+              end
+
+              Effects.TrackMouse(@M3.keys, @M3.X, @M3.Y, Effects.Arrow)
+              keysum := keysum + M3.keys
+            until M3.keys = {}
+            M3.res := 0
+            if F.val_ then
+              F.val_ := ~F.val_
+              if F.obj # nil then
+                ButtonSetModel(F)
+                Gadgets.Update(F.obj)
+              else
+                Gadgets.Update(F)
+              end
+
+              if (keysum = {1}) or Oberon.New & (keysum = {2}) then
+                Gadgets.ExecuteAttr(F, "Cmd", M3.dlink, nil, nil)
+              end
+            end
+
+          else
+            keysum := M3.keys
+            repeat
+              Effects.TrackMouse(@M3.keys, @M3.X, @M3.Y, Effects.Arrow)
+              keysum := keysum + M3.keys
+            until M3.keys = {}
+            M3.res := 0
+            if (keysum = {1}) or Oberon.New & (keysum = {2}) then
+              Gadgets.ExecuteAttr(F, "Cmd", M3.dlink, nil, nil)
+            end
+          end
+
+        elsif ~(Gadgets.selected in F.state) then
+          Gadgets.framehandle(F, M3)
+        end
+
+      else
+        Gadgets.framehandle(F, M3)
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end ButtonHandler
+
+procedure InitButton*(F: Button)
+begin
+  F.handle := ButtonHandler
+  F.W := 40
+  F.H := 30
+  F.popout := true
+  F.led := true
+  F.ledcol := Display3.red
+  copy(@F.caption, "Button", 32)
+end InitButton
+
+procedure NewButton*()
+  var
+    F: Button
+begin
+  newgc(F)
+  InitButton(F)
+  Objects.NewObj := F
+end NewButton
+
+// ========== Checkboxes ================
+
+procedure CheckBoxUpdateModel(F: CheckBox)
+  var
+    A: Objects.AttrMsg
+begin
+  if F.obj # nil then
+    A.id := Objects.get
+    Field(F, @A.name, 32)
+    A.class := Objects.Inval
+    A.res := -1
+    F.obj.handle(F.obj, @A)
+    if A.res >= 0 then
+      if A.class = Objects.Bool then
+        F.val_ := A.b
+      elsif A.class = Objects.Int then
+        F.val_ := A.i = F.setval
+      end
+    end
+  end
+end CheckBoxUpdateModel
+
+procedure CheckBoxSetModel(F: CheckBox)
+  var
+    A: Objects.AttrMsg
+begin
+  if F.obj # nil then
+    A.id := Objects.get
+    Field(F, @A.name, 32)
+    A.class := Objects.Inval
+    A.res := -1
+    F.obj.handle(F.obj, @A)
+    if A.res >= 0 then
+      A.dlink := F.dlink
+      if A.class = Objects.Bool then
+        A.b := F.val_
+        A.id := Objects.set_
+        A.res := -1
+        F.obj.handle(F.obj, @A)
+      elsif A.class = Objects.Int then
+        if F.val_ then
+          A.i := F.setval
+          A.id := Objects.set_
+          A.res := -1
+          F.obj.handle(F.obj, @A)
+        end
+      end
+    end
+  end
+end CheckBoxSetModel
+
+procedure CheckBoxAttr(B: CheckBox; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "BasicGadgets.NewCheckBox", 64)
+      M.res := 0
+    elsif M.name = "Value" then
+      M.class := Objects.Bool
+      M.b := B.val_
+      M.res := 0
+    elsif M.name = "SetVal" then
+      M.class := Objects.Int
+      M.i := B.setval
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := asr(B.H, 1) - 5
+      M.res := 0
+    elsif M.name = "YesVal" then
+      // ps - 3.5.96
+      if B.val_ then
+        Gadgets.framehandle(B, M)
+        if M.res < 0 then
+          M.class := Objects.String
+          copy(@M.s, "", 64)
+        end
+      else
+        M.class := Objects.String
+        copy(@M.s, "", 64)
+      end
+      M.res := 0
+    elsif M.name = "Field" then
+      ForceString(B, M)
+    elsif M.name = "Cmd" then
+      ForceString(B, M)
+    elsif M.name = "Color" then
+      Gadgets.framehandle(B, M)
+      if M.res < 0 then
+        M.class := Objects.Int
+        M.i := Display3.textbackC
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(B, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Value" then
+      if M.class = Objects.Bool then
+        B.val_ := M.b
+        M.res := 0
+        if B.obj # nil then
+          CheckBoxSetModel(B)
+          Gadgets.Update(B.obj)
+        end
+      end
+
+    elsif M.name = "SetVal" then
+      if M.class = Objects.Int then
+        B.setval := val(int16, M.i)
+        if B.obj # nil then
+          Gadgets.Update(B.obj)
+        end
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(B, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Value")
+    M.Enum("YesVal")
+    M.Enum("SetVal")
+    M.Enum("Field")
+    M.Enum("Cmd")
+    M.Enum("Color")
+    Gadgets.framehandle(B, M)
+  end
+end CheckBoxAttr
+
+procedure RestoreCheckBox(R: Display3.Mask; F: CheckBox; x, y, w, h: int16)
+  var
+    A: Objects.AttrMsg
+    col: int32
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  A.id := Objects.get
+  copy(@A.name, "Color", 32)
+  A.class := Objects.Inval
+  A.i := Display3.textbackC
+  A.res := -1
+  F.handle(F, @A)
+  if A.class = Objects.Int then
+    col := A.i
+  else
+    col := Display3.textbackC
+  end
+  A.id := Objects.get
+  Field(F, @A.name, 32)
+  A.class := Objects.Inval
+  A.res := -1
+  if F.obj # nil then
+    F.obj.handle(F.obj, @A)
+  end
+
+  if (A.res >= 0) & (A.class = Objects.Int) then
+    // change look if integers are involved
+    Display3.FilledRect3D(R, Display3.bottomC, Display3.topC, col, x, y, w, h, 1, Display.replace)
+    if F.val_ then
+      Display3.FilledRect3D(R, Display3.topC, Display3.bottomC, Display3.groupC, x + 3, y + 3, w - 6, h - 6, 1, Display.replace)
+    end
+
+  else
+    Display3.FilledRect3D(R, Display3.bottomC, Display3.topC, col, x, y, w, h, 1, Display.replace)
+    if F.val_ then
+      Display3.ReplConst(R, Display3.white, x + 5, y + 4, 1, 10, Display.replace)
+      Display3.ReplConst(R, Display3.black, x + 6, y + 4, 1, 10, Display.replace)
+      Display3.Line(R, Display3.white, Display.solid, x + 5, y + 5, x + 17, y + 17, 1, Display.replace)
+      Display3.Line(R, Display3.black, Display.solid, x + 5, y + 4, x + 17, y + 16, 1, Display.replace)
+    end
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreCheckBox
+
+procedure PrintCheckBox(F: CheckBox; M: pointer to Display.DisplayMsg)
+  var
+    A: Objects.AttrMsg
+    R: Display3.Mask
+    x, y, w, h: int16
+    col: int32
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  A.id := Objects.get
+  copy(@A.name, "Color", 32)
+  A.class := Objects.Inval
+  A.i := Display3.textbackC
+  A.res := -1
+  F.handle(F, @A)
+  if A.class = Objects.Int then
+    col := A.i
+  else
+    col := Display3.textbackC
+  end
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  if (F.obj # nil) & (F.obj is Integer) then
+    Printer3.FilledRect3D(R, Display3.bottomC, Display3.topC, col, x, y, w, h, P(1), Display.replace)
+    if F.val_ then
+      Printer3.FilledRect3D(R, Display3.topC, Display3.bottomC, Display3.groupC, x + P(3), y + P(3), w - P(6), h - P(6), 1, Display.replace)
+    end
+
+  else
+    Printer3.FilledRect3D(R, Display3.bottomC, Display3.topC, col, x, y, w, h, P(1), Display.replace)
+    if F.val_ then
+      Printer3.ReplConst(R, Display3.white, x + P(5), y + P(4), P(1), P(10), Display.replace)
+      Printer3.ReplConst(R, Display3.black, x + P(6), y + P(4), P(1), P(10), Display.replace)
+      Printer3.Line(R, Display3.white, Display.solid, x + P(5), y + P(5), x + P(17), y + P(17), P(1), Display.replace)
+      Printer3.Line(R, Display3.black, Display.solid, x + P(5), y + P(4), x + P(17), y + P(16), P(1), Display.replace)
+    end
+  end
+end PrintCheckBox
+
+procedure CopyCheckBox*(M: pointer to Objects.CopyMsg; from, to_: CheckBox)
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  to_.val_ := from.val_
+  to_.setval := from.setval
+end CopyCheckBox
+
+procedure CheckBoxHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M2: Display.PFrameMsg
+    x, y, w, h, u, v: int16
+    ver: int32
+    F0: CheckBox
+    R: Display3.Mask
+    keysum: set
+begin
+  case F of
+  | CheckBox:
+    case M of
+    | Objects.PAttrMsg:
+      CheckBoxAttr(F, M)
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Files.WriteNum(@M.R, VersionNewCheckbox)
+        Files.WriteBool(@M.R, F.val_)
+        Files.WriteInt(@M.R, F.setval)
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        Files.ReadNum(@M.R, @ver)
+        if ver = VersionNo then
+          Files.ReadInt(@M.R, @x)
+          F.val_ := x = 1
+          Gadgets.framehandle(F, M)
+          if (F.obj # nil) & (F.obj is Integer) then
+            Files.ReadInt(@M.R, @x)
+            F.setval := x
+          end
+        elsif ver = VersionNewCheckbox then
+          Files.ReadBool(@M.R, @F.val_)
+          Files.ReadInt(@M.R, @F.setval)
+          Gadgets.framehandle(F, M)
+        else
+          Texts.WriteString(@W, "Version ")
+          Texts.WriteInt(@W, VersionNewCheckbox, 3)
+          Texts.WriteString(@W, " of checkboxes cannot read version ")
+          Texts.WriteInt(@W, ver, 3)
+          Texts.WriteLn(@W)
+          Log()
+          halt(42)
+        end
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyCheckBox(M, F, F0)
+        M.obj := F0
+      end
+
+    | Display.PFrameMsg:
+      x := M.x + F.X // calculate actual coordinates
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      u := M.x // store volatile info
+      v := M.y
+      M2 := M
+      case M2 of
+      | Display.PDisplayMsg:
+        if M2.device = Display.screen then
+          if (M2.F = nil) or (M2.id = Display.full) & (M2.F = F) then
+            Gadgets.MakeMask(F, x, y, M2.dlink, @R)
+            RestoreCheckBox(R, F, x, y, w, h)
+          elsif (M2.id = Display.area) & (M2.F = F) then
+            Gadgets.MakeMask(F, x, y, M2.dlink, @R)
+            Display3.AdjustMask(R, x + M2.u, y + h - 1 + M2.v, M2.w, M2.h)
+            RestoreCheckBox(R, F, x, y, w, h)
+          end
+
+        elsif M2.device = Display.printer then
+          PrintCheckBox(F, M2)
+        end
+
+      | Gadgets.PUpdateMsg:
+        if F.obj # nil then
+          F.obj.handle(F.obj, M2)
+        end
+        if M2.obj = F.obj then
+          if M2.stamp # F.stamp then
+            F.stamp := M2.stamp
+            CheckBoxUpdateModel(F)
+          end
+
+          Gadgets.MakeMask(F, x, y, M2.dlink, @R)
+          RestoreCheckBox(R, F, x, y, w, h)
+        else
+          Gadgets.framehandle(F, M2)
+        end
+
+      | Display.PControlMsg:
+        // !!!
+        if F.obj # nil then
+          F.obj.handle(F.obj, M2)
+        end
+        if (M2.id = Display.restore) & (M2.stamp # F.stamp) then
+          F.stamp := M2.stamp
+          CheckBoxUpdateModel(F)
+        end
+
+      | Oberon.PInputMsg:
+        if (M2.id = Oberon.track) & ((1 in M2.keys) or Oberon.New & (2 in M2.keys)) & Gadgets.InActiveArea(F, M2) then
+          F.val_ := ~F.val_
+          if F.obj # nil then
+            CheckBoxSetModel(F)
+            Gadgets.Update(F.obj)
+          else
+            Gadgets.Update(F)
+          end
+
+          keysum := M2.keys
+          repeat
+            Effects.TrackMouse(@M2.keys, @M2.X, @M2.Y, Effects.Arrow)
+            keysum := keysum + M2.keys
+          until M2.keys = {}
+
+          M2.res := 0
+          if (keysum = {1}) or Oberon.New & (keysum = {2}) then
+            Gadgets.ExecuteAttr(F, "Cmd", M2.dlink, nil, nil)
+          end
+
+        elsif ~(Gadgets.selected in F.state) then
+          Gadgets.framehandle(F, M2)
+        end
+
+      else
+        Gadgets.framehandle(F, M2)
+      end
+
+      M.x := u // restore volatile info
+      M.y := v
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end CheckBoxHandler
+
+procedure InitCheckBox*(F: CheckBox)
+begin
+  F.W := 20
+  F.H := 20
+  F.handle := CheckBoxHandler
+end InitCheckBox
+
+procedure NewCheckBox*()
+  var
+    F: CheckBox
+begin
+  newgc(F)
+  InitCheckBox(F)
+  Objects.NewObj := F
+end NewCheckBox
+
+// ========== SLIDERS =========
+
+procedure SliderUpdateModel(F: Slider)
+  var
+    A: Objects.AttrMsg
+begin
+  if F.obj # nil then
+    A.id := Objects.get
+    Field(F, @A.name, 32)
+    A.class := Objects.Inval
+    A.res := -1
+    F.obj.handle(F.obj, @A)
+    if A.res >= 0 then
+      if A.class = Objects.Int then
+        F.val_ := A.i
+      elsif A.class = Objects.String then
+        Strings.StrToInt(@A.s, @F.val_)
+      elsif A.class = Objects.Real then
+        F.val_ := val(int32, floor(A.x))
+      elsif A.class = Objects.LongReal then
+        F.val_ := val(int32, floor(A.y))
+      end
+    end
+  end
+end SliderUpdateModel
+
+procedure SliderSetModel(F: Slider)
+  var
+    A: Objects.AttrMsg
+begin
+  if F.obj # nil then
+    A.id := Objects.set_
+    Field(F, @A.name, 32)
+    A.class := Objects.Int
+    A.i := F.val_
+    A.res := -1
+    F.obj.handle(F.obj, @A)
+  end
+end SliderSetModel
+
+procedure SliderAttr(F: Slider; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "BasicGadgets.NewSlider", 64)
+      M.res := 0
+    elsif M.name = "Min" then
+      M.class := Objects.Int
+      M.i := F.min_
+      M.res := 0
+    elsif M.name = "Max" then
+      M.class := Objects.Int
+      M.i := F.max_
+      M.res := 0
+    elsif M.name = "Value" then
+      M.class := Objects.Int
+      M.i := F.val_
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := asr(F.H, 1) - 5
+      M.res := 0
+    elsif M.name = "Field" then
+      ForceString(F, M)
+    elsif M.name = "Cmd" then
+      ForceString(F, M)
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Min" then
+      if M.class = Objects.Int then
+        F.min_ := M.i
+        M.res := 0
+      end
+    elsif M.name = "Max" then
+      if M.class = Objects.Int then
+        F.max_ := M.i
+        M.res := 0
+      end
+    elsif M.name = "Value" then
+      if M.class = Objects.Int then
+        F.val_ := M.i
+        if F.obj # nil then
+          SliderSetModel(F)
+          Gadgets.Update(F.obj)
+        end
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Min")
+    M.Enum("Max")
+    M.Enum("Value")
+    M.Enum("Field")
+    M.Enum("Cmd")
+    Gadgets.framehandle(F, M)
+  end
+end SliderAttr
+
+procedure RestoreSlider(R: Display3.Mask; F: Slider; x, y, w, h: int16)
+begin
+  if F.min_ = F.max_ then
+    F.max_ := F.min_ + 1
+  end
+  F.BW := Min(w, h)
+  F.B := Effects.BarPos(x, y, w, h, F.BW, F.min_, F.max_, F.val_)
+  Effects.Bar(R, x, y, w, h, F.B, F.BW)
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreSlider
+
+procedure CopySlider*(M: pointer to Objects.CopyMsg; from, to_: Slider)
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  to_.min_ := from.min_
+  to_.max_ := from.max_
+  to_.val_ := from.val_
+  to_.B := from.B
+  to_.BW := from.BW
+end CopySlider
+
+procedure PrintSlider(F: Slider; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask
+    x, y, w, h, X0, Y0, B, BW: int16
+
+  procedure P(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end P
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  Printer3.FilledRect3D(R, Display3.bottomC, Display3.topC, 12, x, y, w, h, 1, Display.replace)
+
+  BW := Min(w, h)
+  B := Effects.BarPos(x, y, w, h, BW, F.min_, F.max_, F.val_)
+  if w > h then
+    X0 := B + 1
+    Y0 := Min(BW, w - 2)
+  else
+    Y0 := B + 1
+    X0 := Min(BW, h - 2)
+  end
+
+  if h > w then
+    Printer3.FilledRect3D(R, Display3.topC, Display3.bottomC, Display3.groupC, x + 1, Y0, w - 2, X0, 1, Display.replace)
+    if w > P(6) then
+      Printer3.ReplConst(R, Display3.bottomC, x + 3, Y0 + asr(X0, 1), w - 6, 1, Display.replace)
+      Printer3.ReplConst(R, Display3.topC, x + 3, Y0 + asr(X0, 1) - 1, w - 6, 1, Display.replace)
+    end
+
+  else
+    Printer3.FilledRect3D(R, Display3.topC, Display3.bottomC, Display3.groupC, X0, y + 1, Y0, h - 2, 1, Display.replace)
+    if h > P(6) then
+      Printer3.ReplConst(R, Display3.bottomC, X0 + asr(Y0, 1) - 1, y + 3, 1, h - 6, Display.replace)
+      Printer3.ReplConst(R, Display3.topC, 0 + asr(Y0, 1), y + 3, 1, h - 6, Display.replace)
+    end
+  end
+end PrintSlider
+
+procedure SliderHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h: int16
+    F2: Slider
+    R: Display3.Mask
+begin
+  case F of
+  | Slider:
+    case M of
+    | Objects.PAttrMsg:
+      SliderAttr(F, M)
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        WriteVersion(@M.R)
+        Files.WriteLInt(@M.R, F.min_)
+        Files.WriteLInt(@M.R, F.max_)
+        Files.WriteLInt(@M.R, F.val_)
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        ReadVersion(@M.R)
+        Files.ReadLInt(@M.R, @F.min_)
+        Files.ReadLInt(@M.R, @F.max_)
+        Files.ReadLInt(@M.R, @F.val_)
+        Gadgets.framehandle(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F2)
+        F.stamp := M.stamp
+        F.dlink := F2
+        CopySlider(M, F, F2)
+        M.obj := F2
+      end
+
+    | Display.PFrameMsg:
+      if M.res >= 0 then
+        return
+      end
+      x := M.x + F.X
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      M1 := M
+      case M1 of
+      | Display.PDisplayMsg:
+        if M1.device = Display.screen then
+          if (M1.F = nil) or (M1.id = Display.full) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            RestoreSlider(R, F, x, y, w, h)
+          elsif (M1.id = Display.area) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            Display3.AdjustMask(R, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+            RestoreSlider(R, F, x, y, w, h)
+          end
+
+        elsif M1.device = Display.printer then
+          PrintSlider(F, M1)
+        end
+
+      | Gadgets.PUpdateMsg:
+        if F.obj # nil then
+          F.obj.handle(F.obj, M1)
+        end
+        if M1.obj = F.obj then
+          if F.stamp # M1.stamp then
+            F.stamp := M1.stamp
+            SliderUpdateModel(F)
+          end
+          Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+          RestoreSlider(R, F, x, y, w, h)
+        else
+          Gadgets.framehandle(F, M1)
+        end
+
+      | Display.PControlMsg:
+        // !!!
+        if F.obj # nil then
+          F.obj.handle(F.obj, M1)
+        end
+        if (F.obj # nil) & (M1.id = Display.restore) then
+          SliderUpdateModel(F)
+        end
+
+      | Oberon.PInputMsg:
+        if (M1.id = Oberon.track) & (1 in M1.keys) & Gadgets.InActiveArea(F, M1) then
+          Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+          F.B := Effects.BarPos(x, y, w, h, F.BW, F.min_, F.max_, F.val_)
+          Effects.TrackBar(R, @M1.keys, @M1.X, @M1.Y, @x, @y, @w, @h, @F.B, @F.BW)
+          F.val_ := Effects.BarValue(x, y, w, h, F.B, F.BW, F.min_, F.max_)
+          if F.obj # nil then
+            SliderSetModel(F)
+            Gadgets.Update(F.obj)
+          else
+            Gadgets.Update(F)
+          end
+
+          Gadgets.ExecuteAttr(F, "Cmd", M1.dlink, nil, nil)
+          M1.res := 0
+        elsif ~(Gadgets.selected in F.state) then
+          Gadgets.framehandle(F, M1)
+        end
+
+      else
+        Gadgets.framehandle(F, M1)
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end SliderHandler
+
+procedure InitSlider*(S: Slider)
+begin
+  S.min_ := 0
+  S.max_ := 100
+  S.val_ := 50
+  S.W := 30
+  S.H := 60
+  S.handle := SliderHandler
+  S.BW := Min(S.W, S.H)
+end InitSlider
+
+procedure NewSlider*()
+  var
+    S: Slider
+begin
+  newgc(S)
+  InitSlider(S)
+  Objects.NewObj := S
+end NewSlider
+
+// Indicate to the display space that the value of obj has changed. Calls Gadgets.Update.
+procedure SetValue*(obj: Objects.Object)
+begin
+  Gadgets.Update(obj)
+end SetValue
+
+// ---
+
+// Separate a button from its look (F.obj). The object is removed and inserted at the caret. Only functions when the button has a (consumed) gadget as a caption.
+procedure Break*()
+  var
+    M: Display.SelectMsg
+    t: Display.Frame
+    B: Button
+begin
+  M.F := nil
+  M.id := Display.get
+  M.time := -1
+  M.obj := nil
+  Display.Broadcast(@M)
+  if (M.time # -1) & (M.obj # nil) then
+    if M.obj is Button then
+      B := M.obj(Button)
+      if B.look # nil then
+        if B.look is Display.Frame then
+          t := B.look(Display.Frame)
+          B.look := nil
+          Gadgets.Update(B)
+          Gadgets.Integrate(t)
+        else
+          B.look := nil
+          Gadgets.Update(B)
+        end
+      end
+    end
+  end
+end Break
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewBoolean" end return NewBoolean end
+  if i = 1 then if name # nil then name^ := "NewString" end return NewString end
+  if i = 2 then if name # nil then name^ := "NewInteger" end return NewInteger end
+  if i = 3 then if name # nil then name^ := "NewReal" end return NewReal end
+  if i = 4 then if name # nil then name^ := "SetValues" end return SetValues end
+  if i = 5 then if name # nil then name^ := "NewButton" end return NewButton end
+  if i = 6 then if name # nil then name^ := "NewCheckBox" end return NewCheckBox end
+  if i = 7 then if name # nil then name^ := "NewSlider" end return NewSlider end
+  if i = 8 then if name # nil then name^ := "Break" end return Break end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("BasicGadgets", cmd_)
+  Texts.OpenWriter(@W)
+end BasicGadgets.

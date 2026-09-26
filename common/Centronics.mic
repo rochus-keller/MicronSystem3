@@ -1,0 +1,76 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Centronics [level=5]
+
+import Kernel, Input, Modules
+// dummy
+
+// Native version
+
+const
+  LPT1* = 0
+  LPT2* = 1
+  LPT3* = 2
+
+procedure Halt(const msg: pointer to array of char)
+  var
+    error: array 32 of char
+begin
+  copy(@error, msg, 32)
+  halt(99)
+end Halt
+
+// Start - Open parallel port.
+
+procedure Start*(port: int16)
+begin
+  Halt("Not implemented")
+end Start
+
+// Reset - Reset parallel port.
+
+procedure Reset*(port: int16)
+begin
+  Halt("Not implemented")
+end Reset
+
+// Stop - Close parallel port.
+
+procedure Stop*(port: int16)
+begin
+  Halt("Not implemented")
+end Stop
+
+// Send - Send byte to parallel port, waiting until it is ready.
+
+procedure Send*(port: int16; x: char)
+begin
+  Halt("Not implemented")
+end Send
+
+// SendPoll - Send byte to parallel port.  done indicates success or failure.
+
+procedure SendPoll*(port: int16; x: char; done: pointer to boolean)
+begin
+  Halt("Not implemented")
+end SendPoll
+
+// Available - Returns number of bytes available for reading (implementation optional).
+
+procedure Available*(port: int16): int32
+begin
+  Halt("Not implemented")
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Available
+
+// Receive - Read a byte from the parallel port (implementation optional).
+
+procedure Receive*(port: int16; x: pointer to char)
+begin
+  Halt("Not implemented")
+end Receive
+
+begin
+  Modules.Register("Centronics", nil)
+end Centronics.

@@ -1,0 +1,1143 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Documents [level=5]
+
+import Texts, Objects, Display, Attributes, Links, Gadgets, Modules, Files, Display3, Effects, Oberon, Fonts, Strings, Out
+// portable
+// jm 18.1.95
+
+(** The Documents module forms the basis of the Gadgets document model.
+*)
+(*
+6.4.94 - VERY SPECIAL DOCUMENT WITH DSC HAVING THE SAME COORDINATES AS THE DOCUMENT
+Old version can be found in DocumentsOld.Mod.
+This important change allows the contents of the document to experience its change in coordinates, so
+that it can optimize updates occordingly. This feature is especially used in TextGadgets0.ModifyFrame
+
+6.4.94 - Introduced a default document type
+2.5.94 - Added copy over on selection
+2.5.94 - Added deep copy support
+30.5.94 - added handling of Documents.This load errors
+9.6.94 - default documents are open larger
+7.11.94 - removed lib from standard types
+3.1.95 - Documents.This renamed to Documents.Open
+- added check to ensure invariant from 6.4.94. I am not sure if this fix is correct or not, at least
+it allows text documents to flow inside a text
+- added "DocumentName" attribute
+4.12.95 - fixed name overflow in TitleToFilename
+15.12.95 - added historyHook
+7.3.96 - removed TitleToFilename
+30.12.96 - removed MapName
+*)
+
+const
+  MaxDocTypes = 48
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  Document* = pointer to DocumentDesc
+  DocumentDesc* = object (Gadgets.FrameDesc)
+    name*: array 128 of char // Document name.
+    Load*: procedure(D: Document) // Load document contents from disk.
+    Store*: procedure(D: Document) // Store document contents to disk.
+    time: int32
+  end
+
+  // Find out what document is located at X, Y on the display.
+  LocateMsg* = object (Display.FrameMsg)
+    doc*: Document // Result, NIL if no document found.
+    X*, Y*: int16
+  end
+  PLocateMsg* = pointer to LocateMsg
+
+var
+  Id*: int16 // 07F7H little-endian magic number/flag identifying document files.
+  historyHook*: procedure(D: pointer to Document) // Called for each document opened.
+  reg: int16
+  DocExt: array 48 (* MaxDocTypes *) of array 32 of char
+  DocNewProc: array 48 (* MaxDocTypes *) of array 64 of char
+  DocService: array 48 (* MaxDocTypes *) of boolean
+
+  errMsg*: array 256 of char
+
+// ================ Loading/storing of Document Attachments =================
+
+(* The attachment format is as follows:
+
+tag document-header F7X 08X Len4 Attributes Library Links
+
+Len4 is the length from after Len4 to the end of Links.
+*)
+
+procedure LoadAttachments*(R: pointer to Files.Rider; attr: pointer to Attributes.Attr; link: pointer to Links.Link)
+  var
+    len_: int32
+    F: Files.File
+    ch: char
+    lib: Objects.Library
+begin
+  F := Files.Base(R)
+  Files.Read(R, cast(BytePtr, @ch))
+  assert(ch = 8X)
+  Files.ReadLInt(R, @len_)
+  Attributes.LoadAttributes(R, attr)
+  newgc(lib)
+  Objects.OpenLibrary(lib)
+  Files.Read(R, cast(BytePtr, @ch))
+  assert(ch = Objects.LibBlockId)
+  Objects.LoadLibrary(lib, F, Files.Pos(R), @len_)
+  Files.Set(R, F, Files.Pos(R) + len_)
+  Links.LoadLinks(R, lib, link)
+end LoadAttachments
+
+procedure StoreAttachments*(R: pointer to Files.Rider; attr: Attributes.Attr; link: Links.Link)
+  var
+    r: Files.Rider
+    F: Files.File
+    patch, len_: int32
+    lib: Objects.Library
+    M: Objects.BindMsg
+begin
+  F := Files.Base(R)
+
+  Files.Write(R, val(byte, ord(0F7X)))
+  Files.Write(R, val(byte, ord(8X)))
+  patch := Files.Pos(R)
+  Files.WriteLInt(R, 0) // patch
+  Attributes.StoreAttributes(R, attr)
+  newgc(lib)
+  Objects.OpenLibrary(lib)
+  M.lib := lib
+  Links.BindLinks(link, @M)
+  Objects.StoreLibrary(lib, F, Files.Pos(R), @len_)
+  Files.Set(R, F, Files.Pos(R) + len_)
+  Links.StoreLinks(R, lib, link)
+  len_ := Files.Pos(R) - patch - 4
+  Files.Set(@r, F, patch)
+  Files.WriteLInt(@r, len_)
+end StoreAttachments
+
+(* How to skip attachments:
+
+PROCEDURE SkipAttachments(VAR R: Files.Rider);
+VAR F: Files.File; len: LONGINT;
+BEGIN
+F := Files.Base(R);
+Files.Read(R, ch); ASSERT(ch = 08X);
+Files.ReadLInt(R, len);
+Files.Set(R, F, Files.Pos(R) + len)
+END SkipAttachments;
+
+*)
+// ================ Loading of Document types =================
+
+procedure SplitName(name, MName, PName: pointer to array of char)
+  var
+    i, j: int16
+begin
+  i := 0
+  while name[i] # "." do
+    MName[i] := name[i]
+    inc(i)
+  end
+  MName[i] := 0X
+  inc(i)
+  j := 0
+  while name[i] # 0X do
+    PName[j] := name[i]
+    inc(i)
+    inc(j)
+  end
+  PName[j] := 0X
+end SplitName
+
+// Try to load generic document
+
+procedure generic(const name, newproc: pointer to array of char; loaderror: pointer to boolean): Document
+
+  var
+    D: Document
+    MName, PName: array 64 of char
+    Mod: Modules.Module
+    Cmd: Modules.Command
+begin
+  D := nil
+  SplitName(newproc, @MName, @PName)
+  Mod := Modules.ThisMod(@MName)
+  if Modules.res = 0 then
+    Cmd := Modules.ThisCommand(Mod, @PName)
+    if Modules.res = 0 then
+      Objects.NewObj := nil
+      Cmd()
+      if (Objects.NewObj # nil) & (Objects.NewObj is Document) then
+        D := Objects.NewObj(Document)
+        copy(@D.name, name, 128)
+        D.Load(D)
+      else
+        loaderror^ := true
+      end
+
+    else
+      loaderror^ := true
+    end
+
+  else
+    loaderror^ := true
+  end
+
+  return D
+end generic
+
+procedure Generic(const name: pointer to array of char; loaderror: pointer to boolean): Document
+  var
+    D: Document
+    newproc: array 64 of char
+    F: Files.File
+    R: Files.Rider
+    tag: int16
+begin
+  D := nil
+  loaderror^ := false
+  F := Files.Old(name)
+  if F # nil then
+    Files.Set(@R, F, 0)
+    Files.ReadInt(@R, @tag)
+    if (tag = Id) or (tag = 1831) then
+      Files.ReadString(@R, @newproc, 64)
+      D := generic(name, @newproc, loaderror)
+    end
+  end
+
+  return D
+end Generic
+
+procedure Cap(ch: char): char
+begin
+  if (ch >= "a") & (ch <= "z") then
+    return chr(band(ord(ch), 0DFH))
+  else
+    return ch
+  end
+  return 00X // TODO o2m: Micron requires a result on all control paths
+end Cap
+
+// Open the give document with name name. NIL is returned on failure. Unknown document types are opened as text documents.
+procedure Open*(const name: pointer to array of char): Document
+  var
+    i, j, colonpos, dotpos: int16
+    ext: array 64 of char
+    D: Document
+    loaderror: boolean
+begin
+  copy(@errMsg, name, 256)
+  Strings.AppendCh(@errMsg, 256, " ")
+  D := Generic(name, @loaderror)
+  if (D = nil) & ~loaderror then
+    // not found
+    i := 0
+    j := -1
+    colonpos := -1
+    while name[i] # 0X do
+      // find last period
+      if name[i] = "." then
+        j := i
+      elsif name[i] = ":" then
+        if colonpos = -1 then
+          colonpos := i
+        end
+      end
+
+      inc(i)
+    end
+
+    dotpos := j
+    if colonpos > 1 then
+      // jm
+      i := 0
+      j := 0
+      while i < colonpos do
+        if name[i] > " " then
+          ext[j] := Cap(name[i])
+          inc(j)
+        end
+        inc(i)
+      end
+
+      ext[j] := 0X
+      i := 0
+      while (i # reg) & (~DocService[i] or (DocExt[i] # ext)) do
+        inc(i)
+      end
+      if i = reg then
+        // unknown type
+        colonpos := -1 // ignore colon and try with extension
+      end
+    end
+
+    if colonpos <= 1 then
+      j := dotpos
+      if j >= 0 then
+        i := 0 // copy extension
+        inc(j)
+        while (name[j] # 0X) & (i # 31) do
+          ext[i] := Cap(name[j])
+          inc(i)
+          inc(j)
+        end
+        ext[i] := 0X
+        i := 0
+        while (i # reg) & (DocService[i] or (DocExt[i] # ext)) do
+          inc(i)
+        end
+      else
+        i := reg // no period
+      end
+    end
+
+    if i = reg then
+      // nothing, use the default
+      copy(@DocNewProc[i], "TextDocs.NewDoc", 64)
+    end
+    D := generic(name, @DocNewProc[i], @loaderror)
+  end
+
+  Objects.NewObj := nil // for GC
+  if (D # nil) & (D.dsc # nil) then
+    if historyHook # nil then
+      historyHook(@D)
+    end
+    return D
+  else
+    if loaderror then
+      Strings.Append(@errMsg, 256, @Modules.resMsg)
+    else
+      Strings.Append(@errMsg, 256, " loading document failed")
+    end
+
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end Open
+
+procedure Register(const ext, newproc: pointer to array of char; service: boolean)
+  var
+    ext0: array 64 of char
+    ext0_i: int32
+    i: int16
+begin
+  ext0_i := 0
+  while (ext0_i < 63) & (ext[ext0_i] # 0X) do ext0[ext0_i] := ext[ext0_i]; inc(ext0_i) end
+  ext0[ext0_i] := 0X
+  i := 0
+  while ext0[i] # 0X do
+    ext0[i] := Cap(ext0[i])
+    inc(i)
+  end
+  i := 0
+  while (i # reg) & ((ext0 # DocExt[i]) or (service # DocService[i])) do
+    inc(i)
+  end
+  if i = reg then
+    copy(@DocExt[reg], @ext0, 32)
+    copy(@DocNewProc[reg], newproc, 64)
+    DocService[reg] := service
+    inc(reg)
+  else
+    copy(@DocNewProc[i], newproc, 64)
+  end
+end Register
+
+procedure RegisterStandardTypes(const section: pointer to array of char; service: boolean)
+  var
+    S: Texts.Scanner
+    ext, newproc: array 32 of char
+    err: boolean
+begin
+  Oberon.OpenScanner(@S, section)
+  if S.class = Texts.Inval then
+    Out.String("Oberon.Text - ")
+    Out.String(section)
+    Out.String(" not found")
+    Out.Ln()
+  else
+    err := false
+    while (S.class in {Texts.Name,Texts.String}) & ~err do
+      copy(@ext, @S.s, 32)
+      Texts.Scan(@S)
+      if (S.class = Texts.Char) & (S.c = "=") then
+        Texts.Scan(@S)
+        if S.class in {Texts.Name,Texts.String} then
+          copy(@newproc, @S.s, 32)
+          Texts.Scan(@S)
+          Register(@ext, @newproc, service)
+        else
+          err := true
+        end
+
+      else
+        err := true
+      end
+    end
+
+    err := err or (S.class # Texts.Char) or (S.c # "}")
+    if err then
+      Out.String("Error in ")
+      Out.String(section)
+      Out.Ln()
+    end
+  end
+end RegisterStandardTypes
+
+// ===================== default handler for document frames ================
+
+procedure SetMask(F: Display.Frame; M: Display3.Mask)
+  var
+    O: Display3.OverlapMsg
+begin
+  O.M := M
+  O.x := 0
+  O.y := 0
+  O.F := F
+  O.dlink := nil
+  O.res := -1
+  F.handle(F, @O)
+end SetMask
+
+procedure SetMainMask(F: Document)
+  var
+    R: Display3.Mask
+begin
+  if F.dsc # nil then
+    if F.mask = nil then
+      SetMask(F.dsc, nil)
+    else
+      Display3.Copy(F.mask, @R)
+      R.x := 0
+      R.y := 0
+      (*
+      Display3.Intersect(R, F.dsc.X,  F.dsc.Y, F.dsc.W,  F.dsc.H);
+      R.x := -F.dsc.X; R.y := -(F.dsc.Y + F.dsc.H - 1); Display3.Shift(R);
+      *)
+      SetMask(F.dsc, R)
+    end
+  end
+end SetMainMask
+
+procedure ToMain(F: Document; ox, oy: int16; M: pointer to Display.FrameMsg)
+  var
+    Mdlink, Fdlink: Objects.Object
+    tx, ty: int16
+begin
+  if F.dsc # nil then
+    tx := M.x
+    ty := M.y
+    M.x := ox
+    M.y := oy
+    Fdlink := F.dlink
+    Mdlink := M.dlink
+    F.dlink := M.dlink
+    M.dlink := F
+    F.dsc.handle(F.dsc, M)
+    F.dlink := Fdlink
+    M.dlink := Mdlink
+    M.x := tx
+    M.y := ty
+  end
+end ToMain
+
+procedure Absolute(dlink: Objects.Object): boolean
+  var
+    A: Objects.AttrMsg
+begin
+  if (dlink # nil) & (dlink.handle # nil) then
+    // NIL test because of Script
+    A.id := Objects.get
+    copy(@A.name, "Absolute", 32)
+    A.res := -1
+    dlink.handle(dlink, @A)
+    return (A.res >= 0) & (A.class = Objects.Bool) & A.b
+  else
+    return false
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end Absolute
+
+// new
+procedure AdjustDocument(F: Document; M: pointer to Display.ModifyMsg)
+  var
+    A: Display.ModifyMsg
+    old, x, y, w, h: int16
+    R: Display3.Mask
+begin
+  if Absolute(M.dlink) then
+    // TRUE (* 31 IN F.state *)
+    // in viewer system, may optimize
+    old := M.mode
+    M.mode := Display.state
+    Gadgets.framehandle(F, M)
+    M.mode := old
+
+    if F.dsc # nil then
+      // Adjust main
+      A.id := Display.extend
+      A.F := F.dsc
+      A.mode := M.mode
+      A.X := M.X
+      A.Y := M.Y
+      A.W := M.W
+      A.H := M.H
+      A.dX := M.dX
+      A.dY := M.dY
+      A.dW := M.dW
+      A.dH := M.dH
+      A.dlink := M.dlink
+      A.res := -1
+      Objects.Stamp(@A)
+      ToMain(F, M.x, M.y, @A)
+      if (Gadgets.selected in F.state) & (M.mode = Display.display) then
+        x := M.x + F.X
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        Gadgets.MakeMask(F, x, y, M.dlink, @R)
+        Display3.FillPattern(R, Display3.blue, Display3.selectpat, 0, 0, x, y, w, h, Display.paint)
+      end
+    end
+
+  else
+    // unoptimized
+    if (F.dsc # nil) & (M.stamp # F.stamp) then
+      F.stamp := M.stamp
+      // Adjust main
+      A.id := Display.extend
+      A.F := F.dsc
+      A.mode := Display.state
+      A.X := M.X
+      A.Y := M.Y
+      A.W := M.W
+      A.H := M.H
+      A.dX := M.dX
+      A.dY := M.dY
+      A.dW := M.dW
+      A.dH := M.dH
+      A.dlink := M.dlink
+      A.res := -1
+      Objects.Stamp(@A)
+      ToMain(F, M.x, M.y, @A)
+    end
+
+    Gadgets.framehandle(F, M)
+  end
+end AdjustDocument
+
+// -- docviewer main frame changed; have to adjust docviewer size
+procedure AdjustChildDocument(F: Document; M: pointer to Display.ModifyMsg)
+  var
+    A: Display.ModifyMsg
+begin
+  if M.stamp # F.stamp then
+    F.stamp := M.stamp
+    A.id := Display.extend
+    A.F := F
+    A.mode := Display.display
+    A.X := M.X
+    A.Y := M.Y
+    A.W := M.W
+    A.H := M.H
+    A.dX := M.dX
+    A.dY := M.dY
+    A.dW := M.dW
+    A.dH := M.dH
+    Display.Broadcast(@A)
+  end
+end AdjustChildDocument
+
+procedure check(F: Document)
+begin
+  if F.dsc # nil then
+    if (F.X # F.dsc.X) or (F.Y # F.dsc.Y) or (F.W # F.dsc.W) or (F.H # F.dsc.H) then
+      F.dsc.X := F.X
+      F.dsc.Y := F.Y
+      F.dsc.W := F.W
+      F.dsc.H := F.H
+    end
+  end
+end check
+
+procedure RestoreDocument(F: Document; R: Display3.Mask; ox, oy, x, y, w, h: int16; M: pointer to Display.DisplayMsg)
+  var
+    D: Display.DisplayMsg
+
+  procedure ClipAgainst(x, y, w, h: pointer to int16; x1, y1, w1, h1: int16)
+    var
+      r, t, r1, t1: int16
+  begin
+    r := x^ + w^ - 1
+    r1 := x1 + w1 - 1
+    t := y^ + h^ - 1
+    t1 := y1 + h1 - 1
+    if x^ < x1 then
+      x^ := x1
+    end
+    if y^ < y1 then
+      y^ := y1
+    end
+    if r > r1 then
+      r := r1
+    end
+    if t > t1 then
+      t := t1
+    end
+    w^ := r - x^ + 1
+    h^ := t - y^ + 1
+  end ClipAgainst
+begin
+  check(F)
+  Oberon.RemoveMarks(x, y, w, h)
+  if M.id = Display.area then
+    if F.dsc # nil then
+      // display main frame
+      D.device := Display.screen
+      D.id := Display.area
+      D.F := F.dsc
+      D.u := M.u
+      D.v := M.v
+      D.w := M.w
+      D.h := M.h
+      ClipAgainst(@D.u, @D.v, @D.w, @D.h, 0, -F.dsc.H + 1, F.dsc.W, F.dsc.H)
+      D.dlink := M.dlink
+      D.res := -1
+      Objects.Stamp(@D)
+      ToMain(F, ox, oy, @D)
+    else
+      Display3.FilledRect3D(R, Display3.FG, Display3.FG, Display3.BG, x, y, w, h, 1, Display.replace)
+      Display3.String(R, Display3.FG, x + 5, y + h - 20, Fonts.Default, "Document not found", Display.paint)
+    end
+
+  else
+    if F.dsc # nil then
+      D.device := Display.screen
+      D.id := Display.full
+      D.F := F.dsc
+      D.dlink := M.dlink
+      D.res := -1
+      Objects.Stamp(@D)
+      ToMain(F, ox, oy, @D)
+    else
+      Display3.FilledRect3D(R, Display3.FG, Display3.FG, Display3.BG, x, y, w, h, 1, Display.replace)
+      Display3.String(R, Display3.FG, x + 5, y + h - 20, Fonts.Default, "Document not found", Display.paint)
+    end
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.blue, Display3.selectpat, 0, 0, x, y, w, h, Display.paint)
+  end
+end RestoreDocument
+
+procedure Copy*(M: pointer to Objects.CopyMsg; from, to_: Document)
+  var
+    C: Objects.CopyMsg
+begin
+  Gadgets.CopyFrame(M, from, to_)
+
+  if from.dsc # nil then
+    C.id := M.id
+    Objects.Stamp(@C)
+    from.dsc.handle(from.dsc, @C)
+    to_.dsc := C.obj(Gadgets.Frame)
+  else
+    to_.dsc := nil
+  end
+
+  to_.Load := from.Load
+  to_.Store := from.Store
+  copy(@to_.name, @from.name, 128)
+end Copy
+
+procedure DocumentAttr(F: Document; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      halt(99)
+    elsif M.name = "DocumentName" then
+      M.class := Objects.String
+      copy(@M.s, @F.name, 64)
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "DocumentName" then
+      if M.class = Objects.String then
+        copy(@F.name, @M.s, 128)
+        M.res := 0
+      end
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("DocumentName")
+    Gadgets.framehandle(F, M)
+  end
+end DocumentAttr
+
+procedure Neutralize(F: Document)
+  var
+    main: Gadgets.Frame
+    S: Display.SelectMsg
+begin
+  if F.dsc # nil then
+    main := F.dsc(Gadgets.Frame)
+    if Gadgets.selected in main.state then
+      S.F := main
+      S.res := -1
+      S.x := 0
+      S.y := 0
+      S.id := Display.reset
+      F.time := -1
+      ToMain(F, 0, 0, @S)
+      Gadgets.Update(main)
+    end
+  end
+end Neutralize
+
+procedure HandleSelect(F: Document; M: pointer to Oberon.InputMsg)
+  var
+    main: Gadgets.Frame
+    S: Display.SelectMsg
+    N: Oberon.ControlMsg
+    keysum: set
+    C: Objects.CopyMsg
+begin
+  if F.dsc = nil then
+    return
+  end
+  main := F.dsc(Gadgets.Frame)
+  S.F := main
+  S.res := -1
+  S.x := 0
+  S.y := 0
+  if Gadgets.selected in main.state then
+  // do nothing if already selected
+  // S.id := Display.reset; F.time := 0;
+  else
+    N.id := Oberon.neutralize
+    N.F := nil
+    N.res := -1
+    ToMain(F, 0, 0, @N)
+
+    S.id := Display.set_
+    F.time := Oberon.Time()
+    ToMain(F, M.x, M.y, @S)
+    Gadgets.Update(main)
+    keysum := M.keys
+    repeat
+      Effects.TrackMouse(@M.keys, @M.X, @M.Y, Effects.Arrow)
+      keysum := keysum + M.keys
+    until M.keys = {}
+    M.res := 0
+    if keysum = {0,2} then
+    // RL delete selection
+    // nothing
+    elsif keysum = {0,1} then
+      // RM copy to focus
+      C.id := Objects.shallow
+      C.obj := nil
+      Objects.Stamp(@C)
+      F.dsc.handle(F.dsc, @C)
+      if C.obj # nil then
+        (*
+        C.obj(Gadgets.Frame).state := C.obj(Gadgets.Frame).state - {Gadgets.noselect, Gadgets.nodelete, Gadgets.noresize, Gadgets.nomove};
+        *)
+        Gadgets.Integrate(C.obj)
+      end
+    end
+  end
+end HandleSelect
+
+procedure Handler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h: int16
+    F0: Document
+    R: Display3.Mask
+    N: Oberon.ControlMsg
+    tmp: set
+    tM: Display.DisplayMsg
+    obj: Objects.Object
+begin
+  case F of
+  | Document:
+    case M of
+    | Display.PFrameMsg:
+      if (M.F = nil) or (M.F = F) then
+        // message addressed to this frame
+        x := M.x + F.X // calculate display coordinates
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        if M is Display.PDisplayMsg then
+          if M(Display.PDisplayMsg).device = Display.screen then
+            if (M(Display.PDisplayMsg).id = Display.full) or (M(Display.PDisplayMsg).F = nil) then
+              Gadgets.MakeMask(F, x, y, M(Display.PDisplayMsg).dlink, @R)
+              RestoreDocument(F, R, M(Display.PDisplayMsg).x, M(Display.PDisplayMsg).y, x, y, w, h, M(Display.PDisplayMsg))
+            elsif M(Display.PDisplayMsg).id = Display.area then
+              Gadgets.MakeMask(F, x, y, M(Display.PDisplayMsg).dlink, @R)
+              Display3.AdjustMask(R, x + M(Display.PDisplayMsg).u, y + h - 1 + M(Display.PDisplayMsg).v, M(Display.PDisplayMsg).w, M(Display.PDisplayMsg).h)
+              RestoreDocument(F, R, M(Display.PDisplayMsg).x, M(Display.PDisplayMsg).y, x, y, w, h, M(Display.PDisplayMsg))
+            end
+
+          elsif M(Display.PDisplayMsg).device = Display.printer then
+            ToMain(F, M(Display.PDisplayMsg).x, M(Display.PDisplayMsg).y, M(Display.PDisplayMsg))
+          end
+
+        elsif M is Oberon.PInputMsg then
+          if (M(Oberon.PInputMsg).id = Oberon.track) & ~(Gadgets.selected in F.state) then
+            if ~Gadgets.InActiveArea(F, M(Oberon.PInputMsg)) then
+              if M(Oberon.PInputMsg).keys = {0} then
+                HandleSelect(F, M(Oberon.PInputMsg))
+              else
+                Gadgets.framehandle(F, M(Oberon.PInputMsg))
+              end
+
+            else
+              ToMain(F, M(Oberon.PInputMsg).x, M(Oberon.PInputMsg).y, M(Oberon.PInputMsg))
+              if (M(Oberon.PInputMsg).res < 0) & (M(Oberon.PInputMsg).keys = {0}) then
+                HandleSelect(F, M(Oberon.PInputMsg))
+              end
+              if (M(Oberon.PInputMsg).res < 0) & ~Gadgets.InActiveArea(F, M(Oberon.PInputMsg)) then
+                Gadgets.framehandle(F, M(Oberon.PInputMsg))
+              end
+            end
+
+          elsif ~(Gadgets.selected in F.state) then
+            ToMain(F, M(Oberon.PInputMsg).x, M(Oberon.PInputMsg).y, M(Oberon.PInputMsg))
+          else
+            Gadgets.framehandle(F, M(Oberon.PInputMsg))
+          end
+
+        elsif M is Display.PModifyMsg then
+          if M(Display.PModifyMsg).F = F then
+            AdjustDocument(F, M(Display.PModifyMsg))
+          else
+            Gadgets.framehandle(F, M(Display.PModifyMsg))
+          end
+
+        elsif M is PLocateMsg then
+          Gadgets.MakeMask(F, x, y, M(PLocateMsg).dlink, @R)
+          if Effects.Inside(M(PLocateMsg).X, M(PLocateMsg).Y, x, y, w, h) & Display3.Visible(R, M(PLocateMsg).X, M(PLocateMsg).Y, 1, 1) then
+            M(PLocateMsg).doc := F
+            ToMain(F, M(PLocateMsg).x, M(PLocateMsg).y, M(PLocateMsg))
+          end
+
+        elsif M is Display.PLocateMsg then
+          if (M(Display.PLocateMsg).loc = nil) & Effects.Inside(M(Display.PLocateMsg).X, M(Display.PLocateMsg).Y, x, y, w, h) then
+            ToMain(F, M(Display.PLocateMsg).x, M(Display.PLocateMsg).y, M(Display.PLocateMsg))
+            if M(Display.PLocateMsg).loc = nil then
+              M(Display.PLocateMsg).loc := F
+              M(Display.PLocateMsg).u := M(Display.PLocateMsg).X - x
+              M(Display.PLocateMsg).v := M(Display.PLocateMsg).Y - (y + h - 1)
+              M(Display.PLocateMsg).res := 0
+            end
+          end
+
+        elsif M is Display.PSelectMsg then
+          if M(Display.PSelectMsg).id = Display.set_ then
+            Neutralize(F)
+            N.id := Oberon.neutralize
+            N.F := nil
+            N.res := -1
+            ToMain(F, M(Display.PSelectMsg).x, M(Display.PSelectMsg).y, @N)
+          elsif M(Display.PSelectMsg).id = Display.reset then
+          elsif M(Display.PSelectMsg).id = Display.get then
+            if ((M(Display.PSelectMsg).time - F.time < 0) or (M(Display.PSelectMsg).time = -1)) & (Gadgets.selected in F.dsc(Gadgets.Frame).state) then
+              M(Display.PSelectMsg).time := F.time
+              M(Display.PSelectMsg).sel := F
+              M(Display.PSelectMsg).obj := F.dsc
+            end
+          end
+
+          if M(Display.PSelectMsg).F # nil then
+            Gadgets.framehandle(F, M(Display.PSelectMsg))
+          else
+            ToMain(F, M(Display.PSelectMsg).x, M(Display.PSelectMsg).y, M(Display.PSelectMsg))
+          end
+
+        elsif M is Oberon.PControlMsg then
+          ToMain(F, M(Oberon.PControlMsg).x, M(Oberon.PControlMsg).y, M(Oberon.PControlMsg))
+          if M(Oberon.PControlMsg).id = Oberon.neutralize then
+            Neutralize(F)
+          end
+
+        elsif M is Display3.PUpdateMaskMsg then
+          newgc(F.mask)
+          Display3.Open(F.mask)
+          Display3.Add(F.mask, 0, -F.H + 1, F.W, F.H)
+          SetMainMask(F)
+          M(Display3.PUpdateMaskMsg).res := 0
+
+        elsif M is Display3.POverlapMsg then
+          F.mask := M(Display3.POverlapMsg).M
+          SetMainMask(F)
+
+        elsif M is Display3.PUpdateMaskMsg then
+          if F.mask = nil then
+            Gadgets.MakeMask(F, x, y, M(Display3.PUpdateMaskMsg).dlink, @R)
+          end
+          SetMainMask(F)
+
+        elsif M is Gadgets.PUpdateMsg then
+          if M(Gadgets.PUpdateMsg).obj = F.dsc then
+            Gadgets.MakeMask(F, x, y, M(Gadgets.PUpdateMsg).dlink, @R)
+            tM.device := Display.screen
+            tM.id := Display.full
+            tM.dlink := M(Gadgets.PUpdateMsg).dlink
+            RestoreDocument(F, R, M(Gadgets.PUpdateMsg).x, M(Gadgets.PUpdateMsg).y, x, y, w, h, @tM)
+            if Gadgets.lockedsize in F.dsc(Gadgets.Frame).state then
+              F.state := F.state + {Gadgets.lockedsize}
+            else
+              F.state := F.state - {Gadgets.lockedsize}
+            end
+
+          else
+            ToMain(F, M(Gadgets.PUpdateMsg).x, M(Gadgets.PUpdateMsg).y, M(Gadgets.PUpdateMsg))
+          end
+
+        elsif M.F # nil then
+          Gadgets.framehandle(F, M)
+        else
+          ToMain(F, M.x, M.y, M)
+        end
+
+      else
+        // not for this frame but perhaps for a child
+        M1 := M
+        case M1 of
+        | Display3.PUpdateMaskMsg:
+          if M1.F = F.dsc then
+            if F.mask = nil then
+              Gadgets.MakeMask(F, M1.x + F.X, M1.y + F.Y, M1.dlink, @R)
+            end
+            SetMainMask(F)
+          else
+            ToMain(F, M1.x, M1.y, M1)
+          end
+
+        | Display.PConsumeMsg:
+          if false & ~(30 in F.state) & (M1.obj is Document) then
+          // prevent consumption
+          else
+            ToMain(F, M1.x, M1.y, M1)
+          end
+
+        | Display.PModifyMsg:
+          if M1.F = F.dsc then
+            AdjustChildDocument(F, M1(Display.PModifyMsg))
+          else
+            ToMain(F, M1.x, M1.y, M1)
+          end
+
+        else
+          ToMain(F, M1.x, M1.y, M1)
+        end
+      end
+
+    // Object messages
+    | Objects.PAttrMsg:
+      DocumentAttr(F, M(Objects.PAttrMsg))
+    | Objects.PLinkMsg:
+      if (M.id = Objects.get) & (M.name = "Model") then
+        M.obj := F.dsc
+        M.res := 0
+      else
+        Gadgets.framehandle(F, M)
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        // store private data here
+        if F.lib.name = "" then
+          // private library
+          Files.WriteInt(@M.R, 1)
+          Files.WriteString(@M.R, @F.name, 128)
+          Files.WriteSet(@M.R, {})
+          Gadgets.framehandle(F, M)
+        else
+          // public library
+          Files.WriteInt(@M.R, 2)
+          Files.WriteString(@M.R, @F.name, 128)
+          Gadgets.WriteRef(@M.R, F.lib, F.dsc)
+          Gadgets.framehandle(F, M)
+        end
+
+      elsif M.id = Objects.load then
+        // load private data here
+        Files.ReadInt(@M.R, @x)
+        if x = 1 then
+          // private library
+          Files.ReadString(@M.R, @F.name, 128)
+          Files.ReadSet(@M.R, @tmp)
+          Gadgets.framehandle(F, M)
+          F.Load(F)
+        elsif x = 2 then
+          // public library
+          Files.ReadString(@M.R, @F.name, 128)
+          Gadgets.ReadRef(@M.R, F.lib, @obj)
+          Gadgets.framehandle(F, M)
+          if (obj # nil) & (obj is Gadgets.Frame) then
+            F.dsc := obj(Display.Frame)
+          else
+            F.Load(F)
+          end
+        end
+      end
+
+    | Objects.PBindMsg:
+      Gadgets.framehandle(F, M)
+      if (M.lib.name # "") & (F.dsc # nil) then
+        // public library, bind document contents
+        F.dsc.handle(F.dsc, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink // copy msg arrives again
+      else
+        // first time copy message arrives
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        Copy(M, F, F0)
+        M.obj := F0
+      end
+
+    | Objects.PFindMsg:
+      Gadgets.framehandle(F, M)
+      if (F.dsc # nil) & (M.obj = nil) then
+        F.dsc.handle(F.dsc, M)
+      end
+
+    else
+      // unknown msg, framehandler might know it
+      Gadgets.framehandle(F, M)
+    end
+  end
+end Handler
+
+procedure New*()
+  var
+    F: Document
+begin
+  newgc(F)
+  F.handle := Handler
+  F.W := 250
+  F.H := 200
+  Objects.NewObj := F
+end New
+
+// Initialize document D with main as contents.
+procedure Init*(D: Document; main: Gadgets.Frame)
+  var
+    f: Files.File
+    M: Display.ModifyMsg
+begin
+  D.dsc := main
+  if main # nil then
+    if (main.lib # nil) & (main.lib.name # "") then
+      // public object !
+      D.X := main.X
+      D.Y := main.Y
+      D.W := main.W
+      D.H := main.H
+    else
+      M.X := D.X
+      M.Y := D.Y
+      M.W := D.W
+      M.H := D.H
+      M.x := 0
+      M.y := 0
+      M.dX := M.X - main.X
+      M.dY := M.Y - main.Y
+      M.dW := M.W - main.W
+      M.dH := M.H - main.H
+      M.F := main
+      M.id := Display.extend
+      M.mode := Display.state
+      M.res := -1
+      Objects.Stamp(@M)
+      main.handle(main, @M)
+      main.X := D.X
+      main.Y := D.Y
+      main.W := D.W
+      main.H := D.H
+    end
+
+    D.state := D.state + {Gadgets.lockedcontents}
+    if Gadgets.lockedsize in main.state then
+      D.state := D.state + {Gadgets.lockedsize}
+    end
+  end
+
+  f := Files.Old(@D.name)
+  if f # nil then
+    Files.GetName(f, @D.name)
+  end
+end Init
+
+// Returns the marked document (with F1). NIL is returned when no document is marked. The visibility of the Oberon pointer is ignored.
+procedure MarkedDoc*(): Document
+  var
+    M: LocateMsg
+    V: Display.Frame
+begin
+  if true then
+    // Oberon.Pointer.on
+    M.X := Oberon.Pointer.X
+    M.Y := Oberon.Pointer.Y
+    M.F := nil
+    M.doc := nil
+    V := Oberon.MarkedViewer()
+    if V # nil then
+      M.res := -1
+      M.x := 0
+      M.y := 0
+      V.handle(V, @M)
+    else
+      Display.Broadcast(@M)
+    end
+
+    return M.doc
+  else
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end MarkedDoc
+
+procedure InitM()
+begin
+  reg := 0
+  Register("Text", "TextDocs.NewDoc", false)
+  Register("Tool", "TextDocs.NewDoc", false)
+  Register("Mod", "TextDocs.NewDoc", false)
+  Register("Panel", "PanelDocs.NewDoc", false)
+  Register("Pict", "RembrandtDocs.NewDoc", false)
+  RegisterStandardTypes("Gadgets.Documents", false)
+  RegisterStandardTypes("Gadgets.DocumentServices", true)
+end InitM
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "New" end return New end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Documents", cmd_)
+  Id := 2039
+  InitM()
+end Documents.

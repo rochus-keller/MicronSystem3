@@ -1,0 +1,724 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Clocks [level=5]
+
+import Input, Dates, Strings, Display, Display3, Printer, Printer3, Texts, Objects, Gadgets, Oberon, Fonts, Math, Files, Modules
+// portable
+// Fri, 23-Apr-1993
+
+const
+  tickId* = 0
+  alarmId* = 1
+  Minute = 60i1
+  Hour = 60i1 * Minute
+  Day = 24i1 * Hour
+  digital = 0
+  calendar = 1
+  new_ = 2
+
+type
+  Alarm* = pointer to AlarmDesc
+  AlarmHandler* = procedure(alarm: Alarm; handled: pointer to boolean)
+  AlarmDesc* = record
+    at: int32
+    handle*: AlarmHandler
+    handled: boolean
+    next: Alarm
+  end
+
+  EnumAlarmHandler* = procedure(alarm: Alarm; t: int32; d: int32; handled: pointer to boolean)
+
+  TickMsg* = object (Display.FrameMsg)
+    id*: int16
+    date*, time*: int32
+  end
+  PTickMsg* = pointer to TickMsg
+
+  Clock* = pointer to ClockDesc
+  ClockDesc* = object (Gadgets.FrameDesc)
+    date, time, timeDiff: int32
+    state0: set
+    col: int16
+  end
+
+var
+  alarms: boolean
+  firstAlarm: Alarm
+  lastTask, lastAlarm, lastTick, zeroY: int32
+  task: Oberon.Task
+  W: Texts.Writer
+  font: array 3 of Fonts.Font
+
+// ------------ Oberon date convertion ------------
+
+procedure ToLinearForm(t, d: int32): int32
+  var
+    h, m, s: int16
+begin
+  Dates.ToHMS(t, @h, @m, @s)
+  return (Dates.NumberOfDays(d) - zeroY) * Day + val(int32, s) + val(int32, m) * Minute + val(int32, h) * Hour
+end ToLinearForm
+
+procedure ToOberonForm(time: int32; t, d: pointer to int32)
+begin
+  d^ := Dates.NumberOfDaysToDate(obdiv(time, Day) + zeroY)
+  time := obmod(time, Day)
+  t^ := Dates.ToTime(val(int16, obdiv(time, Hour)), val(int16, obmod(obdiv(time, Minute), Minute)), val(int16, obmod(time, Minute)))
+end ToOberonForm
+
+procedure GetClock(): int32
+  var
+    d, t: int32
+begin
+  Oberon.GetClock(@t, @d)
+  return ToLinearForm(t, d)
+end GetClock
+
+// ------------ alarm ------------
+
+procedure AlarmTask(me: Oberon.Task)
+  var
+    a, p: Alarm
+    now, t, d: int32
+    M: TickMsg
+    hour, min_, sec: int16
+    handled: boolean
+begin
+  if alarms & (Input.Time() - lastAlarm > Input.TimeUnit) then
+    lastAlarm := Input.Time()
+    Oberon.GetClock(@M.time, @M.date)
+    M.id := alarmId
+    M.F := nil
+    Display.Broadcast(@M)
+  end
+
+  if Input.Time() - lastTask > 5i2 * Input.TimeUnit then
+    lastTask := Input.Time()
+    Oberon.GetClock(@t, @d)
+    now := ToLinearForm(t, d)
+    Dates.ToHMS(t, @hour, @min_, @sec)
+    if (now - lastTick > 16) & (sec < 15) then
+      M.date := d
+      M.time := t
+      M.id := tickId
+      M.F := nil
+      Display.Broadcast(@M)
+      lastTick := now
+    end
+
+    a := firstAlarm
+    alarms := false
+    while a # nil do
+      if a.handled then
+        if a = firstAlarm then
+          firstAlarm := firstAlarm.next
+        else
+          p.next := a.next
+        end
+      end
+      handled := a.handled
+      a.handled := true
+      if (a.at < now) & ~handled then
+        ToOberonForm(a.at, @t, @d)
+        a.handle(a, @handled)
+        alarms := alarms or ~handled
+      end
+
+      a.handled := handled
+      p := a
+      a := a.next
+    end
+  end
+
+  me.time := Input.Time() + Input.TimeUnit
+end AlarmTask
+
+procedure InstallAlarm*(alarm: Alarm; time, date: int32; handle: AlarmHandler)
+  var
+    pa, a: Alarm
+begin
+  if alarm # nil then
+    alarm.at := ToLinearForm(time, date)
+    alarm.handle := handle
+    alarm.handled := false
+    pa := nil
+    a := firstAlarm
+    while (a # nil) & (a # alarm) do
+      pa := a
+      a := a.next
+    end
+
+    if a = alarm then
+      if pa # nil then
+        pa.next := a.next
+      else
+        firstAlarm := a.next
+      end
+    end
+
+    alarm.next := nil
+    pa := nil
+    a := firstAlarm
+    while (a # nil) & (a.at <= alarm.at) do
+      pa := a
+      a := a.next
+    end
+
+    if a # nil then
+      if pa # nil then
+        pa.next := alarm
+      else
+        firstAlarm := alarm
+      end
+
+      alarm.next := a
+    elsif pa # nil then
+      pa.next := alarm
+    else
+      firstAlarm := alarm
+    end
+  end
+end InstallAlarm
+
+procedure RemoveAlarm*(alarm: Alarm)
+  var
+    p, a: Alarm
+    T: TickMsg
+begin
+  a := firstAlarm
+  while (a # nil) & (a # alarm) do
+    p := a
+    a := a.next
+  end
+  if a # nil then
+    if a = firstAlarm then
+      firstAlarm := a.next
+    else
+      p.next := a.next
+    end
+    alarms := false
+    Oberon.GetClock(@T.time, @T.date)
+    T.time := asr(T.time, 1) * 2
+    T.id := alarmId
+    T.F := nil
+    Display.Broadcast(@T)
+  end
+end RemoveAlarm
+
+procedure ShowAlarms*(enum: EnumAlarmHandler)
+  var
+    a: Alarm
+    t, d: int32
+begin
+  a := firstAlarm
+  while a # nil do
+    if ~a.handled then
+      ToOberonForm(a.at, @t, @d)
+      enum(a, t, d, @a.handled)
+    end
+    a := a.next
+  end
+end ShowAlarms
+
+// ------------ clock ------------
+procedure ClockAttr(F: Clock; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Color" then
+      M.class := Objects.Int
+      M.i := F.col
+      M.res := 0
+    elsif M.name = "TimeDiff" then
+      M.class := Objects.Int
+      M.i := obdiv(F.timeDiff, Hour)
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := asr(F.H, 1) - 5
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Color" then
+      if M.class = Objects.Int then
+        F.col := val(int16, M.i)
+        M.res := 0
+      end
+    elsif M.name = "TimeDiff" then
+      F.timeDiff := M.i * Hour
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Color")
+    M.Enum("TimeDiff")
+    Gadgets.framehandle(F, M)
+  end
+end ClockAttr
+
+procedure Line2(M: Display3.Mask; ang, x0, y0, r1, r2, color: int16)
+  var
+    x1, y1, x2, y2: int16
+    s, c, a: real
+begin
+  ang := obmod(15 - ang, 60)
+  a := val(real, val(longreal, 2) * Math.pi / val(longreal, 60) * val(longreal, ang))
+  s := Math.sin(a)
+  c := Math.cos(a)
+  x1 := val(int16, val(int16, floor(val(real, r1) * c + 0.5)))
+  y1 := val(int16, val(int16, floor(val(real, r1) * s + 0.5)))
+  x2 := val(int16, val(int16, floor(val(real, r2) * c + 0.5)))
+  y2 := val(int16, val(int16, floor(val(real, r2) * s + 0.5)))
+  Display3.Line(M, color, Display.solid, x0 + x1, y0 + y1, x0 + x2, y0 + y2, 1, Display.replace)
+end Line2
+
+procedure RestoreClock(F: Clock; M: Display3.Mask; x, y, w, h: int16; alarm: boolean)
+
+  var
+    time, date: int32
+    rh, rm, i, x0, y0, r, hour, min_, sec, year, month, day, dow, col: int16
+    s: array 32 of char
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  ToOberonForm(F.time + F.timeDiff, @time, @date)
+  col := F.col
+  if calendar in F.state0 then
+    if ~alarm & (date = F.date) then
+      dow := Dates.DayOfWeek(date)
+      Dates.ToYMD(date, @year, @month, @day)
+      Strings.MonthToStr(month, @s, 32, true)
+      Display3.CenterString(M, col, x, y, F.W, 10, font[0], @s, Display3.textmode)
+      Strings.IntToStr(day, @s, 32)
+      Display3.CenterString(M, col, x, y + 7, F.W, 20, font[1], @s, Display3.textmode)
+      if dow = 6 then
+        col := Display3.red
+      else
+        col := F.col
+      end
+      Strings.DayToStr(dow, @s, 32, false)
+      if dow = 6 then
+        col := Display3.red
+      end
+      Display3.CenterString(M, col, x, y + 22, F.W, 10, font[0], @s, Display3.textmode)
+    else
+      F.date := date
+      Gadgets.Update(F)
+    end
+
+  elsif digital in F.state0 then
+    if alarm then
+      if ((F.time mod 2) # 0) then
+        col := Display3.red
+      end
+      Display3.Circle(M, col, Display.solid, x + 3, y + 7, 3, 1, {Display3.filled}, Display3.textmode)
+    else
+      Dates.ToHMS(time, @hour, @min_, @sec)
+      s[0] := chr(obdiv(hour, 10) + val(int16, ord("0")))
+      s[1] := chr(obmod(hour, 10) + val(int16, ord("0")))
+      s[2] := ":"
+      s[3] := chr(obdiv(min_, 10) + val(int16, ord("0")))
+      s[4] := chr(obmod(min_, 10) + val(int16, ord("0")))
+      s[5] := 0X
+      Display3.ReplConst(M, Display3.downC, x, y + 3, w, h, Display.replace)
+      Display3.CenterString(M, col, x, y + 3, w, h - 3, font[1], @s, Display3.paint)
+    end
+
+  else
+    if F.W < F.H then
+      r := asr(F.W, 1) - 1
+    else
+      r := asr(F.H, 1) - 1
+    end
+    x0 := x + asr(w, 1)
+    y0 := y + asr(h, 1)
+    Dates.ToHMS(time, @hour, @min_, @sec)
+    if alarm then
+      if ((F.time mod 2) # 0) then
+        col := Display3.red
+      else
+        col := Display3.textbackC
+      end
+      Display3.Circle(M, col, Display.solid, x0 - asr(r, 1), y0, 3, 1, {Display3.filled}, Display.replace)
+    elsif r >= 12 then
+      rh := obdiv(7 * r, 11)
+      rm := obdiv(9 * r, 11)
+      i := 0
+      Display3.Circle(M, Display3.textbackC, Display.solid, x0, y0, r, 1, {Display3.filled}, Display.replace)
+      while i < 60 do
+        Line2(M, i, x0, y0, rm, r, col)
+        inc(i, 5)
+      end
+      Line2(M, min_, x0, y0, 0, rm, col)
+      Line2(M, val(int16, obmod(F.time + F.timeDiff, Day div 2i1) div 720), x0, y0, 0, rh, col)
+      Display3.Circle(M, col, Display.solid, x0, y0, r, 1, {}, Display.replace)
+    end
+
+    if (hour = 12) & (min_ = 0) then
+      copy(@s, "hn", 32)
+    elsif (hour = 0) & (min_ = 0) then
+      copy(@s, "gh", 32)
+    elsif hour < 12 then
+      copy(@s, "am", 32)
+    else
+      copy(@s, "pm", 32)
+    end
+
+    Display3.String(M, F.col, x0 - asr(r, 1) - 4, y0 - 2, font[0], @s, Display3.textmode)
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(M, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreClock
+
+procedure PrintClock(F: Clock; M: pointer to Display.DisplayMsg)
+
+  var
+    time, date: int32
+    r, rh, rm, x0, y0, i, hour, min_, sec, year, month, day, dow, col: int16
+    s: array 32 of char
+    Q: Display3.Mask
+
+  procedure P(X: int16): int16
+  begin
+    return val(int16, obdiv(Display.Unit * X, Printer.Unit))
+  end P
+
+  procedure PLine(ang, x0, y0, r1, r2, color: int16; Q: pointer to Display3.Mask)
+    var
+      x1, y1, x2, y2: int16
+      s, c, a: real
+  begin
+    ang := obmod(15 - ang, 60)
+    a := val(real, val(longreal, 2) * Math.pi / val(longreal, 60) * val(longreal, ang))
+    s := Math.sin(a)
+    c := Math.cos(a)
+    x1 := val(int16, val(int16, floor(val(real, r1) * c + 0.5)))
+    y1 := val(int16, val(int16, floor(val(real, r1) * s + 0.5)))
+    x2 := val(int16, val(int16, floor(val(real, r2) * c + 0.5)))
+    y2 := val(int16, val(int16, floor(val(real, r2) * s + 0.5)))
+    Printer3.Line(Q^, color, Display.solid, x0 + x1, y0 + y1, x0 + x2, y0 + y2, P(1), Display.replace)
+  end PLine
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @Q)
+  ToOberonForm(F.time + F.timeDiff, @time, @date)
+  col := F.col
+  if calendar in F.state0 then
+    dow := Dates.DayOfWeek(date)
+    Dates.ToYMD(date, @year, @month, @day)
+    Strings.MonthToStr(month, @s, 32, true)
+    s[3] := 0X
+    Printer3.CenterString(Q, col, M.x, M.y, P(F.W), P(10), font[0], @s, Display.paint)
+    Strings.IntToStr(day, @s, 32)
+    Printer3.CenterString(Q, col, M.x, M.y + P(7), P(F.W), P(20), font[1], @s, Display.paint)
+    if dow = 6 then
+      col := Display3.red
+    end
+    Strings.DayToStr(dow, @s, 32, false)
+    Printer3.CenterString(Q, col, M.x, M.y + P(22), P(F.W), P(10), font[0], @s, Display.paint)
+  elsif digital in F.state0 then
+    Strings.TimeToStr(time, @s)
+    i := 0
+    while s[i] # 0X do
+      inc(i)
+    end
+    s[i - 3] := 0X
+    Printer3.ReplConst(Q, Display3.downC, M.x, M.y + P(3), P(F.W), P(F.H), Display.replace)
+    Printer3.CenterString(Q, col, M.x, M.y + P(3), P(F.W), P(F.H - 3), font[2], @s, Display.paint)
+  else
+    if F.W < F.H then
+      r := P(asr(F.W, 1) - 1)
+    else
+      r := P(asr(F.H, 1) - 1)
+    end
+    x0 := M.x + P(asr(F.W, 1))
+    y0 := M.y + P(asr(F.H, 1))
+    Dates.ToHMS(time, @hour, @min_, @sec)
+    if r >= 12 then
+      rh := obdiv(7 * r, 11)
+      rm := obdiv(9 * r, 11)
+      i := 0
+      Printer3.Circle(Q, Display3.textbackC, Display.solid, x0, y0, r, P(1), {Display3.filled}, Display.replace)
+      while i < 60 do
+        PLine(i, x0, y0, rm, r, col, @Q)
+        inc(i, 5)
+      end
+      PLine(min_, x0, y0, 0, rm, col, @Q)
+      PLine(val(int16, obmod(F.time + F.timeDiff, Dates.day div 2i1) div 720), x0, y0, 0, rh, col, @Q)
+      Printer3.Circle(Q, col, Display.solid, x0, y0, r, P(1), {}, Display.replace)
+    end
+
+    if (hour = 12) & (min_ = 0) then
+      copy(@s, "hn", 32)
+    elsif (hour = 0) & (min_ = 0) then
+      copy(@s, "gh", 32)
+    elsif hour < 12 then
+      copy(@s, "am", 32)
+    else
+      copy(@s, "pm", 32)
+    end
+
+    Printer3.String(Q, col, x0 - asr(r, 1) - P(4), y0 - P(2), font[0], @s, Display.paint)
+  end
+end PrintClock
+
+procedure CopyClock*(M: pointer to Objects.CopyMsg; from, to_: Clock)
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  to_.time := from.time
+  to_.state0 := from.state0
+  to_.timeDiff := from.timeDiff
+  to_.col := from.col
+end CopyClock
+
+procedure ClockHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h, u, v: int16
+    F0: Clock
+    R: Display3.Mask
+begin
+  case F of
+  | Clock:
+    case M of
+    | Objects.PAttrMsg:
+      if (M.name = "Gen") & (M.id = Objects.get) then
+        if digital in F.state0 then
+          copy(@M.s, "Clocks.NewDigiClock", 64)
+        elsif calendar in F.state0 then
+          copy(@M.s, "Clocks.NewCalendar", 64)
+        else
+          copy(@M.s, "Clocks.NewClock", 64)
+        end
+
+        M.res := 0
+        M.class := Objects.String
+      else
+        ClockAttr(F, M)
+      end
+
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        Files.WriteInt(@M.R, 1)
+        Files.WriteSet(@M.R, F.state0)
+        Files.WriteNum(@M.R, F.timeDiff)
+        Files.WriteInt(@M.R, F.col)
+        Gadgets.framehandle(F, M)
+      elsif M.id = Objects.load then
+        Files.ReadInt(@M.R, @x)
+        if x # 1 then
+          Files.Set(@M.R, Files.Base(@M.R), Files.Pos(@M.R) - 1)
+          Files.ReadSet(@M.R, @F.state0)
+          if new_ in F.state0 then
+            Files.ReadNum(@M.R, @F.timeDiff)
+          end
+          F.state0 := F.state0 + {new_}
+          Gadgets.framehandle(F, M)
+        else
+          Files.ReadSet(@M.R, @F.state0)
+          if new_ in F.state0 then
+            Files.ReadNum(@M.R, @F.timeDiff)
+          end
+          F.state0 := F.state0 + {new_}
+          Files.ReadInt(@M.R, @F.col)
+          Gadgets.framehandle(F, M)
+        end
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyClock(M, F, F0)
+        M.obj := F0
+      end
+
+    | Display.PFrameMsg:
+      x := M.x + F.X // calculate display coordinates of this instance
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      u := M.x // store volatile info
+      v := M.y
+      M1 := M
+      case M1 of
+      | Display.PDisplayMsg:
+        if M1.device = Display.screen then
+          if (M1.F = nil) or (M1.id = Display.full) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            RestoreClock(F, R, x, y, w, h, false)
+          elsif (M1.id = Display.area) & (M1.F = F) then
+            Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+            Display3.AdjustMask(R, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+            RestoreClock(F, R, x, y, w, h, false)
+          end
+
+        elsif M1.device = Display.printer then
+          PrintClock(F, M1)
+        end
+
+      | PTickMsg:
+        Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+        F.time := ToLinearForm(M1.time, M1.date)
+        RestoreClock(F, R, x, y, w, h, M1.id = alarmId)
+
+      | Display.PControlMsg:
+        if M1.id = Display.restore then
+          F.time := GetClock()
+        end
+
+        Gadgets.framehandle(F, M1)
+      else
+        Gadgets.framehandle(F, M1)
+      end
+
+      M.x := u // restore volatile info
+      M.y := v
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end ClockHandler
+
+procedure InsertDate*()
+  var
+    date: int32
+    s: array 32 of char
+    M: Oberon.ConsumeMsg
+begin
+  date := GetClock()
+  if (Gadgets.executorObj # nil) & (Gadgets.executorObj is Clock) then
+    date := date + Gadgets.executorObj(Clock).timeDiff
+  end
+
+  date := Dates.NumberOfDaysToDate(obdiv(date, Day) + zeroY)
+  Strings.DateToStr(date, @s)
+  Texts.WriteString(@W, @s)
+  newgc(M.text)
+  Texts.Open(M.text, "")
+  Texts.Append(M.text, W.buf)
+  M.beg := 0
+  M.end_ := M.text.len_
+  M.F := nil
+  Display.Broadcast(@M)
+end InsertDate
+
+procedure InsertTime*()
+  var
+    date, time: int32
+    s: array 32 of char
+    M: Oberon.ConsumeMsg
+begin
+  time := GetClock()
+  if (Gadgets.executorObj # nil) & (Gadgets.executorObj is Clock) then
+    time := time + Gadgets.executorObj(Clock).timeDiff
+  end
+
+  ToOberonForm(time, @time, @date)
+  Strings.TimeToStr(time, @s)
+  Texts.WriteString(@W, @s)
+  newgc(M.text)
+  Texts.Open(M.text, "")
+  Texts.Append(M.text, W.buf)
+  M.beg := 0
+  M.end_ := M.text.len_
+  M.F := nil
+  Display.Broadcast(@M)
+end InsertTime
+
+procedure Init(F: Clock)
+begin
+  F.W := 40
+  F.H := 40
+  F.handle := ClockHandler
+  F.state := {Gadgets.transparent}
+  F.state0 := {new_}
+  F.col := Display3.textC
+  F.time := GetClock()
+  F.date := 0
+  F.timeDiff := 0
+end Init
+
+procedure NewClock*()
+  var
+    F: Clock
+begin
+  newgc(F)
+  Init(F)
+  F.W := 40
+  F.H := 40
+  F.state0 := {new_}
+  F.col := Display3.textC
+  Objects.NewObj := F
+end NewClock
+
+procedure NewDigiClock*()
+  var
+    F: Clock
+begin
+  newgc(F)
+  Init(F)
+  F.W := 40
+  F.H := 20
+  F.state0 := {digital,new_}
+  F.col := Display3.white
+  Objects.NewObj := F
+end NewDigiClock
+
+procedure NewCalendar*()
+  var
+    F: Clock
+begin
+  newgc(F)
+  Init(F)
+  F.W := 50
+  F.H := 34
+  F.state0 := {calendar,new_}
+  F.col := Display3.textC
+  Objects.NewObj := F
+end NewCalendar
+
+procedure FreeMod()
+begin
+  if task # nil then
+    Oberon.Remove(task)
+    task := nil
+  end
+end FreeMod
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "InsertDate" end return InsertDate end
+  if i = 1 then if name # nil then name^ := "InsertTime" end return InsertTime end
+  if i = 2 then if name # nil then name^ := "NewClock" end return NewClock end
+  if i = 3 then if name # nil then name^ := "NewDigiClock" end return NewDigiClock end
+  if i = 4 then if name # nil then name^ := "NewCalendar" end return NewCalendar end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Clocks", cmd_)
+  font[0] := Fonts.This("Default8.Scn.Fnt")
+  font[1] := Fonts.This("Default12b.Scn.Fnt")
+  font[2] := Fonts.This("Default10b.Scn.Fnt")
+  newgc(task)
+  task.handle := AlarmTask
+  lastTick := 0
+  task.safe := true
+  task.time := Oberon.Time()
+  Oberon.Install(task)
+  zeroY := Dates.NumberOfDays(Dates.ToDate(1961, 1, 1))
+  Texts.OpenWriter(@W)
+  Modules.InstallTermHandler(FreeMod)
+end Clocks.

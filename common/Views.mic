@@ -1,0 +1,1244 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Views [level=5]
+
+import Objects, Fonts, Gadgets, Display, Display3, Effects, Oberon, Texts, Files, Printer, Printer3, Modules
+// portable
+// jm 19.1.95
+
+(** Implementation of camera-views with adjustable viewpoints.
+*)
+
+(*
+jm 3.2.93 - OpenViewer systemtrack flag
+jm 15.2.93 - Update optimized for menuviewers
+jm 26.2.93 - Printing trap
+- Heavyweight dragging changed
+5.4.93 - fixed attrmsg
+- fixed selection color
+13.4.93 - introduced hotspot
+
+Fri, 10-Sep-1993 Thrown out Backdrops, Heavydrag, loading, storing, printing
+4.4.94 - GetBlock, RestoreBlock: if not otherwise possible the background bitmap is used
+25.7.94 - return selection correctly
+8.11.94 - removed check of 31 flag
+7.2.95 - fixed loading of views with dummy objects
+21.6.95 - Views are now always created with border = 1
+*)
+
+const
+  VersionNo = 2
+
+type
+  View* = pointer to ViewDesc
+  ViewDesc* = object (Gadgets.ViewDesc)
+    // Relative viewpoint of viewer object. Vector from top-left camera-view corner to top-left of contents.
+    vx*, vy*: int16
+    time*: int32 // Selection time of viewed gadget.
+  end
+
+  // Structure to "store" an area on the display
+  Block* = record
+    mask*: Display3.Mask // Mask bounding the area to be drawn in.
+    x, y, w, h: int16
+    view: Display.Frame
+  end
+
+var
+  background*: int16 // Background color of camera-views
+  last: View
+  W: Texts.Writer
+
+procedure Log()
+begin
+  Texts.Append(Oberon.Log, W.buf)
+end Log
+
+procedure Max(x, y: int16): int16
+begin
+  if x > y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Max
+
+procedure Min(x, y: int16): int16
+begin
+  if x < y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+// background drawing procedure
+procedure ReplConst(F: View; X, Y: int16; M: Display3.Mask; col, x, y, w, h: int16)
+  var
+    cx, cy, cw, ch, t: int16
+begin
+  // Display3.ReplConst(M, col, x, y, w, h, Display.replace)
+  cx := M.X
+  cy := M.Y
+  cw := M.W
+  ch := M.H
+  Display3.AdjustMask(M, x, y, w, h)
+  if F.border <= 1 then
+    Display3.FilledRect3D(M, Display3.topC, Display3.bottomC, col, X, Y, F.W, F.H, 1, Display.replace)
+  else
+    Display3.Rect(M, Display3.black, Display.solid, X, Y, F.W, F.H, 1, Display.replace)
+    t := F.border - 2
+    if t > 0 then
+      Display3.Rect(M, Display3.white, Display.solid, X + 1, Y + 1, F.W - 2, F.H - 2, t, Display.replace)
+    end
+    t := F.border - 1
+    if t < 0 then
+      t := 0
+    end
+    Display3.FilledRect3D(M, Display3.black, Display3.black, col, X + t, Y + t, F.W - t * 2, F.H - t * 2, 1, Display.replace)
+  end
+
+  M.X := cx
+  M.Y := cy
+  M.W := cw
+  M.H := ch
+end ReplConst
+
+// --- stack ops ---
+
+procedure ToFrame(F: View; u, v: int16; M: pointer to Display.FrameMsg)
+  var
+    y: int16
+    B: Display3.UpdateMaskMsg
+begin
+  if (F.obj # nil) & (F.obj is Display.Frame) then
+    if F.mask = nil then
+      B.F := F
+      Display.Broadcast(@B)
+      if F.mask = nil then
+        newgc(F.mask)
+        Display3.Open(F.mask)
+        Display3.Add(F.mask, 0, -F.H + 1, F.W, F.H)
+        F.mask.x := 0
+        F.mask.y := 0
+      end
+    end
+
+    M.x := u + (F.vx - F.obj(Display.Frame).X)
+    M.y := v + (F.vy - (F.obj(Display.Frame).Y + F.obj(Display.Frame).H - 1))
+    y := v - F.H + 1
+    Gadgets.Send(F, u, y, F.obj(Display.Frame), M)
+  end
+end ToFrame
+
+procedure ClipAgainst(x, y, w, h: pointer to int16; x1, y1, w1, h1: int16)
+  var
+    r, t, r1, t1: int16
+begin
+  r := x^ + w^ - 1
+  r1 := x1 + w1 - 1
+  t := y^ + h^ - 1
+  t1 := y1 + h1 - 1
+  if x^ < x1 then
+    x^ := x1
+  end
+  if y^ < y1 then
+    y^ := y1
+  end
+  if r > r1 then
+    r := r1
+  end
+  if t > t1 then
+    t := t1
+  end
+  w^ := r - x^ + 1
+  h^ := t - y^ + 1
+end ClipAgainst
+
+procedure CutoutBack(F: View; R: Display3.Mask; x, y, w, h, X, Y, W, H: int16)
+  var
+    B, T, nH: int16
+
+  procedure Enum(x1, y1, w1, h1: int16; F: pointer to View; R: pointer to Display3.Mask; X: pointer to int16; Y: pointer to int16)
+  begin
+    if (w1 > 0) & (h1 > 0) then
+      ReplConst(F^, X^, Y^, R^, background, x1, y1, w1, h1)
+    end
+  end Enum
+begin
+  B := Y
+  if y > Y then
+    // bottom block
+    B := y
+    Enum(X, Y, W, Min(H, y - Y), @F, @R, @X, @Y)
+  end
+  T := Y + H
+  if y + h < Y + H then
+    // top block
+    T := y + h
+    Enum(X, T, W, Min(H, Y + H - T), @F, @R, @X, @Y)
+  end
+  nH := T - B // + 1 !!!!
+  if x > X then
+    // left block
+    Enum(X, B, Min(W, x - X), nH, @F, @R, @X, @Y)
+  end
+  if x + w < X + W then
+    // right block
+    Enum(x + w, B, Min(W, X + W - (x + w)), nH, @F, @R, @X, @Y)
+  end
+end CutoutBack
+
+procedure RestoreView(F: View; x, y: int16; dlink: Objects.Object)
+  var
+    M: Display.DisplayMsg
+    w, h, col, cx, cy, cw, ch: int16
+    R: Display3.Mask
+    f: Display.Frame
+begin
+  w := F.W
+  h := F.H
+  Oberon.RemoveMarks(x, y, w, h)
+  Gadgets.MakeMask(F, x, y, dlink, @R)
+  col := background
+  if (F.obj # nil) & (F.obj is Display.Frame) then
+    f := F.obj(Display.Frame)
+    if (f is Gadgets.Frame) & (Gadgets.transparent in f(Gadgets.Frame).state) then
+      ReplConst(F, x, y, R, col, x, y, w, h)
+    else
+      cx := x + F.vx // area of child frame
+      cy := y + F.H + F.vy - f.H
+      cw := f.W
+      ch := f.H
+      ClipAgainst(@cx, @cy, @cw, @ch, x + F.border, y + F.border, w - F.border * 2, h - F.border * 2)
+      CutoutBack(F, R, cx, cy, cw, ch, x, y, w, h)
+    end
+
+    M.device := Display.screen
+    M.id := Display.full
+    M.F := nil
+    M.dlink := dlink
+    M.res := -1
+    ToFrame(F, x, y + h - 1, @M)
+  else
+    ReplConst(F, x, y, R, col, x, y, w, h)
+    Display3.CenterString(R, Display3.FG, x, y, w, h, Fonts.Default, "Empty View", Display3.textmode)
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreView
+
+procedure RestoreViewArea(F: View; x, y, u, v, w1, h1: int16; dlink: Objects.Object)
+  var
+    M: Display.DisplayMsg
+    w, h, col, cx, cy, cw, ch: int16
+    R: Display3.Mask
+    f: Display.Frame
+begin
+  w := F.W
+  h := F.H
+  Gadgets.MakeMask(F, x, y, dlink, @R)
+  col := background
+  Oberon.RemoveMarks(x, y, w, h)
+  Display3.AdjustMask(R, x + u, y + h - 1 + v, w1, h1)
+  if (F.obj # nil) & (F.obj is Display.Frame) then
+    f := F.obj(Display.Frame)
+    if (f is Gadgets.Frame) & (Gadgets.transparent in f(Gadgets.Frame).state) then
+      ReplConst(F, x, y, R, col, x, y, w, h)
+    else
+      cx := x + F.vx // area of child frame
+      cy := y + F.H + F.vy - f.H
+      cw := f.W
+      ch := f.H
+      ClipAgainst(@cx, @cy, @cw, @ch, x + F.border, y + F.border, w - F.border * 2, h - F.border * 2)
+      CutoutBack(F, R, cx, cy, cw, ch, x, y, w, h)
+    end
+
+    ClipAgainst(@u, @v, @w1, @h1, F.vx, F.vy - f.H + 1, f.W, f.H)
+    M.u := u - F.vx
+    M.v := v - F.vy
+    M.w := w1
+    M.h := h1
+    M.device := Display.screen
+    M.id := Display.area
+    M.F := f
+    M.dlink := dlink
+    M.res := -1
+    ToFrame(F, x, y + h - 1, @M)
+  else
+    ReplConst(F, x, y, R, col, x, y, w, h)
+    Display3.CenterString(R, Display3.FG, x, y, w, h, Fonts.Default, "Empty View", Display3.textmode)
+  end
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(R, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreViewArea
+
+procedure AdjustToFrame(F: View; u, v: int16; M: pointer to Display.ModifyMsg)
+  var
+    y: int16
+    B: Display3.UpdateMaskMsg
+begin
+  if F.obj # nil then
+    if F.mask = nil then
+      B.F := F
+      Display.Broadcast(@B)
+    end
+    M.x := u + F.vx - M.X
+    M.y := v + F.vy - M.Y - M.H + 1
+    y := v - F.H + 1
+    Gadgets.Send(F, u, y, F.obj(Display.Frame), M)
+  end
+end AdjustToFrame
+
+procedure AdjustChild(F: View; x, y, w, h: int16; M: pointer to Display.ModifyMsg)
+  var
+    RM, R: Display3.Mask
+    cx, cy: int16
+begin
+  if M.F = F.obj then
+    if last = F then
+      // moved or resized in this view
+      if M.stamp # F.stamp then
+        cx := F.vx + M.dX
+        cy := F.vy + (M.dY + M.dH) - M.H + 1
+      else
+        cx := F.vx
+        cy := F.vy - M.H + 1
+      end
+
+      if (M.id = Display.move) & ~Effects.Intersect(cx, cy, M.W, M.H, 0, -F.H + 1, F.W, F.H) then
+        // completely out of bound, ignore
+        M.res := 0
+        return
+      end
+
+      if M.stamp # F.stamp then
+        F.vx := F.vx + M.dX
+        F.vy := F.vy + (M.dY + M.dH)
+        F.stamp := M.stamp
+      end
+
+      Gadgets.MakeMask(F, x, y, M.dlink, @RM)
+      Display3.Copy(RM, @R)
+      R.x := 0
+      R.y := 0
+      Display3.Intersect(R, F.vx - M.dX, F.vy - (M.dY + M.dH) - (M.H - M.dH) + 1, M.W - M.dW, M.H - M.dH)
+      if (M.F is Gadgets.Frame) & ~(Gadgets.transparent in M.F(Gadgets.Frame).state) then
+        Display3.Subtract(R, F.vx, F.vy - M.H + 1, M.W, M.H)
+      end
+
+      R.x := x
+      R.y := y + h - 1
+      ReplConst(F, x, y, R, background, x + F.border, y + F.border, w - F.border * 2, h - F.border * 2)
+      AdjustToFrame(F, x, y + h - 1, M)
+      if Gadgets.selected in F.state then
+        Display3.FillPattern(RM, 15, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+      end
+
+    elsif (M.dW # 0) or (M.dH # 0) then
+      // just resize in this view
+      Gadgets.MakeMask(F, x, y, M.dlink, @RM)
+      Display3.Copy(RM, @R)
+      R.x := 0
+      R.y := 0
+      Display3.Intersect(R, F.vx, F.vy - (M.H - M.dH) + 1, M.W - M.dW, M.H - M.dH)
+      if (M.F is Gadgets.Frame) & ~(Gadgets.transparent in M.F(Gadgets.Frame).state) then
+        Display3.Subtract(R, F.vx, F.vy - M.H + 1, M.W, M.H)
+      end
+
+      R.x := x
+      R.y := y + h - 1
+      ReplConst(F, x, y, R, background, x + F.border, y + F.border, w - F.border * 2, h - F.border * 2)
+      AdjustToFrame(F, x, y + h - 1, M)
+      if Gadgets.selected in F.state then
+        Display3.FillPattern(RM, 15, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+      end
+    end
+
+  else
+    ToFrame(F, x, y + h - 1, M)
+  end
+end AdjustChild
+
+procedure CopyView*(M: pointer to Objects.CopyMsg; from, to_: View)
+begin
+  Gadgets.CopyFrame(M, from, to_)
+  to_.vx := from.vx
+  to_.vy := from.vy
+  to_.border := from.border
+end CopyView
+
+procedure StoreView(F: View; M: pointer to Objects.FileMsg)
+begin
+  Files.WriteNum(@M.R, VersionNo)
+  Files.WriteInt(@M.R, F.vx)
+  Files.WriteInt(@M.R, F.vy)
+  Files.WriteInt(@M.R, 0) // hack
+  Gadgets.framehandle(F, M)
+end StoreView
+
+procedure LoadView(F: View; M: pointer to Objects.FileMsg)
+  var
+    x: int32
+    dummy: int16
+begin
+  Files.ReadNum(@M.R, @x)
+  if x # VersionNo then
+    Texts.WriteString(@W, "Version ")
+    Texts.WriteInt(@W, VersionNo, 3)
+    Texts.WriteString(@W, " of Views cannot read version ")
+    Texts.WriteInt(@W, x, 3)
+    Texts.WriteLn(@W)
+    Log()
+    halt(42)
+  end
+
+  Files.ReadInt(@M.R, @F.vx)
+  Files.ReadInt(@M.R, @F.vy)
+  Files.ReadInt(@M.R, @dummy)
+  Gadgets.framehandle(F, M)
+  if (F.obj # nil) & ~(F.obj is Display.Frame) then
+    F.obj := nil
+    Texts.WriteString(@W, "Discarding dummy object in View")
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end
+end LoadView
+
+procedure ViewAttr(F: View; M: pointer to Objects.AttrMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      copy(@M.s, "Views.NewView", 64)
+      M.class := Objects.String
+      M.res := 0
+    elsif M.name = "Locked" then
+      M.class := Objects.Bool
+      M.b := Gadgets.lockedcontents in F.state
+      M.res := 0
+    elsif M.name = "Border" then
+      M.class := Objects.Int
+      M.i := F.border
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Locked" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state := F.state + {Gadgets.lockedcontents}
+        else
+          F.state := F.state - {Gadgets.lockedcontents}
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "Border" then
+      if (M.class = Objects.Int) & (M.i >= 0) & (M.i < F.W) & (M.i < F.H) then
+        F.border := val(int16, M.i)
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Locked")
+    M.Enum("Border")
+    Gadgets.framehandle(F, M)
+  end
+end ViewAttr
+
+procedure ViewLink(F: View; M: pointer to Objects.LinkMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Model" then
+      M.obj := F.obj
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if (M.name = "Model") & ((M.obj = nil) or (M.obj is Gadgets.Frame)) then
+      F.obj := M.obj
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Model")
+    Gadgets.framehandle(F, M)
+  end
+end ViewLink
+
+procedure Absolute(dlink: Objects.Object): boolean
+  var
+    A: Objects.AttrMsg
+begin
+  if (dlink # nil) & (dlink.handle # nil) then
+    // NIL test because of Script
+    A.id := Objects.get
+    copy(@A.name, "Absolute", 32)
+    A.res := -1
+    dlink.handle(dlink, @A)
+    return (A.res >= 0) & (A.class = Objects.Bool) & A.b
+  else
+    return false
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end Absolute
+
+procedure CleverAdjust(F: View; M: pointer to Display.ModifyMsg; stamp: pointer to int32; borderW: int16)
+  var
+    x, y, w, h, x0, y0, w0, h0, x1, y1, w1, h1: int16
+    D: Display.DisplayMsg
+    abs_: boolean
+begin
+  // calculate old position
+  abs_ := Absolute(M.dlink)
+  x := M.X - M.dX
+  y := M.Y - M.dY
+  w := M.W - M.dW
+  h := M.H - M.dH
+
+  if abs_ & (M.W = w) & (M.X = x) & (M.Y = y) & (h # 0) then
+    // In MenuViewer, width did not change, grow up/down
+    // Special optimization
+    if M.H > h then
+      // copy up
+      h1 := M.H - h
+      Display.CopyBlock(x, y, w, h, x, M.Y + h1, Display.replace)
+    else
+      // copy down
+      h1 := h - M.H
+      Display.CopyBlock(x, y + h1 + F.border, w, M.H - F.border, M.X, M.Y + F.border, Display.replace)
+    end
+
+    if M.stamp # stamp^ then
+      // first adjust
+      F.X := M.X
+      F.Y := M.Y
+      F.W := M.W
+      F.H := M.H
+      F.mask := nil
+      stamp^ := M.stamp
+    end
+
+    if M.H > h then
+      // copy up, restore bottom part
+      RestoreViewArea(F, F.X, F.Y, 0, -F.H + 1, F.W, h1 + F.border, nil)
+    end
+
+  elsif (M.X = x) & (M.Y + M.H = y + h) then
+    // left top most corner is stable
+    // << remove
+    if M.mode = Display.display then
+      // extend / reduce Y
+      w0 := 0
+      h0 := 0
+      if M.H > h then
+        // extend
+        x0 := 0
+        y0 := -M.H + 1
+        w0 := M.W
+        h0 := y - M.Y + borderW
+      elsif M.H < h then
+        // reduce
+        x0 := 0
+        y0 := -M.H + 1
+        w0 := M.W
+        h0 := borderW
+      end
+
+      // extend / reduce X
+      w1 := 0
+      h1 := 0
+      if M.W > w then
+        // extend
+        x1 := w - borderW
+        y1 := -M.H + 1
+        w1 := M.W - w + 1 + borderW
+        h1 := M.H
+      elsif M.W < w then
+        // reduce
+        x1 := M.W - borderW
+        y1 := -M.H + 1
+        w1 := borderW
+        h1 := M.H
+      end
+
+      if (w1 # 0) & (h1 # 0) then
+        // eliminate overlap
+        inc(y1, h0)
+        dec(h1, h0)
+      end
+    end
+
+    if M.stamp # stamp^ then
+      // first adjust
+      F.X := M.X // invalidate current mask
+      F.Y := M.Y
+      F.W := M.W
+      F.H := M.H
+      F.mask := nil
+      stamp^ := M.stamp
+    end
+
+    if M.mode = Display.display then
+      if (w0 # 0) & (h0 > 0) then
+        D.F := F
+        D.x := M.x
+        D.y := M.y
+        D.F := F
+        D.id := Display.area
+        D.device := Display.screen
+        D.u := x0
+        D.v := y0
+        D.w := w0
+        D.h := h0
+        Objects.Stamp(@D)
+        D.dlink := M.dlink
+        D.res := -1
+        F.handle(F, @D)
+      end
+
+      if (w1 # 0) & (h1 > 0) then
+        D.F := F
+        D.x := M.x
+        D.y := M.y
+        D.F := F
+        D.id := Display.area
+        D.device := Display.screen
+        D.u := x1
+        D.v := y1
+        D.w := w1
+        D.h := h1
+        Objects.Stamp(@D)
+        D.dlink := M.dlink
+        D.res := -1
+        F.handle(F, @D)
+      end
+    end
+
+  else
+    Gadgets.framehandle(F, M)
+  end
+end CleverAdjust
+
+procedure PrintView(F: View; M: pointer to Display.DisplayMsg)
+  var
+    R: Display3.Mask
+    u, v: int16
+    f: Display.Frame
+    P: Display.DisplayMsg
+    X, Y: int16
+
+  procedure PP(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end PP
+begin
+  X := F.absX
+  Y := F.absY
+  F.absX := M.x
+  F.absY := M.y
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @R)
+  Printer3.Rect(R, 15, Display.solid, M.x, M.y, PP(F.W), PP(F.H), 1, Display3.replace)
+  if F.obj # nil then
+    f := F.obj(Display.Frame)
+    (* u := M.x; v := M.y;
+    M.x := u + PP(F.vx + f.X); M.y := v + PP(F.H + F.vy - f.H + f.Y);
+    Gadgets.Send(F, u, v, f, M) *)
+    P.res := -1
+    Objects.Stamp(@P)
+    P.device := Display.printer
+    P.id := Display.full
+    P.F := f
+    P.dlink := F
+    P.x := M.x + PP(f.X)
+    P.y := M.y + PP(F.H + f.Y - f.H)
+    f.handle(f, @P)
+  else
+    Printer3.CenterString(R, Display3.FG, M.x, M.y, PP(F.W), PP(F.H), Fonts.Default, "Empty View", Display.paint)
+  end
+
+  F.absX := X
+  F.absY := Y
+end PrintView
+
+procedure Neutralize(F: View; x, y, w, h: int16; M: pointer to Oberon.ControlMsg)
+  var
+    S: Display.SelectMsg
+begin
+  F.stamp := M.stamp
+  if (F.time # -1) & (F.obj # nil) then
+    // selected
+    Oberon.RemoveMarks(x, y, w, h)
+    S.obj := F.obj
+    S.F := F.obj(Display.Frame)
+    S.res := -1
+    Objects.Stamp(@S)
+    S.id := Display.reset
+    S.dlink := M.dlink
+    ToFrame(F, x, y + h - 1, @S)
+    Gadgets.Update(F.obj)
+  end
+
+  F.time := -1
+end Neutralize
+
+procedure Locate(F: View; x, y, w, h: int16; M: pointer to Display.LocateMsg)
+  var
+    cx: int16
+    L: Display.LocateMsg
+begin
+  if (M.loc = nil) & Effects.Inside(M.X, M.Y, x, y, w, h) then
+    L.dlink := M.dlink
+    L.X := M.X
+    L.Y := M.Y
+    L.F := nil
+    L.loc := nil
+    L.res := -1
+    Objects.Stamp(@L)
+    ToFrame(F, x, y + h - 1, @L)
+    if L.loc # nil then
+      M.loc := L.loc
+      M.x := L.x
+      M.y := L.y
+      M.u := L.u
+      M.v := L.v
+      M.res := 0
+    elsif F.obj # nil then
+      M.loc := F
+      M.u := M.X - (x + F.vx - F.obj(Display.Frame).X)
+      cx := F.obj(Display.Frame).Y + F.obj(Display.Frame).H - 1
+      M.v := M.Y - (y + h - 1 + F.vy - cx)
+      M.res := 0
+    else
+      M.loc := F
+      M.u := M.X - x
+      M.v := M.Y - (y + h - 1)
+      M.res := 0
+    end
+  end
+end Locate
+
+procedure Select(F: View; x, y, w, h: int16; M: pointer to Display.SelectMsg)
+begin
+  if M.id = Display.get then
+    if ((M.time - F.time < 0) or (M.time = -1)) & (F.obj # nil) & (Gadgets.selected in F.obj(Gadgets.Frame).state) then
+      M.obj := F.obj
+      M.time := F.time
+      M.sel := F
+    end
+
+    ToFrame(F, x, y + h - 1, M)
+  elsif M.F = F then
+    Gadgets.framehandle(F, M)
+  elsif (F.obj # nil) & (M.F = F.obj) & (M.stamp # F.stamp) then
+    F.stamp := M.stamp
+    ToFrame(F, x, y + h - 1, M)
+    Gadgets.Update(F.obj)
+    M.res := 0
+  else
+    ToFrame(F, x, y + h - 1, M)
+  end
+end Select
+
+procedure UpdateMask(F: View; x, y, w, h: int16; M: pointer to Display3.UpdateMaskMsg)
+  var
+    R: Display3.Mask
+    O: Display3.OverlapMsg
+begin
+  if M.F = F.obj then
+    // mychild
+    newgc(R)
+    Display3.Open(R)
+    Display3.Add(R, 0, -F.obj(Display.Frame).H + 1, F.obj(Display.Frame).W, F.obj(Display.Frame).H)
+    O.F := F.obj(Display.Frame)
+    O.x := 0
+    O.y := 0
+    O.M := R
+    O.res := -1
+    O.dlink := nil
+    ToFrame(F, x, y + h - 1, @O)
+    M.res := 0
+  elsif M.F = F then
+    // view has to construct its own mask
+    newgc(F.mask)
+    Display3.Open(F.mask)
+    Display3.Add(F.mask, 0, -F.H + 1, F.W, F.H)
+    F.mask.x := 0
+    F.mask.y := 0
+  else
+    ToFrame(F, x, y + h - 1, M)
+  end
+end UpdateMask
+
+procedure Consume(F: View; x, y, w, h: int16; M: pointer to Display.ConsumeMsg)
+  var
+    f: Display.Frame
+    C: Display.ControlMsg
+    B: Objects.BindMsg
+begin
+  if (M.id = Display.drop) & (M.F = F) then
+    if (F.obj = nil) & (M.obj is Display.Frame) then
+      f := M.obj(Display.Frame)
+      f.slink := nil
+      if Gadgets.Recursive(F, f) then
+        Texts.WriteString(@W, "Not allowed, will cause recursive structures")
+        Log()
+      elsif (F.lib # nil) & (f.lib # nil) & (F.lib # f.lib) & (f.lib.name # "") then
+        Texts.WriteString(@W, "Across library movement not allowed")
+        Log()
+      else
+        C.id := Display.remove // << remove
+        C.F := f
+        Display.Broadcast(@C)
+        F.obj := f
+        if F.border <= 1 then
+          F.vx := 0
+          F.vy := 0
+        else
+          F.vx := F.border
+          F.vy := -F.border
+        end
+
+        f.X := 0
+        f.Y := 0
+        case f of
+        | Gadgets.Frame:
+          f(Gadgets.Frame).mask := nil
+        end
+        if F.lib # nil then
+          B.lib := F.lib
+          F.obj.handle(F.obj, @B)
+        end
+        Gadgets.Update(F)
+        M.res := 0
+      end
+
+    else
+      M.res := 0
+    end
+
+  else
+    ToFrame(F, x, y + h - 1, M)
+  end
+end Consume
+
+procedure InHotspot(X, Y, x, y, w, h: int16): boolean
+  const
+    size_ = 10
+    GravQ = 4
+    MinGrav = 2
+
+  procedure InBorder(mx, my, X, Y, W, H: int16): boolean
+    var
+      hg, vg: int16
+  begin
+    if (W <= Effects.gravity * 3) or (H <= Effects.gravity * 3) then
+      hg := Min(Effects.gravity, Max(asr(W, 2), MinGrav))
+      vg := Min(Effects.gravity, Max(asr(H, 2), MinGrav))
+      return Effects.Inside(mx, my, X + hg, Y, 1, H) or Effects.Inside(mx, my, X, Y + vg, W, 1) or Effects.Inside(mx, my, X + W - hg - 1, Y, 1, H) or Effects.Inside(mx, my, X, Y + H - vg - 1, W, 1)
+
+    else
+      return Effects.Inside(mx, my, X + Effects.gravity, Y, 1, H) or Effects.Inside(mx, my, X, Y + Effects.gravity, W, 1) or Effects.Inside(mx, my, X + W - Effects.gravity - 1, Y, 1, H) or Effects.Inside(mx, my, X, Y + H - Effects.gravity - 1, W, 1)
+    end
+    return false // TODO o2m: Micron requires a result on all control paths
+  end InBorder
+begin
+  return Effects.Inside(X, Y, x, y + h - size_, size_, size_) or InBorder(X, Y, x, y, w, h)
+end InHotspot
+
+procedure TrackMouse(F: View; x, y, w, h: int16; M: pointer to Oberon.InputMsg)
+  var
+    keysum: set
+    Fdlink, Mdlink: Objects.Object
+    last0: View
+    f: Display.Frame
+    L: Display.LocateMsg
+    S: Display.SelectMsg
+    D: Display.DisplayMsg
+    C: Objects.CopyMsg
+begin
+  if ~Effects.InBorder(M.X, M.Y, x, y, w, h) & ~(Gadgets.selected in F.state) then
+    // Gadgets.InActiveArea(F, M)
+    L.dlink := M.dlink
+    L.X := M.X
+    L.Y := M.Y
+    L.F := nil
+    L.loc := nil
+    L.res := -1
+    ToFrame(F, x, y + h - 1, @L)
+    if (L.loc # nil) & ~InHotspot(M.X, M.Y, x, y, w, h) then
+      // push
+      last0 := last // Pop
+      last := F
+      ToFrame(F, x, y + h - 1, M)
+      last := last0
+      if M.res < 0 then
+        // viewed object did not respond
+        if (M.keys = {0}) & (F.obj is Gadgets.Frame) then
+          // select
+          S.F := F.obj(Gadgets.Frame)
+          S.res := -1
+          Objects.Stamp(@S)
+          if Gadgets.selected in F.obj(Gadgets.Frame).state then
+            S.id := Display.reset
+            F.time := -1
+          else
+            S.id := Display.set_
+            F.time := Oberon.Time()
+          end
+
+          keysum := M.keys
+          S.dlink := M.dlink
+          ToFrame(F, x, y + h - 1, @S)
+          Oberon.FadeCursor(@Oberon.Mouse)
+          D.device := Display.screen
+          D.id := Display.full
+          D.F := F.obj(Display.Frame)
+          Display.Broadcast(@D)
+          repeat
+            Effects.TrackMouse(@M.keys, @M.X, @M.Y, Effects.Arrow)
+            keysum := keysum + M.keys
+          until M.keys = {}
+
+          if keysum = {0,2} then
+            // RL delete selection
+            F.obj := nil
+            Gadgets.Update(F)
+          elsif keysum = {0,1} then
+            // RM copy to focus
+            C.id := Objects.deep
+            C.obj := nil
+            Objects.Stamp(@C)
+            F.obj.handle(F.obj, @C)
+            Gadgets.Integrate(C.obj)
+          end
+
+          M.res := 0
+        elsif (M.keys = {1}) & (F.obj is Gadgets.Frame) & (Gadgets.selected in F.obj(Gadgets.Frame).state) & ~(Gadgets.lockedcontents in F.state) then
+          // move
+          f := F.obj(Display.Frame)
+          // push
+          last0 := last
+          last := F
+          M.x := x + (F.vx - f.X)
+          M.y := y + h - 1 + (F.vy - (f.Y + f.H - 1))
+          Fdlink := F.dlink
+          Mdlink := M.dlink
+          F.dlink := M.dlink
+          M.dlink := F
+          if Effects.InCorner(M.X, M.Y, M.x + f.X, M.y + f.Y, f.W, f.H) & ~(Gadgets.lockedsize in F.state) then
+            Gadgets.SizeFrame(f, M)
+          else
+            Gadgets.MoveFrame(f, M)
+          end
+
+          F.dlink := Fdlink
+          M.dlink := Mdlink
+          last := last0 // Pop
+          M.res := 0
+        else
+          Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+        end
+      end
+
+    // switch on
+    elsif (M.keys = {1}) & (L.loc # nil) & (F.obj is Gadgets.Frame) & InHotspot(M.X, M.Y, x, y, w, h) & ~(Gadgets.lockedcontents in F.state) then
+
+      f := F.obj(Display.Frame)
+      // push
+      last0 := last
+      last := F
+      M.x := x + (F.vx - f.X)
+      M.y := y + h - 1 + (F.vy - (f.Y + f.H - 1))
+      Fdlink := F.dlink
+      Mdlink := M.dlink
+      F.dlink := M.dlink
+      M.dlink := F
+      Gadgets.MoveFrame(f, M)
+      F.dlink := Fdlink
+      M.dlink := Mdlink
+      last := last0 // Pop
+      M.res := 0
+    elsif Effects.InBorder(M.X, M.Y, x, y, w, h) then
+      Gadgets.framehandle(F, M)
+    else
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.Arrow, M.X, M.Y)
+    end
+
+  elsif Effects.InBorder(M.X, M.Y, x, y, w, h) then
+    Gadgets.framehandle(F, M)
+  end
+end TrackMouse
+
+procedure ViewHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h, u, v: int16
+    F0: View
+begin
+  case F of
+  | View:
+    case M of
+    | Objects.PAttrMsg:
+      ViewAttr(F, M(Objects.PAttrMsg))
+    | Objects.PLinkMsg:
+      ViewLink(F, M(Objects.PLinkMsg))
+    | Objects.PFileMsg:
+      if M.id = Objects.store then
+        StoreView(F, M)
+      elsif M.id = Objects.load then
+        LoadView(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyView(M, F, F0)
+        M.obj := F0
+      end
+
+    | Objects.PBindMsg:
+      Gadgets.framehandle(F, M)
+      if F.obj # nil then
+        F.obj.handle(F.obj, M)
+      end
+    | Display.PFrameMsg:
+      x := M.x + F.X // calculate actual coordinates
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      u := M.x // store volatile info
+      v := M.y
+      M1 := M
+      case M1 of
+      | Display.PDisplayMsg:
+        if M1.device = Display.screen then
+          if (M1.F = nil) or (M1.id = Display.full) & (M1.F = F) then
+            RestoreView(F, x, y, M1.dlink)
+          elsif (M1.id = Display.area) & (M1.F = F) then
+            RestoreViewArea(F, x, y, M1.u, M1.v, M1.w, M1.h, M1.dlink)
+          else
+            ToFrame(F, x, y + h - 1, M1)
+          end
+
+        elsif M1.device = Display.printer then
+          PrintView(F, M1)
+        else
+          ToFrame(F, x, y + h - 1, M1)
+        end
+
+      | Gadgets.PUpdateMsg:
+        if M1.obj = F.obj then
+          RestoreView(F, x, y, M1.dlink)
+          ToFrame(F, x, y + h - 1, M1)
+        else
+          ToFrame(F, x, y + h - 1, M1)
+        end
+
+      | Oberon.PControlMsg:
+        if (M1.id = Oberon.neutralize) & (M1.stamp # F.stamp) then
+          Neutralize(F, x, y, w, h, M1)
+        end
+        ToFrame(F, x, y + h - 1, M1)
+
+      | Display.PLocateMsg:
+        Locate(F, x, y, w, h, M1(Display.PLocateMsg))
+      | Display.PSelectMsg:
+        Select(F, x, y, w, h, M1(Display.PSelectMsg))
+      | Display.PConsumeMsg:
+        Consume(F, x, y, w, h, M1(Display.PConsumeMsg))
+      | Oberon.PInputMsg:
+        if (M1.id = Oberon.track) & Effects.Inside(M1.X, M1.Y, x, y, w, h) then
+          TrackMouse(F, x, y, w, h, M1)
+        else
+          ToFrame(F, x, y + h - 1, M1)
+        end
+
+      | Display.PModifyMsg:
+        if (M1.F = F) & (F.obj # nil) then
+          CleverAdjust(F, M1, @F.stamp, F.border)
+        elsif M1.F = F then
+          Gadgets.Adjust(F, M1)
+        else
+          AdjustChild(F, x, y, w, h, M1)
+        end
+
+      | Display.PControlMsg:
+        // << remove
+        if (M1.id = Display.remove) & (M1.F = F.obj) then
+          F.obj := nil
+          Gadgets.Update(F)
+        elsif F.obj # nil then
+          ToFrame(F, x, y + h - 1, M1)
+        end
+
+      | Display3.POverlapMsg:
+        Gadgets.framehandle(F, M1)
+      | Display3.PUpdateMaskMsg:
+        UpdateMask(F, x, y, w, h, M1(Display3.PUpdateMaskMsg))
+      else
+        ToFrame(F, x, y + h - 1, M1)
+      end
+
+      M.x := u // restore volatile info
+      M.y := v
+
+    else
+      if F.obj # nil then
+        F.obj.handle(F.obj, M)
+      end
+    end
+  end
+end ViewHandler
+
+procedure InitView*(F: View)
+begin
+  F.handle := ViewHandler
+  F.W := 100
+  F.H := 100
+  F.border := 1
+end InitView
+
+procedure NewView*()
+  var
+    F: View
+begin
+  newgc(F)
+  InitView(F)
+  Objects.NewObj := F
+end NewView
+
+// Create a camera-view of F.
+procedure ViewOf*(F: Display.Frame): View
+  var
+    V: View
+begin
+  NewView()
+  V := Objects.NewObj(View)
+  V.obj := F
+  if V.border <= 1 then
+    V.vx := 0
+    V.vy := 0
+  else
+    V.vx := V.border
+    V.vy := -V.border
+  end
+
+  return V
+end ViewOf
+
+// Save a description of a rectangular area on the display. RestoreBlock will issue a DisplayMsg to redraw this part of the display. Note that the mask of the Block must be used to draw in the area X, Y, W, H as the camera-view might be clipping parts away. These two procedures provide a portable, safe and memory efficient way of "storing" parts of the display while drawing temporarily. A low level way of saving and restoring areas on the display is provided by Effects, or by module Bitmaps.
+procedure GetBlock*(X, Y, W, H: int16; dlink: Objects.Object; b: pointer to Block)
+  var
+    obj: Objects.Object
+    F: Gadgets.Frame
+begin
+  b.view := nil
+  b.mask := nil
+  obj := dlink
+  while obj # nil do
+    if obj is Gadgets.View then
+      b.view := obj(Gadgets.View)
+      b.x := X - obj(Gadgets.View).absX
+      b.y := Y - (obj(Gadgets.View).absY + obj(Gadgets.View).H - 1)
+      b.w := W
+      b.h := H
+      ClipAgainst(@b.x, @b.y, @b.w, @b.h, 0, -obj(Gadgets.View).H + 1, obj(Gadgets.View).W, obj(Gadgets.View).H)
+      newgc(F)
+      F.X := 0
+      F.Y := 0
+      F.W := W
+      F.H := H
+      newgc(F.mask)
+      Display3.Open(F.mask)
+      Display3.Add(F.mask, 0, -H + 1, W, H)
+      Gadgets.MakeMask(F, X, Y, dlink, @b.mask)
+      return
+
+    elsif (obj is Gadgets.Frame) & Absolute(dlink) then
+      // outside
+      case obj of
+      | Display.Frame:
+        // must be absolutely positioned
+        b.view := obj
+        b.x := X - obj.X
+        b.y := Y - (obj.Y + obj.H - 1)
+        b.w := W
+        b.h := H
+        ClipAgainst(@b.x, @b.y, @b.w, @b.h, 0, -obj.H + 1, obj.W, obj.H)
+        newgc(F)
+        F.X := 0
+        F.Y := 0
+        F.W := W
+        F.H := H
+        newgc(F.mask)
+        Display3.Open(F.mask)
+        Display3.Add(F.mask, 0, -H + 1, W, H)
+        Gadgets.MakeMask(F, X, Y, dlink, @b.mask)
+        return
+      end
+    end
+
+    obj := obj.dlink
+  end
+
+  Effects.OpenMenu(X, Y, W, H)
+  newgc(b.mask)
+  Display3.Open(b.mask)
+  Display3.Add(b.mask, X, Y, W, H)
+end GetBlock
+
+// Restore previously "saved" display area.
+procedure RestoreBlock*(b: Block)
+  var
+    M: Display.DisplayMsg
+begin
+  if b.view # nil then
+    M.device := Display.screen
+    M.id := Display.area
+    M.F := b.view
+    M.u := b.x
+    M.v := b.y
+    M.w := b.w
+    M.h := b.h
+    Display.Broadcast(@M)
+  else
+    Effects.CloseMenu()
+  end
+end RestoreBlock
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewView" end return NewView end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Views", cmd_)
+  Texts.OpenWriter(@W) // 12
+  background := 14
+end Views.

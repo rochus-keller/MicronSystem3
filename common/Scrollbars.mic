@@ -1,0 +1,1046 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Scrollbars [level=5]
+
+import Input, Files, Effects, Printer, Printer3, Display3, Oberon, Objects, Display, Gadgets, Attributes, Modules
+// portable
+// ps (based on sources of rv and Effects),
+
+const
+  VersionNo = 1
+  barW = 18
+
+  // frame states
+  hasarrows* = 0
+  dodrag* = 1
+
+type
+  Frame* = pointer to FrameDesc
+  FrameDesc* = object (Gadgets.FrameDesc)
+    state0*: set
+    backC*, knoblen: int16
+    min_*, max_*, step*, val_*: int32
+    stepO*, minO*, maxO*: Objects.Object
+    vertical*: boolean
+  end
+
+var
+  HoldTime, WaitTime, mayscroll: int32
+
+procedure TimeOk(): boolean
+begin
+  if Oberon.Time() - mayscroll <= 0 then
+    return false
+  else
+    mayscroll := Oberon.Time() + WaitTime
+    return true
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end TimeOk
+
+// Given a position, calculate the relative slider position.
+procedure Value(F: Frame; x, y, w, h, X, Y: int16; min_, max_: int32): int32
+  var
+    res: int32
+
+  procedure CalcVal(x, w, bx, bw: int16; min_, max_: int32): int32
+    var
+      r, d: int32
+  begin
+    d := max_ - min_
+    if d = 0 then
+      r := 0
+    else
+      r := obdiv((bx - x - asr(bw, 1)) * d, w - bw)
+      r := min_ + r
+      if min_ > max_ then
+        d := max_
+        max_ := min_
+        min_ := d
+      end
+      if r > max_ then
+        r := max_
+      elsif r < min_ then
+        r := min_
+      end
+    end
+
+    return r
+  end CalcVal
+begin
+  if F.vertical then
+    res := CalcVal(y, h, Y, F.knoblen, min_, max_)
+  else
+    res := CalcVal(x, w, X, F.knoblen, min_, max_)
+  end
+
+  return res
+end Value
+
+// Given the min, max and val, calculate the absolute bar position
+procedure Pos(F: Frame; x, y, w, h, bw: int16; min_, max_, val_: int32): int16
+  var
+    res: int16
+
+  procedure CalcPos(x, w, bw: int16; min_, max_, val_: int32): int16
+    var
+      d: int32
+  begin
+    d := abs(max_ - min_)
+    if d = 0 then
+      return x
+    else
+      if max_ > min_ then
+        if val_ < min_ then
+          val_ := min_
+        elsif val_ > max_ then
+          val_ := max_
+        end
+      else
+        if val_ > min_ then
+          val_ := min_
+        elsif val_ < max_ then
+          val_ := max_
+        end
+      end
+
+      val_ := abs(val_ - min_)
+      return val(int16, x + obdiv(val_ * (w - bw), d))
+    end
+    return 0 // TODO o2m: Micron requires a result on all control paths
+  end CalcPos
+begin
+  if F.vertical then
+    res := CalcPos(y, h, bw, min_, max_, val_)
+  else
+    res := CalcPos(x, w, bw, min_, max_, val_)
+  end
+
+  return res
+end Pos
+
+procedure SendUpdate(F: Frame; px, py: int16; dlink: Objects.Object; full: boolean)
+  var
+    D: Display.DisplayMsg
+begin
+  D.device := Display.screen
+  D.id := Display.area
+  D.dlink := dlink
+  D.F := F
+  D.x := px
+  D.y := py
+  D.res := -1
+  if full then
+    D.id := Display.full
+  else
+    D.u := 1
+    D.v := -F.H + 2
+    D.w := F.W - 2
+    D.h := F.H - 2
+    if hasarrows in F.state0 then
+      if F.vertical then
+        inc(D.v, barW)
+        dec(D.h, 2i1 * barW)
+      else
+        inc(D.u, barW)
+        dec(D.w, 2i1 * barW)
+      end
+    end
+  end
+
+  F.handle(F, @D)
+end SendUpdate
+
+procedure SetValue(F: Frame; val_: int32)
+  var
+    name: array 64 of char
+begin
+  F.val_ := val_
+  if F.obj # nil then
+    Attributes.GetString(F, "Field", @name, 64)
+    if name = "" then
+      copy(@name, "Value", 64)
+    end
+    Attributes.SetInt(F.obj, @name, val_)
+    Gadgets.Update(F.obj)
+  end
+end SetValue
+
+procedure SetValueAndUpdate(F: Frame; val_: int32; px, py: int16; dlink: Objects.Object)
+  var
+    name: array 64 of char
+begin
+  F.val_ := val_
+  if F.obj # nil then
+    Attributes.GetString(F, "Field", @name, 64)
+    if name = "" then
+      copy(@name, "Value", 64)
+    end
+    Attributes.SetInt(F.obj, @name, val_)
+    Gadgets.Update(F.obj)
+  else
+    SendUpdate(F, px, py, dlink, false)
+  end
+end SetValueAndUpdate
+
+procedure GetValue(F: Frame)
+  var
+    name: array 64 of char
+begin
+  if F.obj # nil then
+    Attributes.GetString(F, "Field", @name, 64)
+    if name = "" then
+      copy(@name, "Value", 64)
+    end
+    Attributes.GetInt(F.obj, @name, @F.val_)
+  end
+end GetValue
+
+procedure AdjustKnoblen(F: Frame)
+  var
+    W: int16
+    kl: int32
+begin
+  if F.minO # nil then
+    Attributes.GetInt(F.minO, "Value", @F.min_)
+  end
+  if F.maxO # nil then
+    Attributes.GetInt(F.maxO, "Value", @F.max_)
+  end
+  if F.vertical then
+    W := F.H
+  else
+    W := F.W
+  end
+  if hasarrows in F.state0 then
+    dec(W, 2i1 * barW)
+  end
+  kl := val(int32, W) - 2 - abs(F.max_ - F.min_)
+  if kl < barW then
+    kl := barW
+  end
+  F.knoblen := val(int16, kl)
+end AdjustKnoblen
+
+procedure DrawKnob(Q: Display3.Mask; x, y, w, h: int16; vertical: boolean)
+  var
+    m: int16
+begin
+  if vertical then
+    Display3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y, w, h, 1, Display3.replace)
+    m := y + asr(h, 1)
+    inc(x, 2)
+    dec(w, 4)
+    Display3.ReplConst(Q, Display3.bottomC, x, m - 2, w, 1, Display3.replace)
+    Display3.ReplConst(Q, Display3.topC, x, m - 1, w, 1, Display3.replace)
+    Display3.ReplConst(Q, Display3.bottomC, x, m + 1, w, 1, Display3.replace)
+    Display3.ReplConst(Q, Display3.topC, x, m + 2, w, 1, Display3.replace)
+  else
+    Display3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y, w, h, 1, Display3.replace)
+    m := x + asr(w, 1)
+    inc(y, 2)
+    dec(h, 4)
+    Display3.ReplConst(Q, Display3.topC, m - 2, y, 1, h, Display3.replace)
+    Display3.ReplConst(Q, Display3.bottomC, m - 1, y, 1, h, Display3.replace)
+    Display3.ReplConst(Q, Display3.topC, m + 1, y, 1, h, Display3.replace)
+    Display3.ReplConst(Q, Display3.bottomC, m + 2, y, 1, h, Display3.replace)
+  end
+end DrawKnob
+
+procedure RestoreFrame(F: Frame; Q: Display3.Mask; x, y, w, h: int16)
+  var
+    i: int16
+begin
+  Oberon.RemoveMarks(x, y, w, h)
+  Display3.FilledRect3D(Q, Display3.bottomC, Display3.topC, F.backC, x, y, w, h, 1, Display3.replace)
+
+  // draw inside
+  inc(x)
+  inc(y)
+  dec(w, 2)
+  dec(h, 2)
+  if F.vertical then
+    if hasarrows in F.state0 then
+      // Down button box
+      Display3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y, w, barW - 1i1, 1, Display3.replace)
+      Display3.ReplConst(Q, Display3.FG, x, y + barW - 1, w, 1, Display3.replace)
+      // Up button box
+      Display3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y + h - barW + 1, w, barW - 1i1, 1, Display3.replace)
+      Display3.ReplConst(Q, Display3.FG, x, y + h - barW, w, 1, Display3.replace)
+      // Triangles
+      for i := -4 to 1 do
+        Display3.ReplConst(Q, Display3.FG, x + asr(w, 1) + i, y + barW div 3i1 - i, -(i * 2), 1, Display3.replace)
+        Display3.ReplConst(Q, Display3.FG, x + asr(w, 1) + i, y + h - barW div 3i1 + i, -(i * 2), 1, Display3.replace)
+      end
+
+      DrawKnob(Q, x, Pos(F, x, y + barW, w, h - 2i1 * barW, F.knoblen, F.min_, F.max_, F.val_), w, F.knoblen, true)
+    else
+      DrawKnob(Q, x, Pos(F, x, y, w, h, F.knoblen, F.min_, F.max_, F.val_), w, F.knoblen, true)
+    end
+
+  else
+    // horizontal
+    if hasarrows in F.state0 then
+      // Left button box
+      Display3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y, barW - 1i1, h, 1, Display3.replace)
+      Display3.ReplConst(Q, Display3.FG, x + barW - 1, y, 1, h, Display3.replace)
+      // Right button box
+      Display3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x + w - barW + 1, y, barW - 1i1, h, 1, Display3.replace)
+      Display3.ReplConst(Q, Display3.FG, x + w - barW, y, 1, h, Display3.replace)
+      // Triangles
+      for i := -4 to 1 do
+        Display3.ReplConst(Q, Display3.FG, x + barW div 3i1 - i, y + asr(h, 1) + i, 1, -(i * 2), Display3.replace)
+        Display3.ReplConst(Q, Display3.FG, x + w - barW div 3i1 + i, y + asr(h, 1) + i, 1, -(i * 2), Display3.replace)
+      end
+
+      DrawKnob(Q, Pos(F, x + barW, y, w - 2i1 * barW, h, F.knoblen, F.min_, F.max_, F.val_), y, F.knoblen, h, false)
+    else
+      DrawKnob(Q, Pos(F, x, y, w, h, F.knoblen, F.min_, F.max_, F.val_), y, F.knoblen, h, false)
+    end
+  end
+
+  dec(x)
+  dec(y)
+  inc(w, 2)
+  inc(h, 2)
+
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(Q, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+  end
+end RestoreFrame
+
+procedure P(x: int32): int16
+begin
+  return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+end P
+
+procedure PrintKnob(Q: Display3.Mask; x, y, w, h: int16; vertical: boolean)
+  var
+    m: int16
+begin
+  if vertical then
+    Printer3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y, w, h, P(1), Display3.replace)
+    m := y + asr(h, 1)
+    inc(x, P(2))
+    dec(w, P(4))
+    Printer3.ReplConst(Q, Display3.bottomC, x, m - P(2), w, P(1), Display3.replace)
+    Printer3.ReplConst(Q, Display3.topC, x, m - P(1), w, P(1), Display3.replace)
+    Printer3.ReplConst(Q, Display3.bottomC, x, m + P(1), w, P(1), Display3.replace)
+    Printer3.ReplConst(Q, Display3.topC, x, m + P(2), w, P(1), Display3.replace)
+  else
+    Printer3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y, w, h, P(1), Display3.replace)
+    m := x + asr(w, 1)
+    inc(y, P(2))
+    dec(h, P(4))
+    Printer3.ReplConst(Q, Display3.topC, m - P(2), y, P(1), h, Display3.replace)
+    Printer3.ReplConst(Q, Display3.bottomC, m - P(1), y + 2, P(1), h, Display3.replace)
+    Printer3.ReplConst(Q, Display3.topC, m + P(1), y, P(1), h, Display3.replace)
+    Printer3.ReplConst(Q, Display3.bottomC, m + P(2), y, P(1), h, Display3.replace)
+  end
+end PrintKnob
+
+procedure PrintFrame(F: Frame; M: pointer to Display.DisplayMsg)
+  var
+    Q: Display3.Mask
+    x, y, w, h, barw, knoblen, one, i: int16
+begin
+  Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, @Q)
+  x := M.x
+  y := M.y
+  w := P(F.W)
+  h := P(F.H)
+  barw := P(barW)
+  knoblen := P(F.knoblen)
+  one := P(1)
+  Printer3.FilledRect3D(Q, Display3.bottomC, Display3.topC, F.backC, x, y, w, h, P(1), Display3.replace)
+  inc(x, one)
+  inc(y, one)
+  dec(w, P(2))
+  dec(h, P(2))
+  if F.vertical then
+    if hasarrows in F.state0 then
+      // Down button box
+      Printer3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y, w, barw - one, one, Display3.replace)
+
+      Printer3.ReplConst(Q, Display3.FG, x, y + barw - one, w, one, Display3.replace)
+      // Up button box
+      Printer3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y + h - barw + one, w, barw - one, one, Display3.replace)
+
+      Printer3.ReplConst(Q, Display3.FG, x, y + h - barw, w, one, Display3.replace)
+      // Triangles
+      for i := -P(4) to 1 do
+        Printer3.ReplConst(Q, Display3.FG, x + asr(w, 1) + i, y + obdiv(barw, 3) - i, -(i * 2), 1, Display3.replace)
+        Printer3.ReplConst(Q, Display3.FG, x + asr(w, 1) + i, y + h - obdiv(barw, 3) + i, -(i * 2), 1, Display3.replace)
+      end
+
+      y := Pos(F, x, y + barw, w, h - 2 * barw, knoblen, F.min_, F.max_, F.val_)
+    else
+      y := Pos(F, x, y, w, h, knoblen, F.min_, F.max_, F.val_)
+    end
+
+    PrintKnob(Q, x, y, w, knoblen, true)
+  else
+    if hasarrows in F.state0 then
+      // Left button box
+      Printer3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x, y, barw - one, h, one, Display3.replace)
+
+      Printer3.ReplConst(Q, Display3.FG, x + barw - one, y, one, h, Display3.replace)
+      // Right button box
+      Printer3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x + w - barw + one, y, barw - one, h, one, Display3.replace)
+
+      Printer3.ReplConst(Q, Display3.FG, x + w - barw, y, one, h, Display3.replace)
+      // Triangles
+      for i := -P(4) to 1 do
+        Printer3.ReplConst(Q, Display3.FG, x + obdiv(barw, 3) - i, y + asr(h, 1) + i, 1, -(i * 2), Display3.replace)
+        Printer3.ReplConst(Q, Display3.FG, x + w - obdiv(barw, 3) + i, y + asr(h, 1) + i, 1, -(i * 2), Display3.replace)
+      end
+
+      x := Pos(F, x + barw, y, w - 2 * barw, h, knoblen, F.min_, F.max_, F.val_)
+    else
+      x := Pos(F, x, y, w, h, knoblen, F.min_, F.max_, F.val_)
+    end
+
+    PrintKnob(Q, x, y, knoblen, h, false)
+  end
+end PrintFrame
+
+procedure TrackFrame(F: Frame; x, y, w, h: int16; M: pointer to Oberon.InputMsg)
+  var
+    Q: Display3.Mask
+    keysum: set
+    n: int16
+    pos, npos, dpos, oldpos: int32
+
+  procedure Pushed(x, y, w, h: int16; step: int32; F: pointer to Frame; M: pointer to Oberon.InputMsg; Q: pointer to Display3.Mask; keysum: pointer to set)
+    var
+      pos: int32
+      on, newstate: boolean
+
+    procedure On(M: pointer to Oberon.InputMsg; h: pointer to int16; w: pointer to int16; x: pointer to int16; y: pointer to int16): boolean
+    begin
+      return Effects.Inside(M.X, M.Y, x^, y^, w^, h^)
+    end On
+
+    procedure Highlight(Q: pointer to Display3.Mask; h: pointer to int16; w: pointer to int16; x: pointer to int16; y: pointer to int16)
+    begin
+      Oberon.FadeCursor(@Oberon.Mouse)
+      Display3.ReplConst(Q^, Display.FG, x^, y^, w^, h^, Display.invert)
+    end Highlight
+
+    procedure SetNewValue(F: pointer to Frame; M: pointer to Oberon.InputMsg; pos: pointer to int32; step: pointer to int32)
+    begin
+      if F^.min_ < F^.max_ then
+        inc(pos^, step^)
+        if pos^ < F^.min_ then
+          pos^ := F^.min_
+        elsif pos^ > F^.max_ then
+          pos^ := F^.max_
+        end
+      else
+        dec(pos^, step^)
+        if pos^ > F^.min_ then
+          pos^ := F^.min_
+        elsif pos^ < F^.max_ then
+          pos^ := F^.max_
+        end
+      end
+
+      if F^.val_ # pos^ then
+        SetValueAndUpdate(F^, pos^, M.x, M.y, M.dlink)
+      end
+    end SetNewValue
+  begin
+    Display3.Copy(Q^, Q)
+    on := false
+    pos := F^.val_
+    keysum^ := M.keys
+    mayscroll := Oberon.Time() + HoldTime
+    SetNewValue(F, M, @pos, @step)
+    while M.keys # {} do
+      newstate := On(M, @h, @w, @x, @y)
+      if newstate & TimeOk() then
+        SetNewValue(F, M, @pos, @step)
+      end
+      if newstate # on then
+        on := newstate
+        Highlight(Q, @h, @w, @x, @y)
+      end
+      Input.Mouse(@M.keys, @M.X, @M.Y)
+      keysum^ := keysum^ + M.keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.PointHand, M.X, M.Y)
+    end
+
+    if on then
+      Highlight(Q, @h, @w, @x, @y)
+    end
+  end Pushed
+begin
+  Gadgets.MakeMask(F, x, y, M.dlink, @Q)
+  keysum := M.keys
+  oldpos := F.val_
+  inc(x, 1)
+  inc(y, 1)
+  dec(w, 2)
+  dec(h, 2)
+
+  if (hasarrows in F.state0) & (~F.vertical & ~Effects.Inside(M.X, M.Y, x + barW, y, w - 2i1 * barW, h) or F.vertical & ~Effects.Inside(M.X, M.Y, x, y + barW, w, h - 2i1 * barW)) then
+    // Relative scroll with arrow buttons
+    if F.vertical then
+      if Effects.Inside(M.X, M.Y, x, y, w, barW) then
+        Pushed(x, y, w, barW, -F.step, @F, M, @Q, @keysum) // Down button
+      elsif Effects.Inside(M.X, M.Y, x, y + h - barW, w, barW) then
+        Pushed(x, y + h - barW, w, barW, F.step, @F, M, @Q, @keysum) // Up button
+      end
+
+    else
+      if Effects.Inside(M.X, M.Y, x, y, barW, h) then
+        Pushed(x, y, barW, h, -F.step, @F, M, @Q, @keysum) // Left button
+      elsif Effects.Inside(M.X, M.Y, x + w - barW, y, barW, h) then
+        Pushed(x + w - barW, y, barW, h, F.step, @F, M, @Q, @keysum) // Right button
+      end
+    end
+
+  else
+    // Absolute scroll using knob
+    pos := F.val_
+    dpos := pos
+    if hasarrows in F.state0 then
+      if F.vertical then
+        inc(y, barW)
+        dec(h, 2i1 * barW)
+      else
+        inc(x, barW)
+        dec(w, 2i1 * barW)
+      end
+    end
+
+    if ~(dodrag in F.state0) then
+      if F.vertical then
+        n := Pos(F, x, y, w, h, F.knoblen, F.min_, F.max_, pos)
+        Display3.Rect(Q, Display3.groupC, Display3.selectpat, x, n, w, F.knoblen, 2, Display3.invert)
+      else
+        n := Pos(F, x, y, w, h, F.knoblen, F.min_, F.max_, pos)
+        Display3.Rect(Q, Display3.groupC, Display3.selectpat, n, y, F.knoblen, h, 2, Display3.invert)
+      end
+    end
+
+    repeat
+      npos := Value(F, x, y, w, h, M.X, M.Y, F.min_, F.max_)
+      if npos # pos then
+        // new position
+        Oberon.FadeCursor(@Oberon.Mouse)
+        if ~(dodrag in F.state0) then
+          // draw a drag indicator
+          if F.vertical then
+            Display3.Rect(Q, Display3.groupC, Display3.selectpat, x, n, w, F.knoblen, 2, Display3.invert)
+            n := Pos(F, x, y, w, h, F.knoblen, F.min_, F.max_, npos)
+            Display3.Rect(Q, Display3.groupC, Display3.selectpat, x, n, w, F.knoblen, 2, Display3.invert)
+          else
+            Display3.Rect(Q, Display3.groupC, Display3.selectpat, n, y, F.knoblen, h, 2, Display3.invert)
+            n := Pos(F, x, y, w, h, F.knoblen, F.min_, F.max_, npos)
+            Display3.Rect(Q, Display3.groupC, Display3.selectpat, n, y, F.knoblen, h, 2, Display3.invert)
+          end
+
+        elsif (abs(npos - dpos) > F.step) or (npos = F.min_) or (npos = F.max_) then
+          dpos := npos
+          SetValueAndUpdate(F, npos, M.x, M.y, M.dlink)
+        end
+
+        pos := npos
+      end
+
+      Input.Mouse(@M.keys, @M.X, @M.Y)
+      keysum := keysum + M.keys
+      Oberon.DrawCursor(@Oberon.Mouse, @Effects.FlatHand, M.X, M.Y)
+    until M.keys = {}
+
+    if ~(dodrag in F.state0) then
+      SetValueAndUpdate(F, npos, M.x, M.y, M.dlink)
+    end
+  end
+
+  if keysum = {0,1,2} then
+    SetValueAndUpdate(F, oldpos, M.x, M.y, M.dlink)
+  elsif (keysum = {1}) or Oberon.New & (keysum = {2}) then
+    Gadgets.ExecuteAttr(F, "Cmd", M.dlink, F, nil)
+  end
+end TrackFrame
+
+procedure UpdateFrame(F: Frame; M: pointer to Gadgets.UpdateMsg)
+begin
+  if F.obj # nil then
+    F.obj.handle(F.obj, M)
+  end
+  if F.minO # nil then
+    F.minO.handle(F.minO, M)
+  end
+  if F.maxO # nil then
+    F.maxO.handle(F.maxO, M)
+  end
+  if F.stepO # nil then
+    F.stepO.handle(F.stepO, M)
+  end
+  if M.obj = F.obj then
+    if F.stamp # M.stamp then
+      F.stamp := M.stamp
+      GetValue(F)
+    end
+    SendUpdate(F, M.x, M.y, M.dlink, false)
+  elsif (M.obj = F.minO) or (M.obj = F.maxO) then
+    if F.stamp # M.stamp then
+      F.stamp := M.stamp
+      AdjustKnoblen(F)
+    end
+    SendUpdate(F, M.x, M.y, M.dlink, false)
+  elsif M.obj = F.stepO then
+    if F.stamp # M.stamp then
+      F.stamp := M.stamp
+      Attributes.GetInt(M.obj, "Value", @F.step)
+    end
+
+  else
+    Gadgets.framehandle(F, M)
+  end
+end UpdateFrame
+
+procedure ModifyFrame(F: Frame; M: pointer to Display.ModifyMsg)
+  var
+    O: Display3.OverlapMsg
+begin
+  if F.stamp # M.stamp then
+    F.stamp := M.stamp
+    F.X := M.X
+    F.Y := M.Y
+    F.W := M.W
+    F.H := M.H
+    O.F := F
+    O.M := nil
+    O.x := 0
+    O.y := 0
+    O.res := -1
+    O.dlink := nil
+    F.handle(F, @O)
+    AdjustKnoblen(F)
+  end
+
+  if (M.mode = Display.display) & (F.H > 0) & (F.W > 0) then
+    SendUpdate(F, M.x, M.y, M.dlink, true)
+  end
+end ModifyFrame
+
+procedure CopyFrame*(M: pointer to Objects.CopyMsg; from, to_: Frame)
+begin
+  to_.backC := from.backC
+  to_.knoblen := from.knoblen
+  to_.vertical := from.vertical
+  to_.state0 := from.state0
+  to_.min_ := from.min_
+  to_.max_ := from.max_
+  to_.step := from.step
+  to_.val_ := from.val_
+  // Copy model objects
+  to_.minO := Gadgets.CopyPtr(M, from.minO)
+  to_.maxO := Gadgets.CopyPtr(M, from.maxO)
+  to_.stepO := Gadgets.CopyPtr(M, from.stepO)
+  Gadgets.CopyFrame(M, from, to_)
+end CopyFrame
+
+procedure FrameAttr(F: Frame; M: pointer to Objects.AttrMsg)
+  var
+    msg: Display.ModifyMsg
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "Scrollbars.New", 64)
+      M.res := 0
+    elsif M.name = "Min" then
+      M.class := Objects.Int
+      M.i := F.min_
+      M.res := 0
+    elsif M.name = "Max" then
+      M.class := Objects.Int
+      M.i := F.max_
+      M.res := 0
+    elsif M.name = "StepSize" then
+      M.class := Objects.Int
+      M.i := F.step
+      M.res := 0
+    elsif M.name = "Value" then
+      M.class := Objects.Int
+      M.i := F.val_
+      M.res := 0
+    elsif M.name = "BackColor" then
+      M.class := Objects.Int
+      M.i := F.backC
+      M.res := 0
+    elsif M.name = "Vertical" then
+      M.class := Objects.Bool
+      M.b := F.vertical
+      M.res := 0
+    elsif M.name = "ArrowBoxes" then
+      M.class := Objects.Bool
+      M.b := hasarrows in F.state0
+      M.res := 0
+    elsif M.name = "HeavyDrag" then
+      M.class := Objects.Bool
+      M.b := dodrag in F.state0
+      M.res := 0
+    elsif M.name = "Cmd" then
+      Gadgets.framehandle(F, M)
+      if M.res < 0 then
+        M.class := Objects.String
+        copy(@M.s, "", 64)
+        M.res := 0
+      end
+    elsif M.name = "Field" then
+      Gadgets.framehandle(F, M)
+      if M.res < 0 then
+        M.class := Objects.String
+        copy(@M.s, "", 64)
+        M.res := 0
+      end
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := asr(F.H, 1) - 5
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "BackColor" then
+      if M.class = Objects.Int then
+        F.backC := val(int16, M.i)
+        M.res := 0
+      end
+
+    elsif M.name = "Min" then
+      if M.class = Objects.Int then
+        F.min_ := M.i
+        if F.minO # nil then
+          Attributes.SetInt(F.minO, "Value", F.min_)
+          Gadgets.Update(F.minO)
+        else
+          AdjustKnoblen(F)
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "Max" then
+      if M.class = Objects.Int then
+        F.max_ := M.i
+        if F.maxO # nil then
+          Attributes.SetInt(F.maxO, "Value", F.max_)
+          Gadgets.Update(F.maxO)
+        else
+          AdjustKnoblen(F)
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "StepSize" then
+      if M.class = Objects.Int then
+        F.step := M.i
+        if F.stepO # nil then
+          Attributes.SetInt(F.stepO, "Value", F.step)
+          Gadgets.Update(F.stepO)
+        end
+        M.res := 0
+      end
+
+    elsif M.name = "Value" then
+      if M.class = Objects.Int then
+        SetValue(F, M.i)
+        M.res := 0
+      end
+    elsif M.name = "Vertical" then
+      if M.class = Objects.Bool then
+        if F.vertical # M.b then
+          F.vertical := M.b
+          msg.id := Display.extend
+          msg.mode := Display.display
+          msg.F := F
+          msg.X := F.X
+          msg.W := F.H
+          msg.H := F.W
+          msg.Y := F.Y + F.H - msg.H
+          msg.dX := 0
+          msg.dY := msg.Y - F.Y
+          msg.dW := msg.W - F.W
+          msg.dH := msg.H - F.H
+          msg.res := -1
+          Display.Broadcast(@msg)
+          F.X := msg.X
+          F.Y := msg.Y
+          F.W := msg.W
+          F.H := msg.H
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "ArrowBoxes" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state0 := F.state0 + {hasarrows}
+        else
+          F.state0 := F.state0 - {hasarrows}
+        end
+        AdjustKnoblen(F)
+        M.res := 0
+      end
+
+    elsif M.name = "HeavyDrag" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state0 := F.state0 + {dodrag}
+        else
+          F.state0 := F.state0 - {dodrag}
+        end
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Min")
+    M.Enum("Max")
+    M.Enum("Value")
+    M.Enum("StepSize")
+    M.Enum("BackColor")
+    M.Enum("Field")
+    M.Enum("Cmd")
+    M.Enum("Vertical")
+    M.Enum("ArrowBoxes")
+    M.Enum("HeavyDrag")
+    Gadgets.framehandle(F, M)
+  end
+end FrameAttr
+
+procedure FrameLink(F: Frame; M: pointer to Objects.LinkMsg)
+begin
+  if M.id = Objects.get then
+    if M.name = "Min" then
+      M.obj := F.minO
+      M.res := 0
+    elsif M.name = "Max" then
+      M.obj := F.maxO
+      M.res := 0
+    elsif M.name = "Step" then
+      M.obj := F.stepO
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Min" then
+      F.minO := M.obj
+      AdjustKnoblen(F)
+      M.res := 0
+    elsif M.name = "Max" then
+      F.maxO := M.obj
+      AdjustKnoblen(F)
+      M.res := 0
+    elsif M.name = "Step" then
+      F.stepO := M.obj
+      M.res := 0
+    elsif M.name = "Model" then
+      F.obj := M.obj
+      GetValue(F)
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Min")
+    M.Enum("Max")
+    M.Enum("Step")
+    Gadgets.framehandle(F, M)
+  else
+    Gadgets.framehandle(F, M)
+  end
+end FrameLink
+
+procedure FrameBind(F: Frame; M: pointer to Objects.BindMsg)
+begin
+  Gadgets.framehandle(F, M)
+  if F.stepO # nil then
+    F.stepO.handle(F.stepO, M)
+  end
+  if F.minO # nil then
+    F.minO.handle(F.minO, M)
+  end
+  if F.maxO # nil then
+    F.maxO.handle(F.maxO, M)
+  end
+end FrameBind
+
+procedure FrameFile(F: Frame; M: pointer to Objects.FileMsg)
+  var
+    ver: int32
+begin
+  if M.id = Objects.store then
+    Files.WriteNum(@M.R, VersionNo)
+    Files.WriteLInt(@M.R, F.min_)
+    Files.WriteLInt(@M.R, F.max_)
+    Files.WriteLInt(@M.R, F.step)
+    Files.WriteLInt(@M.R, F.val_)
+    Files.WriteInt(@M.R, F.backC)
+    Files.WriteBool(@M.R, F.vertical)
+    Files.WriteSet(@M.R, F.state0)
+    Gadgets.WriteRef(@M.R, F.lib, F.minO)
+    Gadgets.WriteRef(@M.R, F.lib, F.maxO)
+    Gadgets.WriteRef(@M.R, F.lib, F.stepO)
+    Gadgets.framehandle(F, M)
+  elsif M.id = Objects.load then
+    Files.ReadNum(@M.R, @ver)
+    if ver >= 1 then
+      Files.ReadLInt(@M.R, @F.min_)
+      Files.ReadLInt(@M.R, @F.max_)
+      Files.ReadLInt(@M.R, @F.step)
+      Files.ReadLInt(@M.R, @F.val_)
+      Files.ReadInt(@M.R, @F.backC)
+      Files.ReadBool(@M.R, @F.vertical)
+      Files.ReadSet(@M.R, @F.state0)
+      Gadgets.ReadRef(@M.R, F.lib, @F.minO)
+      Gadgets.ReadRef(@M.R, F.lib, @F.maxO)
+      Gadgets.ReadRef(@M.R, F.lib, @F.stepO)
+    end
+
+    Gadgets.framehandle(F, M)
+  end
+end FrameFile
+
+procedure FrameHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    x, y, w, h: int16
+    F1: Frame
+    Q: Display3.Mask
+begin
+  case F of
+  | Frame:
+    case M of
+    | Display.PFrameMsg:
+      if (M.F = nil) or (M.F = F) then
+        // message addressed to box
+        x := M.x + F.X // calculate display coordinates
+        y := M.y + F.Y
+        w := F.W
+        h := F.H
+        M1 := M
+        case M1 of
+        | Display.PDisplayMsg:
+          if M1.device = Display.screen then
+            if (M1.id = Display.full) or (M1.F = nil) then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+              RestoreFrame(F, Q, x, y, w, h)
+            elsif M1.id = Display.area then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @Q)
+              Display3.AdjustMask(Q, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+              RestoreFrame(F, Q, x, y, w, h)
+            end
+
+          elsif M1.device = Display.printer then
+            PrintFrame(F, M1)
+          end
+
+        | Display.PControlMsg:
+          Gadgets.framehandle(F, M1)
+          if M1.id = Display.restore then
+            AdjustKnoblen(F)
+            GetValue(F)
+            if F.stepO # nil then
+              Attributes.GetInt(F.stepO, "Value", @F.step)
+            end
+          end
+
+        | Oberon.PInputMsg:
+          if (M1.id = Oberon.track) & Gadgets.InActiveArea(F, M1) & ((M1.keys = {1}) or Oberon.New & (M1.keys = {2})) then
+
+            TrackFrame(F, x, y, w, h, M1)
+            M1.res := 0
+          else
+            Gadgets.framehandle(F, M1)
+          end
+
+        | Display.PModifyMsg:
+          ModifyFrame(F, M1(Display.PModifyMsg))
+        | Gadgets.PUpdateMsg:
+          UpdateFrame(F, M1(Gadgets.PUpdateMsg))
+        else
+          Gadgets.framehandle(F, M1)
+        end
+      end
+
+    | Objects.PAttrMsg:
+      FrameAttr(F, M(Objects.PAttrMsg))
+    | Objects.PFileMsg:
+      FrameFile(F, M(Objects.PFileMsg))
+    | Objects.PLinkMsg:
+      FrameLink(F, M(Objects.PLinkMsg))
+    | Objects.PBindMsg:
+      FrameBind(F, M(Objects.PBindMsg))
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F1)
+        F.stamp := M.stamp
+        F.dlink := F1
+        CopyFrame(M, F, F1)
+        M.obj := F1
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end FrameHandler
+
+procedure InitFrame*(F: Frame)
+begin
+  F.handle := FrameHandler
+  F.W := barW
+  F.H := 100
+  F.min_ := 0
+  F.max_ := 100
+  F.step := 1
+  F.val_ := 50
+  F.backC := Display3.textbackC
+  F.vertical := true
+  F.state0 := {hasarrows}
+  AdjustKnoblen(F)
+end InitFrame
+
+procedure New*()
+  var
+    F: Frame
+begin
+  newgc(F)
+  InitFrame(F)
+  Objects.NewObj := F
+end New
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "New" end return New end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Scrollbars", cmd_)
+  WaitTime := 50i2 * Input.TimeUnit div 1000i2
+  HoldTime := 500i2 * Input.TimeUnit div 1000i2
+  mayscroll := Oberon.Time()
+end Scrollbars.

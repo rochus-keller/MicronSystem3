@@ -1,0 +1,562 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Printer [level=5]
+
+import Files, Modules, Fonts, Texts, Input, Display, Oberon, Pictures, Centronics, V24
+// portable, except where noted
+// jm, pjm
+
+(** Module Printer provide an interface for installable printers.
+*)
+
+const
+  Unit300 = 3048 // 300 dpi resolution
+  defaultPrinter = "PSPrinter.Install"
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+
+  Printer* = pointer to PrinterDesc
+  PrinterDesc* = object
+    res*: int16 // Result code for Open method.
+    name*: array 64 of char // Command used for installing the printer.
+    Height*: int16 // Page size (in printer pixels), and available colors (bit depth) *
+    Width*, Depth*, FrameX*: int16 // Printable region of the page.
+    FrameY*, FrameW*, FrameH*: int16
+    Unit*: int32 // Printer resolution in 1/36000 mm per pixel.
+
+    InitMetrics*: procedure(P: Printer)
+    Open*: procedure(P: Printer; const printer: pointer to array of char; const options: pointer to array of char) // Initialize printer & set result code.
+    Close*: procedure(P: Printer) // Stop printing & set result code.
+    Page*: procedure(P: Printer; nofcopies: int16) // End of page reached.
+    ReplConst*: procedure(P: Printer; x: int16; y: int16; w: int16; h: int16) // Block fill.
+    ReplPattern*: procedure(P: Printer; x: int16; y: int16; w: int16; h: int16; patno: int16) // Pattern fill.
+    Line*: procedure(P: Printer; x0: int16; y0: int16; x1: int16; y1: int16) // Line between (x0, y0) and (x1, y1).
+    Circle*: procedure(P: Printer; x0: int16; y0: int16; r: int16)
+    Ellipse*: procedure(P: Printer; x0: int16; y0: int16; a: int16; b: int16)
+    Spline*: procedure(P: Printer; x0: int16; y0: int16; n: int16; open: int16; X: pointer to array of int16; Y: pointer to array of int16)
+    Picture*: procedure(P: Printer; pict: Pictures.Picture; sx: int16; sy: int16; sw: int16; sh: int16; dx: int16; dy: int16; dw: int16; dh: int16; mode: int16)
+    UseListFont*: procedure(P: Printer; const name: pointer to array of char)
+    String*: procedure(P: Printer; x: int16; y: int16; const str: pointer to array of char; fnt: Fonts.Font)
+    ContString*: procedure(P: Printer; const str: pointer to array of char; fnt: Fonts.Font)
+    UseColor*: procedure(P: Printer; red: int16; green: int16; blue: int16)
+    GetMetric*: procedure(P: Printer; fnt: Fonts.Font): Fonts.Font
+  end
+
+  SendProc = procedure(port: int16; ch: char; done: pointer to boolean)
+  SpoolList = pointer to SpoolListDesc
+  SpoolListDesc = record
+    next: SpoolList
+    send: SendProc
+    r: Files.Rider
+    port: int16
+    done: boolean
+    ch: char
+    v24: boolean
+  end
+
+var
+  Height*: int16 // In printer pixels, and bit depth
+  Width*, Depth*, FrameX*: int16 // Printable area.
+  FrameY*, FrameW*, FrameH*: int16
+  Unit*: int32 // Printer resolution in 1/36000 mm per pixel.
+  res*: int16 // result code. 0 = ok, 1 = no such printer, 2 = no link, 3 = printer not ready, 4 = no permission
+  current*: Printer // Current active printer.
+  spool: SpoolList
+  W: Texts.Writer
+  task: Oberon.Task
+  timeslice, spoollength: int32 // view with System.State Printer
+  spoolpos: int32
+  default_: array 64 of char
+
+procedure SplitName(name, MName, PName: pointer to array of char)
+  var
+    i, j: int32
+begin
+  i := 0
+  while name[i] # "." do
+    MName[i] := name[i]
+    inc(i)
+  end
+  MName[i] := 0X
+  inc(i)
+  j := 0
+  while name[i] # 0X do
+    PName[j] := name[i]
+    inc(i)
+    inc(j)
+  end
+  PName[j] := 0X
+end SplitName
+
+procedure LoadDefaultPrinter()
+
+  var
+    S: Texts.Scanner
+    s, defMod, defCmd: array 64 of char
+    Mod: Modules.Module
+    Cmd: Modules.Command
+begin
+  current := nil
+  Oberon.OpenScanner(@S, "Printer.Default")
+  if S.class in {Texts.Name,Texts.String} then
+    copy(@s, @S.s, 64)
+  else
+    copy(@s, defaultPrinter, 64)
+  end
+
+  SplitName(@s, @defMod, @defCmd)
+  Mod := Modules.ThisMod(@defMod)
+  if Modules.res = 0 then
+    Cmd := Modules.ThisCommand(Mod, @defCmd)
+    if Modules.res = 0 then
+      Cmd()
+    end
+
+  else
+    Texts.WriteString(@W, "Printer: ")
+    Texts.WriteString(@W, @S.s)
+    Texts.WriteString(@W, " not found")
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end
+
+  Oberon.OpenScanner(@S, "Printer.DefaultName")
+  if S.class in {Texts.Name,Texts.String} then
+    copy(@default_, @S.s, 64)
+  else
+    copy(@default_, "Temp.Printer.Out", 64)
+  end
+end LoadDefaultPrinter
+
+// Install printer driver. P.InitMetrics is called to initialise the page metrics.
+procedure Install*(P: Printer)
+  var
+    M: Display.ControlMsg
+    N: Oberon.ControlMsg
+begin
+  assert(P # nil)
+  P.InitMetrics(P)
+  Width := P.Width
+  Height := P.Height
+  Depth := P.Depth
+  FrameX := P.FrameX
+  FrameY := P.FrameY
+  FrameW := P.FrameW
+  FrameH := P.FrameH
+  Unit := P.Unit
+  current := P
+  N.id := Oberon.neutralize
+  M.F := nil
+  Display.Broadcast(@N)
+  M.id := Display.newprinter
+  M.F := nil
+  Display.Broadcast(@M)
+  M.id := Display.suspend
+  M.F := nil
+  Display.Broadcast(@M)
+  M.id := Display.restore
+  M.F := nil
+  Display.Broadcast(@M)
+end Install
+
+// Open specified printer.  res code is set.
+procedure Open*(const printer, options: pointer to array of char)
+  var
+    P: Printer
+begin
+  if current = nil then
+    LoadDefaultPrinter() // load driver when printer first used
+  end
+  if current # nil then
+    P := current
+    if printer^ = "Default" then
+      P.Open(P, @default_, options)
+    else
+      P.Open(P, printer, options)
+    end
+
+    res := P.res
+    Width := P.Width
+    Height := P.Height
+    Depth := P.Depth
+    FrameX := P.FrameX
+    FrameY := P.FrameY
+    FrameW := P.FrameW
+    FrameH := P.FrameH
+    Unit := P.Unit
+  else
+    res := 1 // no such printer
+  end
+end Open
+
+procedure Close*()
+  var
+    P: Printer
+begin
+  P := current
+  P.Close(P)
+  res := P.res
+  Width := P.Width
+  Height := P.Height
+  Depth := P.Depth
+  FrameX := P.FrameX
+  FrameY := P.FrameY
+  FrameW := P.FrameW
+  FrameH := P.FrameH
+  Unit := P.Unit
+end Close
+
+procedure Page*(nofcopies: int16)
+begin
+  current.Page(current, nofcopies)
+end Page
+
+procedure ReplConst*(x, y, w, h: int16)
+begin
+  current.ReplConst(current, x, y, w, h)
+end ReplConst
+
+procedure ReplPattern*(x, y, w, h, patno: int16)
+begin
+  current.ReplPattern(current, x, y, w, h, patno)
+end ReplPattern
+
+procedure Line*(x0, y0, x1, y1: int16)
+begin
+  current.Line(current, x0, y0, x1, y1)
+end Line
+
+procedure Circle*(x0, y0, r: int16)
+begin
+  current.Circle(current, x0, y0, r)
+end Circle
+
+procedure Ellipse*(x0, y0, a, b: int16)
+begin
+  current.Ellipse(current, x0, y0, a, b)
+end Ellipse
+
+procedure Spline*(x0, y0, n, open: int16; X, Y: pointer to array of int16)
+begin
+  current.Spline(current, x0, y0, n, open, X, Y)
+end Spline
+
+procedure Picture*(P: Pictures.Picture; sx, sy, sw, sh, dx, dy, dw, dh, mode: int16)
+begin
+  current.Picture(current, P, sx, sy, sw, sh, dx, dy, dw, dh, mode)
+end Picture
+
+procedure UseListFont*(const name: pointer to array of char)
+begin
+  current.UseListFont(current, name)
+end UseListFont
+
+procedure String*(x, y: int16; const str: pointer to array of char; fnt: Fonts.Font)
+begin
+  current.String(current, x, y, str, fnt)
+end String
+
+procedure ContString*(const str: pointer to array of char; fnt: Fonts.Font)
+begin
+  current.ContString(current, str, fnt)
+end ContString
+
+procedure UseColor*(red, green, blue: int16)
+begin
+  current.UseColor(current, red, green, blue)
+end UseColor
+
+procedure GetMetric*(fnt: Fonts.Font): Fonts.Font
+begin
+  if current # nil then
+    return current.GetMetric(current, fnt)
+  else
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end GetMetric
+
+(* System.PrinterCOMn configuration syntax (default 9600,8,n,1)
+config = bps ["," databits ["," parity ["," stopbits]]] .
+bps = <any valid numeric value> .
+databits = "5"|"6"|"7"|"8" .
+parity = "n"|"o"|"e"|"m"|"s" .
+stopbits = "1"|"2" .
+*)
+
+procedure GetConfig(port: int32; bps, data, parity, stop: pointer to int32)
+  var
+    s: Texts.Scanner
+    label: array 32 of char
+    i: int32
+begin
+  bps^ := 9600
+  data^ := 8
+  parity^ := V24.ParNo
+  stop^ := V24.Stop1
+  copy(@label, "Printer.COM#", 32)
+  i := 0
+  while label[i] # 0X do
+    inc(i)
+  end
+  label[i - 1] := chr(val(int32, ord("1")) + port - V24.COM1)
+  Oberon.OpenScanner(@s, @label)
+  if s.class = Texts.Int then
+    bps^ := s.i
+    Texts.Scan(@s)
+    if (s.class = Texts.Char) & (s.c = ",") then
+      Texts.Scan(@s)
+      if s.class = Texts.Int then
+        data^ := s.i
+        Texts.Scan(@s)
+        if (s.class = Texts.Char) & (s.c = ",") then
+          Texts.Scan(@s)
+          if s.class in {Texts.Name,Texts.String} then
+            case chr(band(ord(s.s[0]), 0DFH)) of
+              78:
+              parity^ := V24.ParNo
+            | 79:
+              parity^ := V24.ParOdd
+            | 69:
+              parity^ := V24.ParEven
+            | 77:
+              parity^ := V24.ParMark
+            | 83:
+              parity^ := V24.ParSpace
+            else
+            end
+
+            Texts.Scan(@s)
+            if (s.class = Texts.Char) & (s.c = ",") then
+              Texts.Scan(@s)
+              if s.class = Texts.Int then
+                stop^ := s.i
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end GetConfig
+
+// Spooling
+
+procedure StartJob(n: SpoolList)
+  var
+    err, bps, data, parity, stop: int32
+begin
+  spoollength := Files.Length(Files.Base(@n.r))
+  if n.v24 then
+    GetConfig(n.port, @bps, @data, @parity, @stop)
+    V24.Start(n.port, bps, data, parity, stop, @err)
+    assert(err = 0)
+  else
+    Centronics.Start(n.port)
+  end
+end StartJob
+
+procedure EndJob(n: SpoolList)
+begin
+  spoollength := 0
+  spoolpos := 0
+  if n.v24 then
+    V24.Stop(n.port)
+  else
+    Centronics.Stop(n.port)
+  end
+end EndJob
+
+procedure V24Send(port: int16; ch: char; done: pointer to boolean)
+  var
+    s: set
+    err: int32
+begin
+  V24.GetMC(port, @s)
+  if V24.CTS in s then
+    V24.Send(port, val(byte, ord(ch)), @err)
+    done^ := err = 0
+  else
+    done^ := false
+  end
+end V24Send
+
+procedure Spooler(me: Oberon.Task)
+  var
+    t: int32
+begin
+  t := Input.Time()
+  loop
+    while ~spool.done do
+      spool.send(spool.port, spool.ch, @spool.done)
+      if Input.Time() - t > timeslice then
+        exit // end of timeslice
+      end
+    end
+
+    Files.Read(@spool.r, cast(BytePtr, @spool.ch))
+    inc(spoolpos)
+    if spool.r.eof then
+      EndJob(spool)
+      spool := spool.next
+      if spool = nil then
+        task := nil
+        Oberon.Remove(me)
+        Texts.WriteString(@W, "Printing finished")
+        Texts.WriteLn(@W)
+        Texts.Append(Oberon.Log, W.buf)
+        exit
+      end
+
+      spool.done := true
+      StartJob(spool)
+    else
+      spool.done := false
+    end
+  end
+
+  me.time := t
+end Spooler
+
+procedure Enter(f: Files.File; port: int16; v24: boolean)
+  var
+    p, n: SpoolList
+begin
+  newgc(n)
+  n.next := nil
+  Files.Set(@n.r, f, 0)
+  n.port := port
+  n.done := true
+  n.v24 := v24
+  if v24 then
+    n.send := V24Send
+  else
+    n.send := Centronics.SendPoll
+  end
+  if spool = nil then
+    // idle
+    assert(task = nil)
+    StartJob(n)
+    spool := n
+    newgc(task)
+    task.time := Input.Time()
+    task.safe := false
+    task.handle := Spooler
+    Oberon.Install(task)
+  else
+    // busy
+    assert(task # nil)
+    p := spool
+    while p.next # nil do
+      p := p.next
+    end
+    p.next := n
+  end
+end Enter
+
+// Send file to the local printer specified by its name, or if not a known printer, register the file.  res code is set.
+procedure Spool*(f: Files.File)
+  // non-portable
+  var
+    name: array 64 of char
+    pre: array 6 of char
+    p: int16
+    i, j: int32
+begin
+  Files.GetName(f, @name)
+  i := 0
+  while (name[i] # 0X) & (name[i] # ":") do
+    inc(i)
+  end
+  if name[i] = ":" then
+    j := 0
+    repeat
+      inc(i)
+      name[j] := name[i]
+      inc(j)
+    until name[i] = 0X
+  end
+
+  copy(@pre, @name, 6)
+  pre[3] := 0X
+  if name = "" then
+    res := 0
+  elsif (pre = "LPT") & (name[3] >= "1") & (name[3] <= "3") & (name[4] = 0X) then
+    // centronics
+    case name[3] of
+      31X:
+      p := Centronics.LPT1
+    | 32X:
+      p := Centronics.LPT2
+    | 33X:
+      p := Centronics.LPT3
+    end
+
+    Enter(f, p, false)
+    res := 0
+  elsif (pre = "COM") & (name[3] >= "1") & (name[3] <= "4") & (name[4] = 0X) then
+    // v24
+    case name[3] of
+      31X:
+      p := V24.COM1
+    | 32X:
+      p := V24.COM2
+    | 33X:
+      p := V24.COM3
+    | 34X:
+      p := V24.COM4
+    end
+
+    Enter(f, p, true)
+  else
+    Files.Register(f)
+    res := 0
+  end
+end Spool
+
+procedure Cleanup()
+begin
+  if task # nil then
+    Oberon.Remove(task)
+    task := nil
+    spool := nil
+    Texts.WriteString(@W, "Printing aborted")
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end
+end Cleanup
+
+procedure Init()
+begin
+  Texts.OpenWriter(@W)
+  spool := nil
+  task := nil
+  spoollength := 0
+  spoolpos := 0
+  timeslice := Input.TimeUnit div 50i2
+  // Height := 0; Width := 0;
+  Height := 3508
+  Width := 2480
+  Depth := 24
+  FrameX := 236
+  FrameY := 177
+  FrameW := 2008
+  FrameH := 3154
+  Unit := Unit300 // 300 dpi resolution
+  Modules.InstallTermHandler(Cleanup)
+end Init
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Close" end return Close end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Printer", cmd_)
+  Init()
+end Printer.

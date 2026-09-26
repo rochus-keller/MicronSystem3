@@ -1,0 +1,109 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Out [level=5]
+
+import Texts, Oberon, Modules
+// portable
+// based on module from "Programming in Oberon"
+
+// Simple output routines for writing text into the Oberon log or a seperate viewer.
+
+var
+  T: Texts.Text
+  W: Texts.Writer
+
+// Write character.
+procedure Char*(ch: char)
+begin
+  Texts.Write(@W, ch)
+  Texts.Append(T, W.buf)
+end Char
+
+// Write a string.
+procedure String*(const str: pointer to array of char)
+begin
+  Texts.WriteString(@W, str)
+  Texts.Append(T, W.buf)
+end String
+
+// Write the integer i in n field positions.
+procedure Int*(i, n: int32)
+begin
+  Texts.WriteInt(@W, i, n)
+  Texts.Append(T, W.buf)
+end Int
+
+// Write the integer i in hexadecimal with a leading space.
+procedure Hex*(i: int32)
+begin
+  Texts.WriteHex(@W, i)
+  Texts.Append(T, W.buf)
+end Hex
+
+// Write the real x in n field positions.
+procedure Real*(x: real; n: int16)
+begin
+  Texts.WriteReal(@W, x, n)
+  Texts.Append(T, W.buf)
+end Real
+
+// Write the real x in n field positions in fixed point notation with f fraction digits.
+procedure RealFix*(x: real; n, f: int16)
+begin
+  Texts.WriteRealFix(@W, x, n, f, 0)
+  Texts.Append(T, W.buf)
+end RealFix
+
+// Write the longreal x in n field positions.
+procedure LongReal*(x: longreal; n: int16)
+begin
+  Texts.WriteLongReal(@W, x, n)
+  Texts.Append(T, W.buf)
+end LongReal
+
+// Write the longreal x in n field positions in fixed point notation with f fraction digits.
+procedure LongRealFix*(x: longreal; n, f: int16)
+begin
+  Texts.WriteLongRealFix(@W, x, n, f, 0)
+  Texts.Append(T, W.buf)
+end LongRealFix
+
+// Write a carriage return (CR or end-of-line).
+procedure Ln*()
+begin
+  Texts.WriteLn(@W)
+  Texts.Append(T, W.buf)
+end Ln
+
+// Open a separate viewer for output.
+procedure Open*()
+begin
+  if T = Oberon.Log then
+    newgc(T)
+    Texts.Open(T, "")
+  end
+  Oberon.OpenText("Out.Text", T, 400, 200)
+end Open
+
+// Revert output to the system log.
+procedure Close*()
+begin
+  T := Oberon.Log
+end Close
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Ln" end return Ln end
+  if i = 1 then if name # nil then name^ := "Open" end return Open end
+  if i = 2 then if name # nil then name^ := "Close" end return Close end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Out", cmd_)
+  Texts.OpenWriter(@W)
+  T := Oberon.Log
+end Out.

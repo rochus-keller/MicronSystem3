@@ -1,0 +1,1349 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Styles [level=5]
+
+import Display, Printer, Files, Fonts, Objects, Oberon, Texts, Input, Modules
+
+// portable
+// RS, Wed, 9-Jun-1993
+
+// copy "by hand" -> obj.link
+// other kind of feedback
+// portable write
+
+const
+  Left = "left"
+  Right = "right"
+  Width = "width"
+  Gap = "gap"
+  Break = "break"
+  Adj = "adjust"
+  Tabs = "tabs"
+  Lsp = "line"
+  Grid = "grid"
+
+  Bef = "before"
+  Norm = "normal"
+  Block = "block"
+  Cent = "center"
+
+  left* = 0i1 // format flags
+  right* = 1i1
+  fmode* = 0
+  leftmarg* = 1
+  width* = 2
+  tabs* = 3
+  Adjust* = {left,right}
+  break* = 3 // page break
+  grid* = 2
+
+  get* = 0
+  set_* = 1
+
+  ScnUnit = 10000i2 // Display.Unit
+
+  mm* = 36000i4
+  tenth = mm div 10i4
+  pageW* = 160i4 * mm
+  scnW* = pageW div ScnUnit
+  MinTabW = 3i4 * mm
+  MinTab = 8
+
+  TAB = 9X
+  BoxH = 7
+  BoxW = 8
+  TabW = 5
+  MinW = scnW div 6i4
+  MaxTabs = 32
+  ML = 2
+  MM = 1
+  MR = 0
+  Version = 1X
+
+type
+  AnyPtr = pointer to byte // helper type for Oberon addresses and SYSTEM.PTR
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+  Style* = pointer to StyleDesc
+  StyleDesc* = object (Objects.ObjDesc)
+    opts*: set // opts: {0} = left, {1} = right, {0,1} = adjust, {} = center
+    paraW*: int32 // width of area
+    left*: int32 // left offset
+    lsp*: int32 // line spacing
+    dsr*, gap*: int32 // gap before style
+    nTabs*: int8
+    tab*: array 32 (* MaxTabs *) of int32
+  end
+
+  Frame* = pointer to FrameDesc
+  FrameDesc* = object (Display.FrameDesc)
+
+    style*: Style
+    sel*, col*: int16
+  end
+
+  UpdateMsg* = object (Display.FrameMsg)
+    id*: int16 // 0 = fmode 1 = leftmarg  2 = width 3 = tabs
+    obj*: Style
+    dX*: int16
+  end
+  PUpdateMsg* = pointer to UpdateMsg
+
+  ParamMsg* = object (Objects.ObjMsg)
+    id*: int16 // get, set
+    S*: Texts.Scanner
+    T*: Texts.Text
+  end
+  PParamMsg* = pointer to ParamMsg
+
+  FontList = pointer to FontListDesc
+  FontListDesc = record
+    next: FontList
+    name: Objects.Name
+    mfnt: Fonts.Font
+    unit: int32
+  end
+
+var
+  defStyle*: Style
+  font: FontList
+  W: Texts.Writer
+  // pat, pat2: ARRAY 6 OF CHAR;
+  dash: AnyPtr
+  dash2: AnyPtr
+  nfnt: Fonts.Font
+
+// document coordinate stuff
+
+procedure Screen(x: int32): int16
+begin
+  return val(int16, obdiv(x, ScnUnit))
+end Screen
+
+procedure Doc(x: int16): int32
+begin
+  return val(int32, x) * ScnUnit
+end Doc
+
+// md3 stuff
+
+procedure Uncache(p: FontList)
+begin
+end Uncache
+
+// remove unused & substituted metrics
+(*
+VAR q: FontList; L: Objects.Library;
+BEGIN q := p.next;
+WHILE q # font DO L := Objects.FirstLib;
+WHILE (L # NIL) & (L.name # q.name) DO L := L.next END;
+IF (L = NIL) OR (q.mfnt.type # Objects.metric) THEN p.next := q.next ELSE p := q END;
+q := q.next
+END
+*)
+
+procedure OpenMetricFont(fnt: Fonts.Font; unit: pointer to int32; mfnt: pointer to Fonts.Font)
+begin
+  mfnt^ := Printer.GetMetric(fnt)
+  if mfnt^ = nil then
+    unit^ := ScnUnit
+    mfnt^ := fnt
+  else
+    unit^ := Printer.Unit
+  end
+end OpenMetricFont
+
+procedure MetricFnt*(fnt: Fonts.Font; unit: pointer to int32; mfnt: pointer to Fonts.Font)
+  var
+    p, q: FontList
+begin
+  q := font.next
+  if q.name # fnt.name then
+    // search
+    p := font
+    while (p.next # font) & (p.next.name # fnt.name) do
+      p := p.next
+    end
+    if p.next = font then
+      newgc(q)
+      copy(@q.name, @fnt.name, 32)
+      OpenMetricFont(fnt, @q.unit, @q.mfnt)
+      Uncache(font)
+    else
+      q := p.next
+      p.next := q.next
+    end
+
+    q.next := font.next // first
+    font.next := q
+  end
+
+  mfnt^ := q.mfnt
+  unit^ := q.unit
+end MetricFnt
+
+procedure Tab*(style: Style; fnt: Fonts.Font; x, X: int32; dx: pointer to int16; dX: pointer to int32)
+
+  var
+    t: int16
+    obj: Objects.Object
+    X0, unit: int32
+begin
+  t := 0
+  x := x * ScnUnit // to doc
+  X0 := X
+  if x > X0 then
+    X0 := x
+  end
+  while t < style.nTabs do
+    dX^ := style.tab[t]
+    if dX^ > X0 + MinTabW then
+      dx^ := val(int16, obdiv(dX^ - x, ScnUnit))
+      dX^ := dX^ - X
+      return
+    else
+      inc(t)
+    end
+  end
+
+  fnt.GetObj(fnt, val(int16, ord(TAB)), @obj)
+  dx^ := obj(Fonts.Char).dx
+  MetricFnt(fnt, @unit, @fnt)
+  fnt.GetObj(fnt, val(int16, ord(TAB)), @obj)
+  dX^ := unit * obj(Fonts.Char).dx
+end Tab
+
+procedure Height*(fnt: Fonts.Font; asr_, dsr: pointer to int32)
+  var
+    unit: int32
+begin
+  MetricFnt(fnt, @unit, @fnt)
+  asr_^ := unit * fnt.maxY
+  dsr^ := -(unit * fnt.minY)
+end Height
+
+procedure Similar*(s0, s1: Style): boolean
+  var
+    n: int16
+begin
+  if s0 # s1 then
+    if (s0.opts # s1.opts) or (s0.paraW # s1.paraW) or (s0.left # s1.left) or (s0.nTabs # s1.nTabs) or (s0.lsp # s1.lsp) or (s0.gap # s1.gap) then
+
+      return false
+    elsif s0.nTabs > 0 then
+      n := 0
+      while n < s0.nTabs do
+        if s0.tab[n] # s1.tab[n] then
+          return false
+        end
+        inc(n)
+      end
+    end
+  end
+
+  return true
+end Similar
+
+// old
+
+procedure ReadLong(R: pointer to Files.Rider; x: pointer to int32)
+  var
+    c0, c1, c2: char
+    s1: int8
+begin
+  Files.Read(R, cast(BytePtr, @c0))
+  Files.Read(R, cast(BytePtr, @c1))
+  Files.Read(R, cast(BytePtr, @c2))
+  Files.Read(R, cast(BytePtr, @s1))
+  x^ := s1
+  x^ := ((x^ * 256 + val(int32, val(int16, ord(c2)))) * 256 + val(int32, val(int16, ord(c1)))) * 256 + val(int32, val(int16, ord(c0)))
+end ReadLong
+
+// new
+
+procedure IntToSet(n: int32): set
+  // [0..255]->[{}..{0..7}]
+  var
+    i: int16
+    s: set
+begin
+  i := 0
+  s := {}
+  repeat
+    if ((n mod 2) # 0) then
+      s := s + {i}
+    end
+    n := asr(n, 1)
+    inc(i)
+  until i = 8
+
+  return s
+end IntToSet
+
+procedure SetToInt(s: set): int32
+  // [{}..{0..7}]->[0..255]
+  var
+    i: int16
+    n: int32
+begin
+  i := 8
+  n := 0
+  repeat
+    dec(i)
+    n := n * 2
+    if i in s then
+      inc(n)
+    end
+  until i = 0
+
+  return n
+end SetToInt
+
+procedure WriteData(W: pointer to Files.Rider; style: Style)
+  var
+    i: int16
+begin
+  Files.Write(W, val(byte, ord(0CFX)))
+  Files.Write(W, val(byte, ord(Version)))
+  Files.WriteNum(W, SetToInt(style.opts))
+  Files.WriteNum(W, style.paraW)
+  Files.WriteNum(W, style.left) // left offset
+  Files.WriteNum(W, style.lsp) // line spacing
+  if style.lsp > 0 then
+    Files.WriteNum(W, style.dsr)
+  end
+  Files.WriteNum(W, style.gap)
+  Files.Write(W, val(byte, style.nTabs))
+  i := 0
+  while i < style.nTabs do
+    Files.WriteNum(W, style.tab[i])
+    inc(i)
+  end
+end WriteData
+
+procedure ReadData(R: pointer to Files.Rider; style: Style)
+  var
+    i: int16
+    n: int32
+    x, y: char
+begin
+  Files.Read(R, cast(BytePtr, @y))
+  Files.Read(R, cast(BytePtr, @x))
+  if x = 0X then
+    // old
+    // opts=[y|0|0|0]
+    Files.Read(R, cast(BytePtr, @x)) // skip
+    Files.Read(R, cast(BytePtr, @x))
+    style.opts := IntToSet(val(int32, ord(y)))
+    ReadLong(R, @style.paraW)
+    ReadLong(R, @style.left) // left offset
+    ReadLong(R, @style.lsp) // line spacing
+    ReadLong(R, @style.gap)
+    Files.Read(R, cast(BytePtr, @style.nTabs))
+    i := 0
+    while i < style.nTabs do
+      ReadLong(R, @style.tab[i])
+      inc(i)
+    end
+    while i < MaxTabs do
+      style.tab[i] := 0
+      inc(i)
+    end
+  elsif x = Version then
+    // [CF|1]
+    Files.ReadNum(R, @n)
+    style.opts := IntToSet(n)
+    Files.ReadNum(R, @style.paraW)
+    Files.ReadNum(R, @style.left) // left offset
+    Files.ReadNum(R, @style.lsp) // line spacing
+    if style.lsp > 0 then
+      Files.ReadNum(R, @style.dsr)
+    end
+    Files.ReadNum(R, @style.gap)
+    Files.Read(R, cast(BytePtr, @style.nTabs))
+    i := 0
+    while i < style.nTabs do
+      Files.ReadNum(R, @style.tab[i])
+      inc(i)
+    end
+    while i < MaxTabs do
+      style.tab[i] := 0
+      inc(i)
+    end
+  else
+    halt(99)
+  end
+end ReadData
+
+procedure DrawTab(F: Frame; sel, x, y: int16)
+begin
+  Display.ReplConst(Display.FG - F.col, x - 2, y, 5, 1, Display.invert)
+  Display.ReplConst(Display.FG - F.col, x - 1, y + 1, 3, 1, Display.invert)
+  Display.ReplConst(Display.FG - F.col, x, y + 2, 1, 1, Display.invert)
+  if sel > 0 then
+    Display.ReplConst(Display.FG - F.col, x - 2, y + 1, 5, 2, Display.invert)
+  end
+end DrawTab
+
+procedure DrawMode(F: Frame; opts: set; x, y, w: int16)
+  var
+    h: int16
+begin
+  h := BoxH - BoxH div 2i1 - 1i1
+  inc(y, BoxH div 2i1 + 1i1)
+  if left in opts then
+    Display.ReplConst(Display.FG - F.col, x, y, BoxW, h, Display.invert)
+  else
+    Display.ReplConst(Display.FG - F.col, x, y + h - 1, BoxW, 1, Display.invert)
+  end
+
+  if right in opts then
+    Display.ReplConst(Display.FG - F.col, x + w - BoxW, y, BoxW, h, Display.invert)
+  else
+    Display.ReplConst(Display.FG - F.col, x + w - BoxW, y + h - 1, BoxW, 1, Display.invert)
+  end
+end DrawMode
+
+procedure DrawName(style: Style; x, y, w: int16)
+  var
+    s: array 32 of char
+    obj: Objects.Object
+    i: int16
+begin
+  i := 0
+  s[0] := 0X
+  Objects.GetName(@style.lib.dict, style.ref, @s, 32)
+  if s[0] # 0X then
+    inc(x, w - 100)
+    dec(y, nfnt.minY)
+    while s[i] # 0X do
+      nfnt.GetObj(nfnt, val(int16, ord(s[i])), @obj)
+      case obj of
+      | Fonts.Char:
+        Display.ReplConst(Display.BG, x, y + nfnt.minY, obj.dx, nfnt.height, Display.replace)
+        Display.CopyPattern(Display.FG, obj.pat (* TODO o2m: 'pat' is an address filled by the Oberon linker/loader; Oberon: Display.CopyPattern(Display.FG, obj.pat, x+obj.x, y+obj.y, Display.replace); INC(x, obj.dx) *), x + obj.x, y + obj.y, Display.replace)
+        inc(x, obj.dx)
+      end
+
+      inc(i)
+    end
+  end
+end DrawName
+
+procedure DrawBox(F: Frame; x, y, X, Y, W: int16)
+begin
+  Display.ReplConst(Display.FG, x + F.X + X, y + F.Y + Y, W, BoxH div 2i1, Display.invert)
+end DrawBox
+
+procedure Wide(F: Frame): boolean
+begin
+  return F.W = obdiv(F.style.paraW, ScnUnit)
+end Wide
+
+procedure DrawTabs(F: Frame; x, y: int16)
+  var
+    i, t: int16
+begin
+  inc(x, F.X)
+  inc(y, F.Y)
+  i := 0
+  while i < F.style.nTabs do
+    t := Screen(F.style.tab[i])
+    if (t < F.W) or Wide(F) then
+      DrawTab(F, 0, x + t, y)
+    end
+    inc(i)
+  end
+end DrawTabs
+
+procedure DrawBar(F: Frame; x, y, w: int16)
+  var
+    BoxW: int16
+begin
+  inc(x, F.X)
+  inc(y, F.Y)
+  BoxW := 0
+  Display.ReplConst(F.col, x, y, w, F.H, Display.replace)
+  if F.H = BoxH then
+    if break in F.style.opts then
+      Display.ReplConst(Display.FG, x + BoxW, y + asr(F.H, 1), w - 2 * BoxW, 1, Display.replace)
+    else
+      Display.ReplPattern(Display.FG, dash, x + BoxW, y + asr(F.H, 1), w - 2 * BoxW, 1, Display.paint)
+    end
+
+    DrawMode(F, F.style.opts, x, y, w)
+    DrawName(F.style, x, y, w)
+    DrawTabs(F, x - F.X, y - F.Y)
+  // IF F.sel > 0 THEN Display.ReplConst(Display.FG, x, y , w, F.H, Display.invert) END
+  elsif break in F.style.opts then
+    Display.ReplPattern(Display.FG, dash2, x, y, F.W, 1, Display.paint)
+  end
+end DrawBar
+
+procedure Update(style: Style; what, dX: int16)
+  var
+    M: UpdateMsg
+begin
+  M.obj := style
+  M.dX := dX
+  M.id := what
+  M.F := nil
+  Display.Broadcast(@M)
+end Update
+
+procedure CheckTab(style: Style; i: int16)
+
+  var
+    tab: int32
+    j: int16
+begin
+  tab := style.tab[i]
+  j := i
+  if (j < style.nTabs - 1) & (style.tab[j + 1] <= tab) then
+    while (j < style.nTabs - 1) & (style.tab[j + 1] <= tab) do
+      style.tab[j] := style.tab[j + 1]
+      inc(j)
+    end
+  else
+    while (j > 0) & (style.tab[j - 1] >= tab) do
+      style.tab[j] := style.tab[j - 1]
+      dec(j)
+    end
+  end
+
+  if (j # i) & (style.tab[j] = tab) then
+    // multiple tabs -> delete
+    dec(style.nTabs)
+    while j < style.nTabs do
+      style.tab[j] := style.tab[j + 1]
+      inc(j)
+    end
+  else
+    style.tab[j] := tab
+  end
+
+  while (style.nTabs > 0) & (style.tab[style.nTabs - 1] > style.paraW) do
+    dec(style.nTabs)
+  end
+end CheckTab
+
+procedure FindTab(F: Frame; x: int16; d, t: pointer to int16)
+
+  var
+    tab: int16
+begin
+  t^ := 0
+  d^ := 0
+  while t^ < F.style.nTabs do
+    tab := Screen(F.style.tab[t^])
+    if (tab - 2 <= x) & (x <= tab + 2) then
+      d^ := x - tab
+      return
+    else
+      inc(t^)
+    end
+  end
+end FindTab
+
+procedure TrackMouse(x, y: pointer to int16; keys, keysum: pointer to set)
+begin
+  Input.Mouse(keys, x, y)
+  keysum^ := keysum^ + keys^
+  Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Arrow, x^, y^)
+end TrackMouse
+
+procedure TrackLeft(F: Frame; x, y, X, Y: int16; left: pointer to int16; keysum: pointer to set)
+
+  var
+    d, min_, max_, left0, boxW: int16
+    Keys: set
+begin
+  d := X - F.X - x
+  min_ := -Screen(F.style.left)
+  max_ := val(int16, F.W - MinW)
+  left0 := 0
+  boxW := BoxW
+  left^ := X - d - F.X - x
+  DrawBox(F, x, y, left^, BoxH div 2i1 + 1i1, boxW)
+  keysum^ := {}
+  repeat
+    Input.Mouse(@Keys, @X, @Y)
+    if (ML in Keys) & ~(ML in keysum^) & Wide(F) then
+      // move column
+      max_ := val(int16, scnW - F.W + min_)
+      DrawBox(F, x, y, left0, BoxH div 2i1 + 1i1, boxW)
+      boxW := F.W
+      DrawBox(F, x, y, left^, BoxH div 2i1 + 1i1, boxW)
+    end
+
+    keysum^ := keysum^ + Keys
+    Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Arrow, X, Y)
+    left^ := X - d - F.X - x
+    if left^ < min_ then
+      left^ := min_
+    elsif left^ > max_ then
+      left^ := max_
+    end
+    if left^ # left0 then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      DrawBox(F, x, y, left0, BoxH div 2i1 + 1i1, boxW)
+      DrawBox(F, x, y, left^, BoxH div 2i1 + 1i1, boxW)
+      left0 := left^
+    end
+  until Keys = {}
+
+  DrawBox(F, x, y, left^, BoxH div 2i1 + 1i1, boxW)
+  if (ML in keysum^) & ~Wide(F) then
+    keysum^ := keysum^ - {ML}
+  end
+  Oberon.FadeCursor(@Oberon.Mouse)
+end TrackLeft
+
+procedure TrackRight(F: Frame; x, y, X, Y: int16; w: pointer to int16; keysum: pointer to set)
+
+  var
+    w0, d, max_: int16
+
+    Keys: set
+begin
+  d := X - F.X - x
+  max_ := val(int16, scnW - Screen(F.style.left))
+  w0 := Screen(F.style.paraW)
+  w^ := F.W + X - d - F.X - x
+  DrawBox(F, x, y, w^ - BoxW, BoxH div 2i1 + 1i1, BoxW)
+  keysum^ := {}
+  repeat
+    TrackMouse(@X, @Y, @Keys, keysum)
+    w^ := F.W + X - d - F.X - x
+    if w^ < MinW then
+      w^ := val(int16, MinW)
+    elsif w^ > max_ then
+      w^ := max_
+    end
+    if w^ # w0 then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      DrawBox(F, x, y, w0 - BoxW, BoxH div 2i1 + 1i1, BoxW)
+      DrawBox(F, x, y, w^ - BoxW, BoxH div 2i1 + 1i1, BoxW)
+      w0 := w^
+    end
+  until Keys = {}
+
+  DrawBox(F, x, y, w^ - BoxW, BoxH div 2i1 + 1i1, BoxW)
+  Oberon.FadeCursor(@Oberon.Mouse)
+end TrackRight
+
+//
+procedure LocTab(style: Style; t, x: int16): int16
+  var
+    i, x0: int16
+begin
+  x0 := MinTab
+  i := 0
+  if i = t then
+    inc(i)
+  end
+  while (i < style.nTabs) & (x0 <= x) do
+    if x < Screen(style.tab[i]) - MinTab then
+      return x
+    end
+    repeat
+      x0 := Screen(style.tab[i]) + MinTab
+      inc(i)
+      if i = t then
+        inc(i)
+      end
+    until (i >= style.nTabs) or (x0 < Screen(style.tab[i]) - MinTab)
+  end
+
+  if (style.nTabs > 0) & (x < x0) then
+    return x0
+  else
+    return x
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end LocTab
+
+procedure TrackTab(F: Frame; x, y, X, Y: int16; tabX, t: pointer to int16; keysum: pointer to set)
+
+  var
+    d, tabX0: int16
+    new_: boolean
+    Keys: set
+begin
+  FindTab(F, X - F.X - x, @d, t)
+  keysum^ := {}
+  tabX0 := X - d - F.X - x
+  if t^ < F.style.nTabs then
+    tabX0 := Screen(F.style.tab[t^])
+    DrawTab(F, 0, x + F.X + tabX0, y + F.Y)
+    DrawTab(F, 1, x + F.X + tabX0, y + F.Y)
+  else
+    DrawBox(F, x, y, tabX0 - TabW div 2i1, 0, TabW)
+  end
+
+  repeat
+    TrackMouse(@X, @Y, @Keys, keysum)
+    // tabX := X - d - F.X - x;
+    tabX^ := LocTab(F.style, t^, X - d - F.X - x)
+    if tabX^ > F.W + MinTab then
+      tabX^ := F.W + MinTab
+    elsif tabX^ < MinTab then
+      tabX^ := MinTab
+    end
+
+    if (ML in Keys) & (t^ = F.style.nTabs) & (F.style.nTabs < MaxTabs) then
+      // add a new
+      DrawBox(F, x, y, tabX0 - TabW div 2i1, 0, TabW)
+      DrawTab(F, 1, x + F.X + tabX^, y + F.Y)
+      d := 0
+      tabX0 := tabX^
+      inc(F.style.nTabs)
+      new_ := true
+    end
+
+    if tabX^ # tabX0 then
+      Oberon.FadeCursor(@Oberon.Mouse)
+      if t^ < F.style.nTabs then
+        DrawTab(F, 1, x + F.X + tabX0, y + F.Y)
+        DrawTab(F, 1, x + F.X + tabX^, y + F.Y)
+      else
+        DrawBox(F, x, y, tabX0 - TabW div 2i1, 0, TabW)
+        DrawBox(F, x, y, tabX^ - TabW div 2i1, 0, TabW)
+      end
+
+      tabX0 := tabX^
+    end
+  until Keys = {}
+
+  if t^ < F.style.nTabs then
+    DrawTab(F, 1, x + F.X + tabX^, y + F.Y) // unselect
+    DrawTab(F, 0, x + F.X + tabX^, y + F.Y)
+    if (MR in keysum^) or ~(left in F.style.opts) or (tabX^ >= F.W) & ~Wide(F) then
+      keysum^ := keysum^ + {MR}
+      DrawTab(F, 0, x + F.X + tabX^, y + F.Y) // erase
+      if new_ then
+        dec(F.style.nTabs) // delete
+      else
+        DrawTab(F, 0, x + F.X + Screen(F.style.tab[t^]), y + F.Y) // reset at old pos
+      end
+    end
+
+  else
+    DrawBox(F, x, y, tabX^ - TabW div 2i1, 0, TabW)
+  end
+
+  Oberon.FadeCursor(@Oberon.Mouse)
+end TrackTab
+
+procedure TrackMode(F: Frame; x, y, X, Y: int16; keysum: pointer to set)
+  var
+    x0, y0: int16
+    Keys: set
+begin
+  inc(x, F.X)
+  inc(y, F.Y)
+  if (X - x > BoxW) & (X - x <= asr(F.W, 1)) then
+    x := x + BoxW
+  elsif (x + F.W - X > BoxW) & (x + F.W - X <= asr(F.W, 1)) then
+    x := x + asr(F.W, 1)
+  else
+    keysum^ := keysum^ + {MR} // not hit: do nothing cf. Edit
+    return
+  end
+
+  Display.ReplPattern(Display.FG, Display.grey1, x, y + BoxH div 2i1 + 1, asr(F.W, 1) - BoxW, BoxH div 2i1, 2)
+  keysum^ := {}
+  repeat
+    TrackMouse(@x0, @y0, @Keys, keysum)
+  until Keys = {}
+  Display.ReplPattern(Display.FG, Display.grey1, x, y + BoxH div 2i1 + 1, asr(F.W, 1) - BoxW, BoxH div 2i1, 2)
+end TrackMode
+
+procedure SelStyle*(style: pointer to Style)
+
+  var
+    T: Texts.Text
+    beg, end_, time: int32
+    R: Texts.Reader
+    obj: Objects.Object
+    x: char
+begin
+  Oberon.GetSelection(@T, @beg, @end_, @time)
+  style^ := nil
+  if time >= 0 then
+    Texts.OpenReader(@R, T, beg)
+    Texts.Read(@R, @x)
+    R.lib.GetObj(R.lib, val(int16, ord(x)), @obj)
+    case obj of
+    | Style:
+      style^ := obj(Style)
+    end
+  end
+end SelStyle
+
+procedure Edit(F: Frame; x, y, X, Y: int16; Keys: set; res: pointer to int16)
+
+  var
+    mode, keysum: set
+    leftX, W, tabX, tab, oldleftX, modif: int16
+    style: Style
+begin
+  Oberon.DrawCursor(@Oberon.Mouse, @Oberon.Arrow, X, Y)
+  if Keys = {MM} then
+    if X - F.X - x < BoxW then
+      TrackLeft(F, x, y, X, Y, @leftX, @keysum)
+      if ~(MR in keysum) then
+        oldleftX := Screen(F.style.left)
+        if false then
+          // MM IN keysum
+          // center
+          F.style.left := asr(pageW - F.style.paraW, 1)
+          leftX := Screen(F.style.left)
+        elsif leftX # 0 then
+          inc(F.style.left, Doc(leftX))
+          modif := leftmarg
+          if ~(ML in keysum) then
+            dec(F.style.paraW, Doc(leftX))
+            modif := width
+            DrawTabs(F, x, y)
+            CheckTab(F.style, 0)
+            DrawTabs(F, x, y)
+          end
+        end
+
+        if oldleftX # leftX then
+          Update(F.style, modif, oldleftX - leftX)
+        end
+      end
+
+    elsif x + F.X + F.W - X < BoxW then
+      if Wide(F) then
+        TrackRight(F, x, y, X, Y, @W, @keysum)
+      else
+        repeat
+          TrackMouse(@X, @Y, @Keys, @keysum)
+        until Keys = {}
+        keysum := keysum + {MR}
+      end
+
+      if ~(MR in keysum) & (W # F.W) then
+        F.style.paraW := Doc(W)
+        DrawTabs(F, x, y) // drop tabs
+        CheckTab(F.style, 0)
+        DrawTabs(F, x, y)
+        Update(F.style, width, 0)
+      end
+
+    elsif Y - F.Y - y <= BoxH div 2i1 then
+      TrackTab(F, x, y, X, Y, @tabX, @tab, @keysum)
+      if ~(MR in keysum) then
+        if (F.style.nTabs > 0) & (tab < F.style.nTabs) then
+          F.style.tab[tab] := Doc(tabX)
+          DrawTabs(F, x, y)
+          CheckTab(F.style, tab)
+          DrawTabs(F, x, y)
+          Update(F.style, tabs, 0)
+        end
+      end
+
+    else
+      // mode
+      TrackMode(F, x, y, X, Y, @keysum)
+      if ~(MR in keysum) then
+        mode := F.style.opts
+        if X - F.X - x < asr(F.W, 1) then
+          // left
+          if (left in F.style.opts) & (F.style.nTabs = 0) then
+            F.style.opts := F.style.opts - {left}
+          else
+            F.style.opts := F.style.opts + {left}
+          end
+
+          modif := left
+        elsif x + F.X + F.W - X < asr(F.W, 1) then
+          // right
+          if right in F.style.opts then
+            F.style.opts := F.style.opts - {right}
+          else
+            F.style.opts := F.style.opts + {right}
+          end
+          modif := right
+        end
+
+        if mode # F.style.opts then
+          DrawMode(F, mode, x + F.X, y + F.Y, F.W)
+          DrawMode(F, F.style.opts, x + F.X, y + F.Y, F.W)
+          Update(F.style, fmode, modif)
+        end
+      end
+    end
+
+    res^ := 0
+  elsif Keys = {ML} then
+    repeat
+      TrackMouse(@X, @Y, @Keys, @keysum)
+    until Keys = {}
+    if MR in keysum then
+      // copy attributes to selection
+      res^ := 0
+      if ~(MM in keysum) then
+        SelStyle(@style)
+        if style # nil then
+          // selection exists
+          style.opts := F.style.opts
+          style.paraW := F.style.paraW
+          style.left := F.style.left
+          style.lsp := F.style.lsp
+          style.dsr := F.style.dsr
+          style.gap := F.style.gap
+          style.nTabs := F.style.nTabs
+          style.tab := F.style.tab
+          Update(style, tabs + 1i1, 0)
+        end
+      end
+    end
+
+    res^ := 0
+  end
+end Edit
+
+procedure CopyF(s, d: Frame)
+begin
+  d.handle := s.handle
+  d.lib := s.lib
+  d.ref := s.ref
+  d.next := s.next
+  d.dsc := s.dsc
+  d.slink := s.slink
+  d.X := s.X
+  d.Y := s.Y
+  d.W := s.W
+  d.H := s.H
+  d.style := s.style
+end CopyF
+
+procedure ToLib(lib: Objects.Library; obj: Objects.Object)
+  var
+    ref: int16
+begin
+  if (lib # nil) & (obj.lib = nil) then
+    lib.GenRef(lib, @ref)
+    lib.PutObj(lib, ref, obj)
+  end
+end ToLib
+
+procedure Restore(F: Frame; x, y: int16)
+begin
+  Oberon.RemoveMarks(x + F.X, y + F.Y, F.W, F.H)
+  Display.ReplConst(F.col, x + F.X, y + F.Y, F.W, F.H, 0)
+  DrawBar(F, x, y, F.W)
+end Restore
+
+procedure FHandle(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  // volatile frame never stored/bound etc.
+
+  var
+    M1: Display.PFrameMsg
+    F1: Frame
+    cx, cy, cw, ch, x, y: int16
+begin
+  case F of
+  | Frame:
+    Display.GetClip(@cx, @cy, @cw, @ch)
+    Display.ResetClip()
+    case M of
+    | Display.PFrameMsg:
+      x := M.x
+      y := M.y
+      M1 := M
+      case M1 of
+      | Oberon.PInputMsg:
+        if (M1.id = Oberon.track) & (F.H = BoxH) then
+          Edit(F, x, y, M1.X, M1.Y, M1.keys, @M1.res)
+        end
+
+      | Display.PDisplayMsg:
+        if (F = M1.F) & (M1(Display.PDisplayMsg).device = Display.screen) then
+          Restore(F, x, y)
+        end
+      (*
+      ELSIF M1 IS Display.SelectMsg THEN
+      WITH M1: Display.SelectMsg DO
+      IF M1.id = Display.set THEN F.sel := 1
+      ELSIF M1.id = Display.reset THEN F.sel := 0
+      END
+      END
+      *)
+      | Display.PModifyMsg:
+        if (M1.id = Display.move) & (M1.F = F) & (M1.mode # Display.state) then
+          F.Y := M1.Y
+          F.X := M1.X
+          Restore(F, x, y)
+        end
+
+      | PUpdateMsg:
+        if F.style = M1.obj then
+          Restore(F, x, y)
+        end
+
+      end
+
+    | Objects.PCopyMsg:
+      newgc(F1) // F1^ := F^;
+      CopyF(F, F1)
+      if M.id = Objects.deep then
+        F.style.handle(F.style, M)
+        F1.style := M.obj(Style)
+      end
+      M.obj := F1
+
+    | Objects.PAttrMsg:
+      if M.id = Objects.get then
+        if M.name = "Transparent" then
+          M.b := true
+        end
+      end
+
+    else
+      F.style.handle(F.style, M)
+    end
+
+    Display.SetClip(cx, cy, cw, ch)
+  end
+end FHandle
+
+procedure Copy(s, d: Style)
+begin
+  d.handle := s.handle
+  d.lib := nil
+  d.ref := 0
+  d.opts := s.opts
+  d.paraW := s.paraW
+  d.left := s.left
+  d.lsp := s.lsp
+  d.gap := s.gap
+  d.nTabs := s.nTabs
+  d.tab := s.tab
+end Copy
+
+procedure WTenth(n: int32)
+begin
+  Texts.WriteInt(@W, obdiv(n, tenth), 8)
+end WTenth
+
+procedure Tenth(M: pointer to ParamMsg; max_: int32; n: pointer to int32)
+begin
+  if M.id = get then
+    Texts.WriteInt(@W, obdiv(n^, tenth), 8)
+  else
+    Texts.Scan(@M.S)
+    if M.S.class = Texts.Int then
+      M.S.i := M.S.i * tenth
+      if (0 <= M.S.i) & (M.S.i <= max_) then
+        n^ := M.S.i
+      end
+    end
+  end
+end Tenth
+
+procedure LibMetrics(M: pointer to ParamMsg; height, dsr: pointer to int32)
+  var
+    fnt: Fonts.Font
+begin
+  if M.id = get then
+    Texts.WriteInt(@W, obdiv(height^, tenth), 8)
+  else
+    Texts.Scan(@M.S)
+    height^ := 34i4 * tenth // default
+    dsr^ := asr(height^, 2)
+    if M.S.class = Texts.Int then
+      M.S.i := M.S.i * tenth
+      height^ := M.S.i
+      dsr^ := asr(height^, 2)
+    elsif (M.S.class = Texts.Name) & (M.S.s # "default") then
+      fnt := Fonts.This(@M.S.s)
+      if fnt.type_ = Fonts.font then
+        (*
+        height := LONG(fnt.height)*ScnUnit; (*line height = 1.2*font height*)
+        dsr := -LONG(fnt.minY)*ScnUnit;
+        *)
+        height^ := val(int32, obdiv(6 * fnt.maxY, 5)) * ScnUnit
+        dsr^ := val(int32, obdiv(6 * fnt.height, 5)) * ScnUnit - height^
+        height^ := height^ + dsr^
+      end
+    end
+  end
+end LibMetrics
+
+procedure WString(first: boolean; const s, t: pointer to array of char)
+begin
+  Texts.Write(@W, " ")
+  if first then
+    Texts.WriteString(@W, s)
+  else
+    Texts.WriteString(@W, t)
+  end
+end WString
+
+procedure String(M: pointer to ParamMsg; flag: int16; set_: pointer to set; const s, t: pointer to array of char)
+begin
+  if M.id = get then
+    Texts.Write(@W, " ")
+    if flag in set_^ then
+      Texts.WriteString(@W, s)
+    else
+      Texts.WriteString(@W, t)
+    end
+  else
+    Texts.Scan(@M.S)
+    if M.S.class = Texts.Name then
+      if M.S.s = s^ then
+        set_^ := set_^ + {flag}
+      elsif M.S.s = t^ then
+        set_^ := set_^ - {flag}
+      end
+    end
+  end
+end String
+
+procedure Params(s: Style; M: pointer to ParamMsg)
+
+  var
+    hint, i, dX: int16
+    old, dmy, right: int32
+begin
+  // WHILE M.S.class = Texts.Name DO
+  if M.S.class = Texts.Name then
+    if M.id = get then
+      Texts.WriteString(@W, @M.S.s)
+    end
+    if M.S.s = Left then
+      old := s.left
+      Tenth(M, pageW - s.paraW, @s.left)
+      hint := leftmarg
+      dX := Screen(old - s.left)
+    elsif M.S.s = Width then
+      Tenth(M, pageW, @s.paraW)
+      hint := width
+      dX := 0
+    elsif M.S.s = Right then
+      right := s.left + s.paraW
+      Tenth(M, pageW - s.left, @right)
+      if M.id = set_ then
+        s.paraW := right - s.left
+      end
+      hint := width
+      dX := 0
+    elsif M.S.s = Gap then
+      LibMetrics(M, @s.gap, @dmy)
+      hint := tabs + 1i1
+      dX := 0
+    elsif M.S.s = Lsp then
+      LibMetrics(M, @s.lsp, @s.dsr)
+      hint := tabs + 1i1
+      dX := 0
+    elsif M.S.s = Grid then
+      String(M, grid, @s.opts, "on", "off")
+      hint := tabs + 1i1
+      dX := 0
+    elsif M.S.s = Break then
+      String(M, break, @s.opts, Bef, Norm)
+      hint := -1
+      dX := 0
+    elsif M.S.s = Adj then
+      if M.id = get then
+        if left in s.opts then
+          WString(right in s.opts, Block, Left)
+        else
+          WString(right in s.opts, Right, Cent)
+        end
+
+      else
+        Texts.Scan(@M.S)
+        if M.S.s = Block then
+          s.opts := s.opts + {left}
+          s.opts := s.opts + {right}
+        elsif M.S.s = Left then
+          s.opts := s.opts + {left}
+          s.opts := s.opts - {right}
+        elsif M.S.s = Cent then
+          s.opts := s.opts - {left}
+          s.opts := s.opts - {right}
+        elsif M.S.s = Right then
+          s.opts := s.opts - {left}
+          s.opts := s.opts + {right}
+        end
+      end
+
+      hint := fmode
+      dX := 0
+    elsif M.S.s = Tabs then
+      if M.id = get then
+        i := 0
+        while i < s.nTabs do
+          WTenth(s.tab[i])
+          inc(i)
+        end
+        Texts.WriteString(@W, " ~")
+      else
+        s.nTabs := 0
+        repeat
+          Tenth(M, s.paraW, @s.tab[s.nTabs])
+          inc(s.nTabs)
+        until (M.S.class # Texts.Int) or (s.nTabs = 32)
+
+        dec(s.nTabs)
+        hint := tabs
+        dX := 0
+      end
+
+    elsif M.S.s = "name" then
+      Texts.Scan(@M.S)
+      if M.S.class = Texts.Name then
+        Objects.PutName(@s.lib.dict, s.ref, @M.S.s)
+        hint := -1
+        dX := 0
+      end
+    else
+      Texts.WriteString(@W, " ???")
+    end
+
+    if M.id = get then
+      Texts.WriteLn(@W)
+      Texts.Append(Oberon.Log, W.buf)
+    else
+      Update(s, hint, dX)
+    end
+
+    // Texts.Scan(S)
+  end
+end Params
+
+procedure Handle(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+
+  var
+    ob1: Style
+begin
+  case obj of
+  | Style:
+    case M of
+    | Objects.PCopyMsg:
+      newgc(ob1)
+      Copy(obj, ob1)
+      M.obj := ob1
+
+    | Objects.PBindMsg:
+      ToLib(M.lib, obj)
+
+    | Objects.PFileMsg:
+      if M.id = Objects.load then
+        ReadData(@M.R, obj)
+      else
+        // store
+        WriteData(@M.R, obj)
+      end
+
+    | PParamMsg:
+      Params(obj, M(PParamMsg))
+    | Objects.PAttrMsg:
+      if (M.id = Objects.get) & (M.name = "Gen") then
+        copy(@M.s, "Styles.New", 64)
+      end
+
+    end
+  end
+end Handle
+
+procedure DefStyle(style: Style)
+begin
+  style.opts := {left}
+  style.paraW := pageW
+  style.left := 0
+  style.lsp := 0
+  style.gap := 0
+  style.nTabs := 0
+end DefStyle
+
+procedure NewStyle*(): Objects.Object
+  var
+    S: Style
+begin
+  newgc(S)
+  DefStyle(S)
+  S.handle := Handle
+  return S
+end NewStyle
+
+procedure NewFrame*(style: Style): Display.Frame
+  var
+    F: Frame
+begin
+  newgc(F)
+  F.handle := FHandle
+  F.W := val(int16, scnW)
+  F.H := BoxH
+  F.style := style
+  return F
+end NewFrame
+
+// ------ commands ------
+
+procedure New*()
+begin
+  Objects.NewObj := NewStyle()
+end New
+
+procedure Gimme*()
+begin
+  // compatibility
+  New()
+end Gimme
+
+procedure Init()
+  var
+    obj: Objects.Object
+    img: array 32 of set
+    i: int32
+begin
+  obj := NewStyle()
+  defStyle := obj(Style)
+  img[0] := {0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30} // 055555555H
+  for i := 1 to 31 do
+    img[i] := img[0]
+  end
+
+  dash := Display.NewPattern(32, 32, @img)
+  img[0] := {2,6,10,14,18,22,26,30} // 044444444H
+  for i := 1 to 31 do
+    img[i] := img[0]
+  end
+
+  dash2 := Display.NewPattern(32, 32, @img)
+  (*
+  pat[0] := CHR(32); pat[1] := 1X;
+  pat[2] := 055X; pat[3] := 055X; pat[4] := 055X; pat[5] := 055X;
+  dash := SYSTEM.ADR(pat);
+  pat2[0] := CHR(32); pat2[1] := 1X;
+  pat2[2] := 044X; pat2[3] := 044X; pat2[4] := 044X; pat2[5] := 044X;
+  dash2 := SYSTEM.ADR(pat2)
+  *)
+end Init
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "New" end return New end
+  if i = 1 then if name # nil then name^ := "Gimme" end return Gimme end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Styles", cmd_)
+  Texts.OpenWriter(@W)
+  Init()
+  newgc(font)
+  font.next := font
+  font.name[0] := 0X
+  nfnt := Fonts.This("Default8.Scn.Fnt")
+end Styles.

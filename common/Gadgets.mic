@@ -1,0 +1,2810 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Gadgets [level=5]
+
+import Objects, Display, Display3, Effects, Oberon, Texts, Input, Files, Modules, Printer, Printer3, Attributes, Links, Viewers, Strings
+// portable
+// , jm 18.1.95
+
+(** The Gadgets module forms the basis of the Gadgets system. It defines the most important types, provide default message handlers and often used utility procedures. In addition, a few gadget specific messages are defined.
+*)
+
+(*
+jm 9.2.93 - Attributes for abstract objects
+- object name belongs intrinsically to objects
+- support for non gadget frames removed
+jm 10.2.93 - support for empty object names
+- fixed attributes for abstract objects
+jm 11.2.93 - Display.ControlMsg
+- moved mask messages to Display3
+jm 15.3.93 - Better creation of default clip masks
+jm 16.3.93 - ReadRef bug
+jm 17.3.93 - Add context to executor dlink when executing a command
+jm 23.2.93 - Fixed semantics of Oberon.Par.obj & Oberon.Par.frame
+jm 24.2.93 - Warning thrown out
+jm 24.2.93 - Gadgets.Execute hack
+jm 2.3.93 - Notes removed
+jm 3.3.93 - ExecuteAttr corrected
+jm 10.3.93 - fix version message
+jm 11.3.93 - Call error correction
+7.4.93 - Introduced editing platform code
+8.4.93 - removed edit platform code
+23.7.93 - fixed copy object
+17.09.93 15:09:48 - Find message
+06.01.94 - improved handling of UpdateMsg slightly
+29.3.94 - Broadcast removed
+- Fixed UpArrow macro
+5.4.94 - fixed unnaming of objects in public libraries
+19.4.94 - added aliasing support to Insert, removed aliasing from Attributes.Scanner
+19.4.94 - Improved lookup macro
+20.4.94 - added visible constant
+27.5.94 - improved track highlight in track frame
+29.6.94 - Added alias support to Change*
+14.7.94 - added some more debug tests for invalid masks, most are deactivated now, search for debug
+18.7.94 - changed object naming
+3.11.94 - unchanged change of 18.7.94
+7.11.94 - unchanged change of 18.7.94
+8.11.94 - changed rules in IsLocked
+
+29.11.94
+- removed optimization flags from Gadgets
+- removed nomove, noresize, nodelete, noselect flags from Gadgets
+- renamed lockchildren to locked
+30.11.94
+- added lockedsize (same as noresize before)
+- renamed locked to lockedcontents
+6.12.94 - added GetSelection
+14.12.94 - CopyObject implemented
+15.12.94 - removed col from Gadgets.Frame
+16.12.94 - removed selection bug
+21.12.94 - When no attribute exists on Objects.AttrMsg "get", nothing is returned. Previously
+an empty string was returned.
+3.8.95 - load aliases from the Registry
+6.12.95 - added ClipMask to Gadgets.ViewDesc (thanks ps) (changes the symbol file)
+15.12.95 - CreateObject now uses Modules.resMsg
+8.5.96 - fixed bug in Recursive
+20.5.96 - CreateObject now understands aliases (ps - 20.5.96)
+6.6.96 - changed Execute (light weight)
+19.6.96 - fixed bug in new Execute
+10.7.96 - added deep parameter to GetPublicObject (* ejz - 10.7.96 *)
+4.8.96 - changed printer mask scaling to Printer.Frame
+14.08.96 pjm - fix in UpArrowMacro for selected objects
+18.2.97 - added ModifySize and Consume
+*)
+
+// Priority message id's.
+
+const
+  top* = 0 // Move gadget to the front.
+  bottom* = 1 // Move gadget to the back.
+  visible* = 2 // Move gadget to the front if not completely visible.
+
+  // Gadget Frame states.
+  selected* = 0 // Selected or not.
+  lockedsize* = 2 // Gadget prefers a fixed W, H.
+  transparent* = 4 // Transparent or not.
+  lockedcontents* = 10 // All direct descendants are locked.
+
+  left = 2
+  middle = 1
+  right = 0
+
+// Message broadcast in the display space to indicate that "obj" has changed. Normally used for updating model gadgets, although obj can be a list of gadget frames belonging to the same container. In this case all of the frames are to be displayed. This message is used by the Inspector to indicate that an attribute value has changed.
+
+type
+  BytePtr = pointer to byte // helper type for VAR SYSTEM.BYTE parameters
+
+  UpdateMsg* = object (Display.FrameMsg)
+    obj*: Objects.Object
+  end
+  PUpdateMsg* = pointer to UpdateMsg
+
+  // Message broadcast in the display space to indicate that the destination frame F wants to change its overlapping  priority.
+  PriorityMsg* = object (Display.FrameMsg)
+    id*: int16 // Top, bottom, visible.
+    passon*: boolean // Indication if a whole tree of containers should be changed in priority.
+  end
+  PPriorityMsg* = pointer to PriorityMsg
+
+  CmdMsg* = object (Objects.ObjMsg)
+    cmd*: array 128 of char // Information to be passed, command to be executed; result returned.
+    res*: int16 // result code
+  end
+  PCmdMsg* = pointer to CmdMsg
+
+  // Base type of the Model gadgets
+  Object* = pointer to ObjDesc
+  ObjDesc* = object (Objects.ObjDesc)
+    attr*: Attributes.Attr // Attribute list. Private variable.
+    link*: Links.Link // Link list. Private variable.
+  end
+
+  // Base type of the visual gadgets
+  Frame* = pointer to FrameDesc
+  FrameDesc* = object (Display.FrameDesc)
+    attr*: Attributes.Attr // Attribute list. Private variable.
+    link*: Links.Link // Link list. Private variable.
+    state*: set
+    mask*: Display3.Mask // Cached display mask. Can be NIL to indicate no/invalid mask.
+    obj*: Objects.Object // Model object, if any.
+  end
+
+  // Base type of the camera-view gadgets.
+  View* = pointer to ViewDesc
+  ViewDesc* = object (FrameDesc)
+    absX*: int16 // Absolute screen position at last message forward to descendants.
+    absY*, border*: int16 // Border width for clipping.
+
+    // Install own clipping to display/printer mask here if view has an irregular outline. Otherwise set to NIL.
+    ClipMask*: procedure(v: View; M: Display3.Mask; ondisplay: boolean)
+  end
+
+  // Calculate a mask for gadget G positioned at X, Y in the context dlink.
+  MakeMaskHandler* = procedure(G: Frame; X: int16; Y: int16; dlink: Objects.Object; M: pointer to Display3.Mask)
+
+  RecursiveMsg = object (Display.FrameMsg) end
+  PRecursiveMsg = pointer to RecursiveMsg
+
+  Stack = record
+    Mdlink, Fdlink: Objects.Object
+    absX, absY: int16
+  end
+
+const
+  nameLen = 32
+  valueLen = 64
+
+type
+  Alias = pointer to AliasDesc
+  AliasDesc = record
+    name: array 32 (* nameLen *) of char
+    value: array 64 (* valueLen *) of char
+    next: Alias
+  end
+
+var
+  framehandle*: Objects.Handler // Default message handler for visual gadgets.
+  objecthandle*: Objects.Handler // Default message handler for Model gadgets.
+  MakeMask*: MakeMaskHandler // Calculates the current display mask of a visual gadget.
+  MakePrinterMask*: MakeMaskHandler // Calculates the current printer mask of a visual gadget.
+
+  // The following fields are used for parameter transfer during command execution.
+  context*: Objects.Object // Context/parent of a gadget executing the command
+  executorObj*: Objects.Object // Gadget executing the command. Same as Oberon.Par.obj.
+  senderObj*: Objects.Object // Initiator of a drag and drop operation i.e. the gadget being dropped.
+  receiverObj*: Objects.Object // Receiver of a dropped gadget. Often same as executorObj.
+
+  aliases: Alias
+  par: Oberon.ParList
+  emptyText: Texts.Text
+  W, WW, mW: Texts.Writer
+  recurse, uparrowdone, verbose: boolean
+  pMask: Display3.Mask
+  tmpX, tmpY: int16
+
+// Misc
+
+procedure Log()
+begin
+  Texts.Append(Oberon.Log, W.buf)
+end Log
+
+procedure Push(S: pointer to Stack; F: View; M: pointer to Display.FrameMsg)
+begin
+  // save old variables
+  S.Fdlink := F.dlink
+  S.Mdlink := M.dlink
+  S.absX := F.absX
+  S.absY := F.absY
+  F.dlink := M.dlink
+  M.dlink := F
+end Push
+
+procedure Pop(S: pointer to Stack; F: View; M: pointer to Display.FrameMsg)
+begin
+  M.dlink := S.Mdlink
+  F.dlink := S.Fdlink
+  F.absX := S.absX
+  F.absY := S.absY
+end Pop
+
+// general purpose
+
+// Is the context/parent of the frame F locked ?
+procedure IsLocked*(F: Frame; dlink: Objects.Object): boolean
+  var
+    A: Objects.AttrMsg
+begin
+  if dlink # nil then
+    if dlink is Frame then
+      return lockedcontents in dlink(Frame).state
+    elsif dlink.handle # nil then
+      // not a frame
+      A.id := Objects.get
+      copy(@A.name, "Locked", 32)
+      A.res := -1
+      dlink.handle(dlink, @A)
+      return (A.res >= 0) & (A.class = Objects.Bool) & A.b
+    else
+      return false
+    end
+
+  else
+    return false
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end IsLocked
+
+// Is the mouse located inside the work area of a gadget (i.e. excluding the control areas)?
+procedure InActiveArea*(F: Frame; M: pointer to Oberon.InputMsg): boolean
+  var
+    x, y, w, h: int16
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  w := F.W
+  h := F.H
+  if Effects.Inside(M.X, M.Y, x, y, w, h) & ~(selected in F.state) then
+    if IsLocked(F, M.dlink) then
+      return true
+    elsif Effects.InBorder(M.X, M.Y, x, y, w, h) then
+      return false
+    else
+      return true
+    end
+
+  else
+    return false
+  end
+  return false // TODO o2m: Micron requires a result on all control paths
+end InActiveArea
+
+// Returns the name of of obj. Sends an Objects.AttrMsg behind the scenes.
+procedure GetObjName*(obj: Objects.Object; name: pointer to array of char; name_len: int32)
+begin
+  Attributes.GetString(obj, "Name", name, name_len)
+end GetObjName
+
+// Name object obj. Sends an Objects.AttrMsg behind the scenes.
+procedure NameObj*(obj: Objects.Object; const name: pointer to array of char)
+begin
+  Attributes.SetString(obj, "Name", name)
+end NameObj
+
+// Search for the object "O" in the public library "L.Lib" wherename is specified as "L.O".
+procedure FindPublicObj*(const name: pointer to array of char): Objects.Object
+  // Lib.obj format, assumes .Lib extension
+  var
+    obj: Objects.Object
+    libname, objname: array 64 of char
+    i, j, k, ref: int16
+    lib: Objects.Library
+begin
+  obj := nil
+  i := 0
+  j := 0
+  while (name[i] # ".") & (name[i] # 0X) do
+    libname[j] := name[i]
+    inc(j)
+    inc(i)
+  end
+  if name[i] = 0X then
+    return nil
+  end
+  libname[j] := 0X
+  k := j
+  inc(i)
+  j := 0
+  while (name[i] # " ") & (name[i] # 0X) do
+    objname[j] := name[i]
+    inc(j)
+    inc(i)
+  end
+  objname[j] := 0X
+  libname[k] := "."
+  libname[k + 1] := "L"
+  libname[k + 2] := "i"
+  libname[k + 3] := "b"
+  libname[k + 4] := 0X
+  lib := Objects.ThisLibrary(@libname)
+  if lib # nil then
+    Objects.GetRef(@lib.dict, @objname, @ref)
+    if ref # (-32768) then
+      lib.GetObj(lib, ref, @obj)
+    end
+  end
+
+  return obj
+end FindPublicObj
+
+// Search for object named name in context.
+procedure FindObj*(context: Objects.Object; const name: pointer to array of char): Objects.Object
+  var
+    obj: Objects.Object
+    M: Objects.FindMsg
+begin
+  obj := nil
+  if context # nil then
+    // search by find message
+    M.obj := nil
+    copy(@M.name, name, 32)
+    context.handle(context, @M)
+    obj := M.obj
+  end
+
+  return obj
+end FindObj
+
+// Sets new W and H to (offscreen) frame F.
+procedure ModifySize*(F: Display.Frame; W, H: int16)
+  var
+    M: Display.ModifyMsg
+begin
+  if (F # nil) & ((F.W # W) or (F.H # H)) then
+    M.id := Display.extend
+    M.mode := Display.state
+    M.F := F
+    M.X := F.X
+    M.Y := F.Y + F.H - H
+    M.W := W
+    M.H := H
+    M.dW := W - F.W
+    M.dH := H - F.H
+    M.dX := 0
+    M.dY := -M.dH
+    M.dlink := nil
+    M.x := 0
+    M.y := 0
+    M.res := -1
+    Objects.Stamp(@M)
+    F.handle(F, @M)
+  end
+end ModifySize
+
+// Inserts the frame f into container F at (u, v). (u, v) is relative to upper left corner of F.
+procedure Consume*(F, f: Frame; u, v: int16)
+  var
+    C: Display.ConsumeMsg
+begin
+  if (F # nil) & (f # nil) then
+    f.slink := nil
+    C.id := Display.drop
+    C.F := F
+    C.res := -1
+    C.dlink := nil
+    C.x := 0
+    C.v := 0
+    C.u := u
+    C.v := v
+    C.obj := f
+    F.handle(F, @C)
+  end
+end Consume
+
+// Returns a deep or shallow copy of object obj, depending on parameter deep
+procedure Clone*(obj: Objects.Object; deep: boolean): Objects.Object
+  var
+    C: Objects.CopyMsg
+begin
+  C.obj := nil
+  if obj # nil then
+    if deep then
+      C.id := Objects.deep
+    else
+      C.id := Objects.shallow
+    end
+    Objects.Stamp(@C)
+    C.dlink := nil
+    obj.handle(obj, @C)
+  end
+
+  return C.obj
+end Clone
+
+// --- Recursion checking ---
+
+procedure RecursiveHandler(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+begin
+  if ~(M is Display3.PUpdateMaskMsg) then
+    recurse := true
+  end
+end RecursiveHandler
+
+// Check if a message loop would be created should newchild be inserted in the container parent. Sends a dummy message behind the scenes.
+procedure Recursive*(parent, newchild: Objects.Object): boolean
+  var
+    old: Objects.Handler
+    M: RecursiveMsg
+begin
+  old := parent.handle
+  M.dlink := nil
+  M.F := nil
+  M.x := 0
+  M.y := 0
+  M.res := -1
+  parent.handle := RecursiveHandler
+  recurse := false
+  newchild.handle(newchild, @M)
+  parent.handle := old
+  return recurse
+end Recursive
+
+// Broadcasts an Gadgets.UpdateMsg should obj be a model gadget, or a Display.DisplayMsg if obj is a Display.Frame.
+procedure Update*(obj: Objects.Object)
+  var
+    M: UpdateMsg
+    D: Display.DisplayMsg
+begin
+  case obj of
+  | Display.Frame:
+    D.device := Display.screen
+    D.id := Display.full
+    D.F := obj(Display.Frame)
+    Display.Broadcast(@D)
+  else
+    M.obj := obj
+    M.F := nil
+    Display.Broadcast(@M)
+  end
+end Update
+
+// Make a copy of a pointer to an object. A shallow copy returns a reference to obj. A deep copy results in M being forwarded to obj.
+procedure CopyPtr*(M: pointer to Objects.CopyMsg; obj: Objects.Object): Objects.Object
+begin
+  if obj = nil then
+    return nil
+  else
+    if M.id = Objects.deep then
+      M.obj := nil
+      obj.handle(obj, M)
+      return M.obj
+    else
+      // shallow
+      return obj
+    end
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end CopyPtr
+
+// Copy the record fields belonging to the base gadget type. Copies handle, X, Y, W, H, state, attr and obj.
+procedure CopyFrame*(M: pointer to Objects.CopyMsg; F, F0: Frame)
+begin
+  // F0.slink := NIL; F0.lib := NIL; F0.ref := -1; F0.next := NIL; F0.dsc := NIL;
+  F0.handle := F.handle
+  F0.X := F.X
+  F0.Y := F.Y
+  F0.W := F.W
+  F0.H := F.H
+  F0.state := F.state
+  Attributes.CopyAttributes(F.attr, @F0.attr)
+  Links.CopyLinks(M, F.link, @F0.link)
+  F0.obj := CopyPtr(M, F.obj)
+end CopyFrame
+
+// Copy the record fields belonging to the base Model gadget type. Copies handle and attr.
+procedure CopyObject*(M: pointer to Objects.CopyMsg; obj, obj0: Object)
+begin
+  obj0.handle := obj.handle
+  Attributes.CopyAttributes(obj.attr, @obj0.attr)
+  Links.CopyLinks(M, obj.link, @obj0.link)
+end CopyObject
+
+procedure EmptyHandler(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+begin
+end EmptyHandler
+
+// Default handling of Display.ModifyMsg for visual gadgets. F.mask is invalidated when the frame changes its location or size. Sends behind the scenes to F an Display.OverlapMsg message to invalidate F.mask. Finally, a Display.DisplayMsg is broadcast to update F on the display.
+procedure Adjust*(F: Display.Frame; M: pointer to Display.ModifyMsg)
+  var
+    D: Display.DisplayMsg
+    O: Display3.OverlapMsg
+begin
+  if (F.X # M.X) or (F.Y # M.Y) or (F.W # M.W) or (F.H # M.H) then
+    // first adjust
+    F.X := M.X
+    F.Y := M.Y
+    F.W := M.W
+    F.H := M.H
+
+    case F of
+    | Frame:
+      O.F := F
+      O.M := nil
+      O.x := 0
+      O.y := 0
+      O.res := -1
+      O.dlink := M.dlink
+      F.handle(F, @O)
+    end
+  end
+
+  if (M.mode = Display.display) & (F.H > 0) & (F.W > 0) then
+    D.x := M.x
+    D.y := M.y
+    D.F := F
+    D.device := Display.screen
+    D.id := Display.full
+    D.dlink := M.dlink
+    D.res := -1
+    Objects.Stamp(@D)
+    F.handle(F, @D)
+  end
+end Adjust
+
+// Returns the frame that is located at X, Y on the display. U, v return the relative coordinates of X, Y inside F. Behind the scenes a Display.LocateMsg is broadcast.
+procedure ThisFrame*(X, Y: int16; F: pointer to Display.Frame; u, v: pointer to int16)
+  var
+    M: Display.LocateMsg
+begin
+  M.X := X
+  M.Y := Y
+  M.F := nil
+  M.loc := nil
+  Display.Broadcast(@M)
+  F^ := M.loc
+  u^ := M.u
+  v^ := M.v
+end ThisFrame
+
+// Implements standard resize handling for frames. Rubber-bands the gadget size and broadcasts a Display.ModifyMsg.
+procedure SizeFrame*(F: Display.Frame; M: pointer to Oberon.InputMsg)
+  var
+    x, y, w, h, X, Y: int16
+    keys: set
+    A: Display.ModifyMsg
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  w := F.W
+  h := F.H
+  Input.Mouse(@keys, @X, @Y)
+  Effects.SizeRect(nil, @keys, @X, @Y, @x, @y, @w, @h, nil)
+  if keys # {0,1,2} then
+    A.id := Display.extend
+    A.mode := Display.display
+    A.X := x - M.x
+    A.Y := y - M.y
+    A.W := w
+    A.H := h
+    A.F := F
+    A.dX := A.X - F.X
+    A.dY := A.Y - F.Y
+    A.dW := A.W - F.W
+    A.dH := A.H - F.H
+    Display.Broadcast(@A)
+    M.res := 0
+  else
+    M.res := 1
+  end
+end SizeFrame
+
+// Implements standard move behaviour for frames. Tracks the gadget outline, broadcasts a ConsumeMsg on a copy-over or consume interclick, or broadcast a Display.ModifyMsg for a simple move operation.
+procedure MoveFrame*(F: Display.Frame; M: pointer to Oberon.InputMsg)
+  var
+    x, y, w, h, X, Y, u0, v0: int16
+    keys: set
+    A: Display.ModifyMsg
+    f: Display.Frame
+    C: Display.ConsumeMsg
+    old: Objects.Handler
+    CM: Objects.CopyMsg
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  w := F.W
+  h := F.H
+  Input.Mouse(@keys, @X, @Y)
+  Effects.MoveRect(nil, @keys, @X, @Y, @x, @y, @w, @h)
+  old := F.handle
+  F.handle := EmptyHandler
+  ThisFrame(X, Y, @f, @u0, @v0)
+  F.handle := old
+  if keys = {middle,right} then
+    // copy frame
+    if f # nil then
+      CM.id := Objects.shallow // copy the object
+      Objects.Stamp(@CM)
+      F.handle(F, @CM)
+      CM.obj.slink := nil
+      C.id := Display.drop
+      C.obj := CM.obj
+      C.F := f
+      C.u := u0 + (x - X)
+      C.v := v0 + (y - Y)
+      Display.Broadcast(@C)
+    end
+
+    M.res := 2 // copied
+  elsif keys = {middle,left} then
+    // consume frame
+    if f # nil then
+      // do a consume
+      C.id := Display.drop
+      C.obj := F
+      F.slink := nil
+      C.F := f
+      C.u := u0 + (x - X)
+      C.v := v0 + (y - Y)
+      Display.Broadcast(@C)
+    end
+
+    M.res := 0 // moved
+  elsif (keys = {middle}) or (keys = {left}) then
+    // move frame, left key is a special hack, see docframes
+    A.id := Display.move
+    A.mode := Display.display
+    A.X := x - M.x
+    A.Y := y - M.y
+    A.W := w
+    A.H := h
+    A.F := F
+    A.dX := A.X - F.X
+    A.dY := A.Y - F.Y
+    A.dW := A.W - F.W
+    A.dH := A.H - F.H
+    Display.Broadcast(@A)
+    M.res := 0 // moved
+  else
+    M.res := 1 // cancel
+  end
+
+  // Kernel.GC
+end MoveFrame
+
+// Integrate obj at the caret position. A Display.ConsumeMsg is broadcast behind the scenes.
+procedure Integrate*(obj: Objects.Object)
+  var
+    C: Display.ConsumeMsg
+begin
+  if obj # nil then
+    C.id := Display.integrate
+    C.obj := obj
+    C.F := nil
+    Display.Broadcast(@C)
+  end
+end Integrate
+
+procedure Atom(lib: Objects.Library; const name: pointer to array of char): int16
+  var
+    ref: int16
+begin
+  Objects.GetKey(@lib.dict, name, @ref)
+  return ref
+end Atom
+
+// Write an object POINTER to a file. Lib is the library of the object that contains the pointer.
+procedure WriteRef*(r: pointer to Files.Rider; lib: Objects.Library; obj: Objects.Object)
+begin
+  if obj = nil then
+    Files.WriteInt(r, -1)
+  else
+    if obj.lib # nil then
+      if obj.lib # lib then
+        if obj.lib.name = "" then
+          // private library
+          Files.WriteInt(r, -1)
+          Texts.WriteString(@W, "Warning: Object belonging to private library referenced in ")
+          if lib.name = "" then
+            Texts.WriteString(@W, "(private)")
+          else
+            Texts.WriteString(@W, @lib.name)
+          end
+
+          Texts.WriteLn(@W)
+          Log()
+        else
+          Files.WriteInt(r, obj.ref)
+          Files.WriteInt(r, Atom(lib, @obj.lib.name))
+        end
+
+      else
+        Files.WriteInt(r, obj.ref)
+        Files.WriteInt(r, Atom(lib, "")) // belongs to this library
+      end
+
+      if obj.lib.name # lib.name then
+        if verbose then
+          Texts.WriteString(@W, "Note: ")
+          if lib.name = "" then
+            Texts.WriteString(@W, "(private)")
+          else
+            Texts.WriteString(@W, @lib.name)
+          end
+
+          Texts.WriteString(@W, " imports ")
+          Texts.WriteString(@W, @obj.lib.name)
+          Texts.WriteLn(@W)
+          Log()
+        end
+      end
+
+    else
+      Files.WriteInt(r, -1)
+      if verbose then
+        Texts.WriteString(@W, "Warning: Object without library referenced in ")
+        if lib.name = "" then
+          Texts.WriteString(@W, "(private)")
+        else
+          Texts.WriteString(@W, @lib.name)
+        end
+
+        Texts.WriteLn(@W)
+        Log()
+      end
+    end
+  end
+end WriteRef
+
+// Read an object POINTER from a file. Lib is the library of the object that contains the pointer. Obj might be of type Objects.Dummy if a loading failure occured.
+procedure ReadRef*(r: pointer to Files.Rider; lib: Objects.Library; obj: pointer to Objects.Object)
+  var
+    i, l: int16
+    F: Objects.Library
+    name: array 32 of char
+begin
+  Files.ReadInt(r, @i)
+  if i = -1 then
+    obj^ := nil
+  else
+    Files.ReadInt(r, @l)
+    Objects.GetName(@lib.dict, l, @name, 32)
+    if name[0] = 0X then
+      F := lib
+      copy(@name, @lib.name, 32)
+    else
+      F := Objects.ThisLibrary(@name)
+    end
+    if F # nil then
+      F.GetObj(F, i, obj)
+      if (name # lib.name) & (obj^ # nil) then
+        if verbose then
+          Texts.WriteString(@W, "Note: ")
+          if lib.name = "" then
+            Texts.WriteString(@W, "(private)")
+          else
+            Texts.WriteString(@W, @lib.name)
+          end
+
+          Texts.WriteString(@W, " imports ")
+          Texts.WriteString(@W, @obj^.lib.name)
+          Texts.WriteLn(@W)
+          Log()
+        end
+      end
+
+      if obj^ = nil then
+        Texts.WriteString(@W, "Warning: ")
+        Texts.WriteString(@W, "Object imported from ")
+        Texts.WriteString(@W, @name)
+        Texts.WriteString(@W, " does not exist (NIL pointer)")
+        Texts.WriteLn(@W)
+        Log()
+      end
+
+    else
+      Texts.WriteString(@W, "Warning: ")
+      Texts.WriteString(@W, @name)
+      Texts.WriteString(@W, " not found")
+      Texts.WriteLn(@W)
+      Log()
+      obj^ := nil
+    end
+  end
+end ReadRef
+
+procedure MakeMaskFor(G: Frame)
+  var
+    MM: Display3.UpdateMaskMsg
+    O: Display3.OverlapMsg
+    M: Display3.Mask
+begin
+  MM.F := G
+  Display.Broadcast(@MM)
+  if G.mask = nil then
+    (* good debug test
+    IF ~(dlink IS View) & (dlink IS Frame) THEN HALT(99) END;
+    *)
+    // constructing a dummy mask
+    newgc(M)
+    Display3.Open(M)
+    Display3.Add(M, 0, -G.H + 1, G.W, G.H)
+    M.x := 0
+    M.y := 0
+    O.F := G
+    O.M := M
+    O.dlink := nil
+    O.res := -1
+    O.x := 0
+    O.y := 0
+    G.handle(G, @O)
+    if G.mask = nil then
+      G.mask := M // frame is still misbehaving
+    end
+  end
+end MakeMaskFor
+
+procedure MakeMask0(G: Frame; X, Y: int16; dlink: Objects.Object; M: pointer to Display3.Mask)
+  var
+    ox, oy, x, y, w, h, b, b2: int16
+    R: Display3.Mask
+    v: Objects.Object
+begin
+  if G.mask = nil then
+    // mask has been invalidated
+    MakeMaskFor(G)
+  end
+
+  M^ := G.mask
+  M^.x := X
+  M^.y := Y + G.H - 1
+  // clear the clipping port
+  M^.X := X
+  M^.Y := Y
+  M^.W := G.W
+  M^.H := G.H
+
+  // go through the view stack and modify the mask
+  if dlink # nil then
+    v := dlink
+    while v # nil do
+      if v is View then
+        if v(View).mask = nil then
+          // very bad
+          MakeMaskFor(v(View))
+        end
+
+        ox := v(View).mask.x
+        oy := v(View).mask.y
+        v(View).mask.x := v(View).absX // place mask at absolute position
+        v(View).mask.y := v(View).absY + v(View).H - 1
+        if Display3.Rectangular(v(View).mask, @x, @y, @w, @h) then
+          Display3.AdjustMask(M^, x, y, w, h)
+        elsif Display3.Visible(v(View).mask, X, Y, G.W, G.H) then
+          // frame completely visible
+          Display3.AdjustMask(M^, X, Y, G.W, G.H)
+        else
+          // waste memory because of overlapping
+          Display3.IntersectMasks(M^, v(View).mask, @R)
+          R.X := M^.X // set new port to old port
+          R.Y := M^.Y
+          R.W := M^.W
+          R.H := M^.H
+          M^ := R
+        end
+
+        if v(View).ClipMask # nil then
+          v(View).ClipMask(v(View), M^, true)
+        else
+          b := v(View).border
+          b2 := b * 2
+          Display3.AdjustMask(M^, v(View).absX + b, v(View).absY + b, v(View).W - b2, v(View).H - b2)
+        end
+
+        v(View).mask.x := ox
+        v(View).mask.y := oy
+
+      (*
+      ELSIF (v IS Frame) & (31 IN v(Frame).state) THEN (* from definition these should be position absolutely *)
+      WITH v: Display.Frame DO
+      Display3.AdjustMask(M, v.X, v.Y, v.W, v.H)
+      END
+      *)
+      elsif v is Viewers.Viewer then
+      elsif ~(v is Frame) & (v is Display.Frame) then
+        // from definition these should be position absolutely
+        case v of
+        | Display.Frame:
+          Display3.AdjustMask(M^, v.X, v.Y, v.W, v.H)
+        end
+      end
+
+      v := v.dlink
+    end
+  end
+end MakeMask0
+
+procedure P(x: int16): int16
+begin
+  return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+end P
+
+procedure EnumMakePrinterMask(X, Y, W, H: int16)
+  var
+    R, T, L, B: int16
+begin
+  L := P(X - tmpX) + tmpX
+  B := P(Y - tmpY) + tmpY
+  R := P(X - tmpX + W) + tmpX
+  T := P(Y - tmpY + H) + tmpY
+  Display3.Add(pMask, L, B, R - L, T - B)
+end EnumMakePrinterMask
+
+procedure MakePMask0(G: Frame; X, Y: int16; M: pointer to Display3.Mask)
+  var
+    MM: Display3.UpdateMaskMsg
+begin
+  if G.mask = nil then
+    // mask has been invalidated
+    MM.F := G
+    Display.Broadcast(@MM)
+    if G.mask = nil then
+      // constructing a dummy mask
+      newgc(M^)
+      Display3.Open(M^)
+      Display3.Add(M^, 0, -G.H + 1, G.W, G.H)
+      M^.x := X
+      M^.y := Y + G.H - 1
+      if verbose then
+        Texts.WriteString(@W, "Warning Gadgets.MakeMask: creating a default mask")
+        Texts.WriteLn(@W)
+        Log()
+      end
+
+    else
+      M^ := G.mask
+      M^.x := X
+      M^.y := Y + G.H - 1
+    end
+
+  else
+    M^ := G.mask
+    M^.x := X
+    M^.y := Y + G.H - 1
+  end
+
+  // clear the clipping port
+  M^.X := X
+  M^.Y := Y
+  M^.W := G.W
+  M^.H := G.H
+end MakePMask0
+
+procedure ScaleMask(px, py: int16; in_: Display3.Mask; out: pointer to Display3.Mask)
+begin
+  newgc(pMask)
+  Display3.Open(pMask)
+  tmpX := px
+  tmpY := py
+  Display3.EnumRect(in_, in_.X, in_.Y, in_.W, in_.H, EnumMakePrinterMask)
+  pMask.X := Printer.FrameX
+  pMask.Y := Printer.FrameY
+  pMask.W := Printer.FrameW
+  pMask.H := Printer.FrameH
+  out^ := pMask
+end ScaleMask
+
+procedure MakePrinterMask0(G: Frame; X, Y: int16; dlink: Objects.Object; M: pointer to Display3.Mask)
+  var
+    ox, oy, x, y, w, h, b, b2: int16
+    R, R0: Display3.Mask
+    v: Objects.Object
+begin
+  // make the basic mask
+  MakePMask0(G, X, Y, M)
+
+  // scale it
+  ScaleMask(X, Y, M^, M)
+
+  // add views clipping
+  v := dlink
+  while v # nil do
+    if (v is View) & (v(View).mask # nil) then
+      case v of
+      | View:
+        ox := v.mask.x
+        oy := v.mask.y
+        v.mask.x := v.absX // place mask at absolute position
+        v.mask.y := v.absY + v.H - 1
+        ScaleMask(v.absX, v.absY, v.mask, @R)
+        if Display3.Rectangular(R, @x, @y, @w, @h) then
+          Display3.AdjustMask(M^, x, y, w, h)
+        elsif Display3.Visible(R, X, Y, P(G.W), P(G.H)) then
+          // frame completely visible
+          Display3.AdjustMask(M^, X, Y, P(G.W), P(G.H))
+        else
+          // waste memory because of overlapping
+          Display3.IntersectMasks(M^, R, @R0)
+          R0.X := M^.X // set new port to old port
+          R0.Y := M^.Y
+          R0.W := M^.W
+          R0.H := M^.H
+          M^ := R0
+        end
+
+        if v.ClipMask # nil then
+          v.ClipMask(v, M^, false)
+        else
+          b := v.border
+          b2 := b * 2
+          Display3.AdjustMask(M^, v.absX + P(b), v.absY + P(b), P(v.W - b2), P(v.H - b2))
+        end
+
+        v.mask.x := ox
+        v.mask.y := oy
+      end
+    end
+
+    v := v.dlink
+  end
+end MakePrinterMask0
+
+// Execute a string as an Oberon command. The parameters executor, dlink, sender, receiver are copied to the global variables executorObj, context, senderObj, receiverObj respectively. Dlink must be the parent of executor. If a '%' is leading the command, no Oberon.Par is set up.
+procedure Execute*(const cmd: pointer to array of char; executor, dlink, sender, receiver: Objects.Object)
+  var
+    cmd0: array 512 of char
+    cmd0_i: int32
+    T: Texts.Text
+    S: Attributes.Scanner
+    ch: char
+    res, cx, cy, cw, chl, i, j: int16
+    oldcontext, obj: Objects.Object
+    str: boolean
+begin
+  cmd0_i := 0
+  while (cmd0_i < 511) & (cmd[cmd0_i] # 0X) do cmd0[cmd0_i] := cmd[cmd0_i]; inc(cmd0_i) end
+  cmd0[cmd0_i] := 0X
+  if cmd0[0] = 0X then
+    return
+  end
+  ch := 0X
+  T := nil
+  Display.GetClip(@cx, @cy, @cw, @chl)
+  Display.ResetClip()
+  executorObj := executor
+  context := dlink
+  senderObj := sender
+  receiverObj := receiver
+
+  newgc(par)
+  par.obj := executor
+  // calculate outermost frame in the menuviewer
+  if context = nil then
+    context := executor // may be the outside most frame
+  end
+  obj := context
+  loop
+    if (obj = nil) or (obj.dlink = nil) or (obj.dlink is Viewers.Viewer) then
+      exit
+    end
+    obj := obj.dlink
+  end
+
+  if (obj # nil) & (obj is Display.Frame) then
+    par.frame := obj(Display.Frame)
+  else
+    par.frame := Oberon.Par.frame // hack, otherwise Oberon.Call traps
+  end
+
+  // modified ps - 6.6.96
+  if cmd0[0] = "%" then
+    par.text := emptyText
+    par.pos := 0
+    i := 1
+    while cmd0[i] > " " do
+      cmd0[i - 1] := cmd0[i]
+      inc(i)
+    end
+    cmd0[i - 1] := 0X
+  elsif cmd0[0] = "$" then
+    newgc(par.text)
+    Texts.Open(par.text, "")
+    i := 1
+    while cmd0[i] > " " do
+      Texts.Write(@W, cmd0[i])
+      cmd0[i - 1] := cmd0[i]
+      inc(i)
+    end
+
+    cmd0[i - 1] := 0X
+    par.pos := i - 1
+    while cmd0[i] # 0X do
+      Texts.Write(@W, cmd0[i])
+      inc(i)
+    end
+
+    Texts.Append(par.text, W.buf)
+  else
+    if (41H <= val(int32, band(ord(cmd0[0]), 0DFH))) & (val(int32, band(ord(cmd0[0]), 0DFH)) <= 5AH) then
+      // direct command
+      i := 0
+      while (cmd0[i] # 0X) & (cmd0[i] > " ") do
+        inc(i)
+      end
+      j := i
+      while (cmd0[j] # 0X) & (cmd0[j] <= " ") do
+        inc(j)
+      end
+      if cmd0[j] # 0X then
+        Attributes.StrToTxt(@cmd0, @T)
+        Attributes.OpenScanner(@S, T, 0)
+        Attributes.Scan(@S)
+        Attributes.Read(@S.R, @ch)
+      end
+
+    else
+      // command has to be retrieved by macro handler
+      Attributes.StrToTxt(@cmd0, @T)
+      Attributes.OpenScanner(@S, T, 0)
+      Attributes.Scan(@S)
+      i := 0
+      j := 0
+      while S.s[i] # 0X do
+        cmd0[i] := S.s[i]
+        inc(i)
+      end
+      Attributes.Read(@S.R, @ch)
+      while ~S.R.eot & (ch <= " ") do
+        Attributes.Read(@S.R, @ch)
+      end
+      if S.R.eot then
+        cmd0[i] := 0X
+        j := i
+      end
+    end
+
+    // set up parameter block
+    if cmd0[j] # 0X then
+      str := false
+      while ~S.R.eot & (str or (ch # "~")) do
+        if ch = 22X then
+          S.R.substitute := ~S.R.substitute
+          str := ~str
+        end
+        Texts.Write(@W, ch)
+        Attributes.Read(@S.R, @ch)
+      end
+
+      par.pos := T.len_
+      par.text := T
+      Texts.Append(T, W.buf)
+    else
+      par.text := emptyText
+      par.pos := 0
+    end
+
+    cmd0[i] := 0X
+  end
+
+  if executor # nil then
+    oldcontext := executor.dlink
+    executor.dlink := context
+  end
+
+  Oberon.Call(@cmd0, par, false, @res)
+  if res # 0 then
+    Texts.WriteString(@W, "Call error: ")
+    Texts.WriteString(@W, @Modules.resMsg)
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end
+
+  if par # nil then
+    par.obj := nil
+  end
+  if executor # nil then
+    executor.dlink := oldcontext
+  end
+  Display.SetClip(cx, cy, cw, chl)
+  executorObj := nil
+  context := nil
+  senderObj := nil
+  receiverObj := nil
+  par := nil
+end Execute
+
+// Macros
+
+procedure ReadName(T: pointer to Attributes.Reader; name: pointer to array of char)
+  var
+    ch: char
+    i: int16
+    old: boolean
+
+  procedure Ok(ch: char): boolean
+  begin
+    return (ch = ".") or (ch >= "0") & (ch <= "9") or (val(int32, band(ord(ch), 0DFH)) >= 41H) & (val(int32, band(ord(ch), 0DFH)) <= 5AH)
+  end Ok
+begin
+  i := 0
+  old := T^.substitute
+  T^.substitute := false
+  loop
+    Attributes.Read(T, @ch)
+    if T^.eot then
+      exit
+    end
+    if ~Ok(ch) then
+      exit
+    end
+    name[i] := ch
+    inc(i)
+  end
+
+  name[i] := 0X
+  T^.substitute := old
+end ReadName
+
+// special code for the & macro. && for next higher context etc.
+procedure Lookup0(T: pointer to Attributes.Reader; name: pointer to array of char; context: pointer to Objects.Object)
+  var
+    ch: char
+    i: int16
+    old: boolean
+
+  procedure Ok(ch: char): boolean
+  begin
+    return (ch = ".") or (ch >= "0") & (ch <= "9") or (val(int32, band(ord(ch), 0DFH)) >= 41H) & (val(int32, band(ord(ch), 0DFH)) <= 5AH)
+  end Ok
+begin
+  i := 0
+  old := T^.substitute
+  T^.substitute := false
+  Attributes.Read(T, @ch)
+  while ~T^.eot & (ch = "&") do
+    if (context^ # nil) & (context^.dlink # nil) then
+      context^ := context^.dlink
+    end
+    Attributes.Read(T, @ch)
+  end
+
+  loop
+    if T^.eot then
+      exit
+    end
+    if ~Ok(ch) then
+      exit
+    end
+    name[i] := ch
+    inc(i)
+    Attributes.Read(T, @ch)
+  end
+
+  name[i] := 0X
+  T^.substitute := old
+end Lookup0
+
+procedure ObjAttr(const name: pointer to array of char; context: Objects.Object; W: pointer to Texts.Writer)
+  var
+    name0: array 128 of char
+    name0_i: int32
+    i, j: int16
+    attr: array 32 of char
+    obj: Objects.Object
+begin
+  name0_i := 0
+  while (name0_i < 127) & (name[name0_i] # 0X) do name0[name0_i] := name[name0_i]; inc(name0_i) end
+  name0[name0_i] := 0X
+  if name0 # "" then
+    i := 0
+    while name0[i] # 0X do
+      inc(i)
+    end
+    while (i > 0) & (name0[i] # ".") do
+      dec(i)
+    end
+    if name0[i] = "." then
+      name0[i] := 0X
+      inc(i)
+      j := 0
+      while name0[i] # 0X do
+        attr[j] := name0[i]
+        inc(i)
+        inc(j)
+      end
+      attr[j] := 0X
+      obj := FindObj(context, @name0)
+      if obj # nil then
+        Attributes.WriteAttr(obj, @attr, W)
+      else
+        Texts.WriteLn(@WW)
+        Texts.WriteString(@WW, "Object not found: ")
+        Texts.WriteString(@WW, @name0)
+        Texts.WriteLn(@WW)
+        Texts.Append(Oberon.Log, WW.buf)
+      end
+
+    else
+      Texts.WriteLn(@WW)
+      Texts.WriteString(@WW, "Syntax error: ")
+      Texts.WriteString(@WW, @name0)
+      Texts.WriteLn(@WW)
+      Texts.Append(Oberon.Log, WW.buf)
+    end
+  end
+end ObjAttr
+
+procedure StandardMacros(ch: char; T: pointer to Attributes.Reader; res: pointer to Texts.Text; beg: pointer to int32)
+  var
+    name: array 64 of char
+    f, context0: Objects.Object
+begin
+  if ch # 0X then
+    newgc(res^)
+    Texts.Open(res^, "")
+    beg^ := 0
+    if ch = "&" then
+      context0 := context
+      Lookup0(T, @name, @context0)
+      ObjAttr(@name, context0, @mW)
+      Texts.Append(res^, mW.buf)
+    elsif ch = "#" then
+      ReadName(T, @name)
+      Attributes.WriteAttr(executorObj, @name, @mW)
+      Texts.Append(res^, mW.buf)
+    elsif ch = "!" then
+      // more than one sender
+      if senderObj # nil then
+        ReadName(T, @name)
+        f := senderObj
+        while f # nil do
+          Attributes.WriteAttr(f, @name, @mW)
+          Texts.Write(@mW, " ")
+          f := f.slink
+        end
+
+        Texts.Write(@mW, " ")
+        Texts.Append(res^, mW.buf)
+      end
+
+    elsif ch = "'" then
+      Texts.Write(@mW, 22X)
+      Texts.Append(res^, mW.buf)
+    elsif ch = "?" then
+      // only one recipient
+      ReadName(T, @name)
+      Attributes.WriteAttr(receiverObj, @name, @mW)
+      Texts.Append(res^, mW.buf)
+    end
+  end
+end StandardMacros
+
+procedure UpArrowMacro(ch: char; T: pointer to Attributes.Reader; res: pointer to Texts.Text; beg: pointer to int32)
+  var
+    text, text0: Texts.Text
+    bg, end_, ttime: int32
+    obj: Objects.Object
+    S: Display.SelectMsg
+    i: int16
+    name: array 32 of char
+    R: Attributes.Reader
+    ch0: char
+    old: Objects.Library
+    string: boolean
+begin
+  if ch = 0X then
+    // Reset
+    uparrowdone := false
+  elsif ch = "^" then
+    // getselection
+    if ~uparrowdone then
+      uparrowdone := true
+      Attributes.Read(T, @ch)
+      if (val(int32, band(ord(ch), 0DFH)) >= 41H) & (val(int32, band(ord(ch), 0DFH)) <= 5AH) then
+        // skip word
+        i := 0
+        loop
+          name[i] := ch
+          inc(i)
+          Attributes.Read(T, @ch)
+          if T^.eot then
+            exit
+          end
+          if (ch # ".") & ((ch <= " ") or ((val(int32, band(ord(ch), 0DFH)) < 41H) or (val(int32, band(ord(ch), 0DFH)) > 5AH))) then
+            exit
+          end
+        end
+
+        name[i] := 0X
+      end
+
+      Oberon.GetSelection(@text, @bg, @end_, @ttime)
+      S.id := Display.get
+      S.F := nil
+      S.sel := nil
+      S.obj := nil
+      S.time := -1
+      Display.Broadcast(@S)
+      if (S.time # -1) & (ttime - S.time < 0) & (S.obj # nil) & (name # "") then
+        newgc(text)
+        Texts.Open(text, "")
+        beg^ := 0
+        obj := S.obj
+        while obj # nil do
+          case obj of
+          | Frame:
+            Attributes.WriteAttr(obj, @name, @W)
+            Texts.Write(@W, " ")
+          end
+
+          obj := obj.slink
+        end
+
+        Texts.Append(text, W.buf)
+        res^ := text
+      elsif ttime # -1 then
+        // res := text; beg := bg;
+        Attributes.OpenReader(@R, text, bg)
+        uparrowdone := true
+        beg^ := bg
+        newgc(text0)
+        Texts.Open(text0, "")
+        string := false
+        Attributes.Read(@R, @ch0)
+        while ~R.eot & (beg^ < end_) do
+          if ch0 = 22X then
+            R.substitute := ~R.substitute
+            string := ~string
+          end
+          old := W.lib
+          W.lib := R.lib
+          Texts.Write(@W, ch0)
+          W.lib := old
+          if beg^ + 1 = end_ then
+            // reached the end, ch0 is the last character read
+            if (ch0 # " ") & (ch0 # 0DX) & (ch0 # 9X) then
+              Attributes.Read(@R, @ch0)
+            else
+              ch0 := " " // ended on a termination char
+            end
+
+          else
+            Attributes.Read(@R, @ch0)
+          end
+
+          inc(beg^)
+        end
+
+        while ~R.eot & (string or (ch0 # " ") & (ch0 # 0DX) & (ch0 # 9X)) do
+          if ch0 = 22X then
+            R.substitute := ~R.substitute
+            string := ~string
+          end
+          old := W.lib
+          W.lib := R.lib
+          Texts.Write(@W, ch0)
+          W.lib := old
+          Attributes.Read(@R, @ch0)
+          inc(beg^)
+        end
+
+        Texts.Write(@W, " ")
+        Texts.Append(text0, W.buf)
+        beg^ := 0
+        end_ := text0.len_
+        res^ := text0
+      else
+        res^ := nil
+      end
+
+    else
+      res^ := nil
+      beg^ := 0
+    end
+  end
+end UpArrowMacro
+
+// Forwards a message from a camera-view to its contents, inserting the camera-view in the message thread. X, Y is the absolute screen coordinates of the bottom-left corner of the camera-view. This is important for calculating the correct display mask for the contents of the view.
+procedure Send*(from: View; X, Y: int16; to_: Display.Frame; M: pointer to Display.FrameMsg)
+  var
+    S: Stack
+begin
+  Push(@S, from, M)
+  from.absX := X
+  from.absY := Y
+  to_.handle(to_, M)
+  Pop(@S, from, M)
+end Send
+
+// ---------- leaf handler ----------
+
+procedure HandleFrameAttributes(F: Frame; M: pointer to Objects.AttrMsg)
+  var
+    b: Attributes.BoolAttr
+    c: Attributes.CharAttr
+    i: Attributes.IntAttr
+    r: Attributes.RealAttr
+    s: Attributes.StringAttr
+    a, f: Attributes.Attr
+begin
+  if M.id = Objects.get then
+    a := F.attr
+    while (a # nil) & (a.name # M.name) do
+      a := a.next
+    end
+    if a # nil then
+      case a of
+      | Attributes.BoolAttr:
+        M.class := Objects.Bool
+        M.b := a(Attributes.BoolAttr).b
+      | Attributes.CharAttr:
+        M.class := Objects.Char
+        M.c := a(Attributes.CharAttr).c
+      | Attributes.IntAttr:
+        M.class := Objects.Int
+        M.i := a(Attributes.IntAttr).i
+      | Attributes.RealAttr:
+        M.class := Objects.LongReal
+        M.y := a(Attributes.RealAttr).r
+      | Attributes.StringAttr:
+        M.class := Objects.String
+        copy(@M.s, @a(Attributes.StringAttr).s, 64)
+      else
+        halt(42)
+      end
+
+      M.res := 0
+    elsif M.name = "Gen" then
+      halt(99)
+    elsif (M.name = "Name") & (F.lib # nil) & (F.lib.name # "") then
+      M.s[0] := 0X
+      Objects.GetName(@F.lib.dict, F.ref, @M.s, 64)
+      M.class := Objects.String
+      M.res := 0
+    elsif M.name = "Transparent" then
+      // hidden attributes: special hack/rs wish
+      M.b := transparent in F.state
+      M.class := Objects.Bool
+      M.res := 0
+      (* should return nothing
+      ELSE M.class := Objects.String; M.s[0] := 0X; M.res := 0 (* must be. some gadgets advertize Cmd *)
+      *)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Gen" then
+      halt(99)
+    elsif M.name = "Name" then
+      // & (M.s # "")
+      f := Attributes.FindAttr(@M.name, F.attr) // Search attribute
+      if M.s[0] # 0X then
+        // Insert name
+        if (f = nil) or ~(f is Attributes.StringAttr) then
+          // Does not exist, insert
+          newgc(s)
+          copy(@s.s, @M.s, 64)
+          Attributes.InsertAttr(@F.attr, @M.name, s)
+        else
+          // Does exist, overwrite
+          copy(@f(Attributes.StringAttr).s, @M.s, 64)
+        end
+
+      else
+        // Delete name
+        if f # nil then
+          // Name in list, has to be deleted
+          Attributes.DeleteAttr(@F.attr, "Name")
+        end
+      end
+
+      M.res := 0
+    else
+      a := nil
+      f := Attributes.FindAttr(@M.name, F.attr)
+      if M.class = Objects.Bool then
+        if (f = nil) or ~(f is Attributes.BoolAttr) then
+          newgc(b)
+          b.b := M.b
+          a := b
+        else
+          f(Attributes.BoolAttr).b := M.b
+        end
+
+      elsif M.class = Objects.Char then
+        if (f = nil) or ~(f is Attributes.CharAttr) then
+          newgc(c)
+          c.c := M.c
+          a := c
+        else
+          f(Attributes.CharAttr).c := M.c
+        end
+      elsif M.class = Objects.Int then
+        if (f = nil) or ~(f is Attributes.IntAttr) then
+          newgc(i)
+          i.i := M.i
+          a := i
+        else
+          f(Attributes.IntAttr).i := M.i
+        end
+      elsif M.class = Objects.Real then
+        if (f = nil) or ~(f is Attributes.RealAttr) then
+          newgc(r)
+          r.r := val(longreal, M.x)
+          a := r
+        else
+          f(Attributes.RealAttr).r := val(longreal, M.x)
+        end
+      elsif M.class = Objects.LongReal then
+        if (f = nil) or ~(f is Attributes.RealAttr) then
+          newgc(r)
+          r.r := M.y
+          a := r
+        else
+          f(Attributes.RealAttr).r := M.y
+        end
+      elsif M.class = Objects.String then
+        if (f = nil) or ~(f is Attributes.StringAttr) then
+          newgc(s)
+          copy(@s.s, @M.s, 64)
+          a := s
+        else
+          copy(@f(Attributes.StringAttr).s, @M.s, 64)
+        end
+
+      else
+        return
+      end
+
+      if a # nil then
+        Attributes.InsertAttr(@F.attr, @M.name, a)
+      end
+
+      M.res := 0
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Name")
+    a := F.attr
+    while a # nil do
+      M.Enum(@a.name)
+      a := a.next
+    end
+    M.res := 0
+  end
+end HandleFrameAttributes
+
+procedure HandleObjectAttributes(obj: Object; M: pointer to Objects.AttrMsg)
+  var
+    b: Attributes.BoolAttr
+    c: Attributes.CharAttr
+    i: Attributes.IntAttr
+    r: Attributes.RealAttr
+    s: Attributes.StringAttr
+    a, f: Attributes.Attr
+begin
+  if M.id = Objects.get then
+    a := obj.attr
+    while (a # nil) & (a.name # M.name) do
+      a := a.next
+    end
+    if a # nil then
+      case a of
+      | Attributes.BoolAttr:
+        M.class := Objects.Bool
+        M.b := a(Attributes.BoolAttr).b
+      | Attributes.CharAttr:
+        M.class := Objects.Char
+        M.c := a(Attributes.CharAttr).c
+      | Attributes.IntAttr:
+        M.class := Objects.Int
+        M.i := a(Attributes.IntAttr).i
+      | Attributes.RealAttr:
+        M.class := Objects.LongReal
+        M.y := a(Attributes.RealAttr).r
+      | Attributes.StringAttr:
+        M.class := Objects.String
+        copy(@M.s, @a(Attributes.StringAttr).s, 64)
+      else
+        halt(42)
+      end
+
+      M.res := 0
+    elsif M.name = "Gen" then
+      halt(99)
+    elsif (M.name = "Name") & (obj.lib # nil) & (obj.lib.name # "") then
+      M.s[0] := 0X
+      Objects.GetName(@obj.lib.dict, obj.ref, @M.s, 64)
+      M.class := Objects.String
+      M.res := 0
+    else
+      M.class := Objects.String
+      M.s[0] := 0X
+      M.res := 0
+    end
+  elsif M.id = Objects.set_ then
+    if M.name = "Gen" then
+      halt(99)
+    elsif M.name = "Name" then
+      (*
+      IF (obj.lib # NIL) & (obj.lib.name # "") THEN (* << only insert names in public libraries *)
+      Objects.GetRef(obj.lib.dict, M.s, ref);
+      IF (ref # MIN(INTEGER)) & (ref # obj.ref) THEN
+      Texts.WriteString(W, " overwriting name "); Texts.WriteString(W, M.s); Texts.WriteLn(W); Log
+      END;
+      Objects.PutName(obj.lib.dict, obj.ref, M.s)
+      END;
+      *)
+      f := Attributes.FindAttr(@M.name, obj.attr) // Search attribute
+      if M.s[0] # 0X then
+        // Insert name
+        if (f = nil) or ~(f is Attributes.StringAttr) then
+          // Does not exist, insert
+          newgc(s)
+          copy(@s.s, @M.s, 64)
+          Attributes.InsertAttr(@obj.attr, @M.name, s)
+        else
+          // Does exist, overwrite
+          copy(@f(Attributes.StringAttr).s, @M.s, 64)
+        end
+
+      else
+        // Delete name
+        if f # nil then
+          // Name in list, has to be deleted
+          Attributes.DeleteAttr(@obj.attr, "Name")
+        end
+      end
+
+      M.res := 0
+    else
+      a := nil
+      f := Attributes.FindAttr(@M.name, obj.attr)
+      if M.class = Objects.Bool then
+        if (f = nil) or ~(f is Attributes.BoolAttr) then
+          newgc(b)
+          b.b := M.b
+          a := b
+        else
+          f(Attributes.BoolAttr).b := M.b
+        end
+
+      elsif M.class = Objects.Char then
+        if (f = nil) or ~(f is Attributes.CharAttr) then
+          newgc(c)
+          c.c := M.c
+          a := c
+        else
+          f(Attributes.CharAttr).c := M.c
+        end
+      elsif M.class = Objects.Int then
+        if (f = nil) or ~(f is Attributes.IntAttr) then
+          newgc(i)
+          i.i := M.i
+          a := i
+        else
+          f(Attributes.IntAttr).i := M.i
+        end
+      elsif M.class = Objects.Real then
+        if (f = nil) or ~(f is Attributes.RealAttr) then
+          newgc(r)
+          r.r := val(longreal, M.x)
+          a := r
+        else
+          f(Attributes.RealAttr).r := val(longreal, M.x)
+        end
+      elsif M.class = Objects.LongReal then
+        if (f = nil) or ~(f is Attributes.RealAttr) then
+          newgc(r)
+          r.r := M.y
+          a := r
+        else
+          f(Attributes.RealAttr).r := M.y
+        end
+      elsif M.class = Objects.String then
+        if (f = nil) or ~(f is Attributes.StringAttr) then
+          newgc(s)
+          copy(@s.s, @M.s, 64)
+          a := s
+        else
+          copy(@f(Attributes.StringAttr).s, @M.s, 64)
+        end
+
+      else
+        return
+      end
+
+      if a # nil then
+        Attributes.InsertAttr(@obj.attr, @M.name, a)
+      end
+
+      M.res := 0
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Name")
+    a := obj.attr
+    while a # nil do
+      M.Enum(@a.name)
+      a := a.next
+    end
+    M.res := 0
+  end
+end HandleObjectAttributes
+
+// Bind an object to a library. Nothing happens if obj is already bound to a public library, or is already bound to lib. This is the default behavior when an object received the Objects.BindMsg.
+procedure BindObj*(obj: Objects.Object; lib: Objects.Library)
+  var
+    ref: int16
+begin
+  if lib # nil then
+    if (obj.lib = nil) or (obj.lib.name[0] = 0X) & (obj.lib # lib) then
+      lib.GenRef(lib, @ref)
+      if ref >= 0 then
+        lib.PutObj(lib, ref, obj)
+      end
+    end
+  end
+end BindObj
+
+procedure findobj(obj: Objects.Object; link: Links.Link; M: pointer to Objects.FindMsg)
+  var
+    name: Objects.Name
+begin
+  GetObjName(obj, @name, 32)
+  if name = M.name then
+    M.obj := obj
+  end
+  while (link # nil) & (M.obj = nil) do
+    if link.obj # nil then
+      GetObjName(link.obj, @name, 32)
+      if name = M.name then
+        M.obj := link.obj
+      end
+    end
+
+    link := link.next
+  end
+end findobj
+
+procedure ObjectHandler(obj: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    obj0: Object
+    ch: char
+begin
+  case obj of
+  | Object:
+    case M of
+    | Objects.PFileMsg:
+      if M.id = Objects.load then
+        Files.Read(@M.R, cast(BytePtr, @ch))
+        if (ch = "C") or (ch = "B") then
+          Files.Set(@M.R, Files.Base(@M.R), Files.Pos(@M.R) - 1) // rewind
+          Attributes.LoadAttributes(@M.R, @obj.attr)
+        elsif ch = 80X then
+          Attributes.LoadAttributes(@M.R, @obj.attr)
+          Links.LoadLinks(@M.R, obj.lib, @obj.link)
+        else
+          halt(99)
+        end
+
+      elsif M.id = Objects.store then
+        if obj.link = nil then
+          // no links, use old format for compatibility
+          Attributes.StoreAttributes(@M.R, obj.attr)
+        else
+          Files.Write(@M.R, val(byte, ord(80X))) // version number
+          Attributes.StoreAttributes(@M.R, obj.attr)
+          Links.StoreLinks(@M.R, obj.lib, obj.link)
+        end
+      end
+
+    | Objects.PAttrMsg:
+      HandleObjectAttributes(obj, M)
+
+    | Objects.PBindMsg:
+      BindObj(obj, M.lib)
+      Links.BindLinks(obj.link, M)
+
+    | Objects.PCopyMsg:
+      if M.stamp = obj.stamp then
+        M.obj := obj.dlink
+      else
+        newgc(obj0)
+        obj.stamp := M.stamp
+        obj.dlink := obj0
+        CopyObject(M, obj, obj0)
+        M.obj := obj0
+      end
+
+    | Objects.PLinkMsg:
+      Links.HandleLinkMsg(@obj.link, M)
+
+    | Objects.PFindMsg:
+      findobj(obj, obj.link, M)
+
+    end
+  end
+end ObjectHandler
+
+procedure HasCmdAttr(F: Frame; const attr: pointer to array of char): boolean
+  var
+    A: Objects.AttrMsg
+begin
+  A.id := Objects.get
+  copy(@A.name, attr, 32)
+  A.class := Objects.Inval
+  A.res := -1
+  A.dlink := nil
+  Objects.Stamp(@A)
+  F.handle(F, @A)
+  return (A.res >= 0) & (A.class = Objects.String) & (A.s # "")
+end HasCmdAttr
+
+// Execute the attribute with name attr of F as an Oberon command. Sends a Objects.AttrMsg to retrieve the attribute attr of F. The attributed must be of the string class.
+procedure ExecuteAttr*(F: Frame; const attr: pointer to array of char; dlink, sender, receiver: Objects.Object)
+  var
+    A: Objects.AttrMsg
+begin
+  A.id := Objects.get
+  copy(@A.name, attr, 32)
+  A.class := Objects.Inval
+  A.res := -1
+  A.dlink := nil
+  Objects.Stamp(@A)
+  F.handle(F, @A)
+  if (A.res >= 0) & (A.class = Objects.String) & (A.s # "") then
+    Execute(@A.s, F, dlink, sender, receiver)
+  end
+end ExecuteAttr
+
+// Standard mouse tracking behavior of visual gadgets. Calls ExecuteAttr for the "Cmd" attribute, calls MoveFrame and SizeFrame.
+procedure TrackFrame*(F: Display.Frame; M: pointer to Oberon.InputMsg)
+  var
+    keys: set
+    x, y, w, h: int16
+    R: Display3.Mask
+begin
+  case F of
+  | Frame:
+    if ~(selected in F.state) & ((middle in M.keys) or Oberon.New & (left in M.keys)) then
+      // only when not selected and middle key
+      x := M.x + F.X
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      if InActiveArea(F, M) then
+        // usable areas, corner, sides may be part, TRUE if locked
+        if HasCmdAttr(F, "Cmd") then
+          MakeMask(F, x, y, M.dlink, @R)
+          Effects.TrackHighlight(R, @keys, @M.X, @M.Y, x, y, w, h)
+          if InActiveArea(F, M) & ((keys = {1}) or Oberon.New & (keys = {2})) then
+            ExecuteAttr(F(Frame), "Cmd", M.dlink, nil, nil)
+          end
+
+          M.res := 0
+        elsif ~IsLocked(F, M.dlink) then
+          MoveFrame(F, M)
+        end
+
+      elsif Effects.InCorner(M.X, M.Y, x, y, w, h) & ~(lockedsize in F.state) then
+        SizeFrame(F, M)
+      elsif Effects.InBorder(M.X, M.Y, x, y, w, h) or Effects.InCorner(M.X, M.Y, x, y, w, h) then
+        MoveFrame(F, M)
+      end
+    end
+  end
+end TrackFrame
+
+procedure FrameHandler(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    F0: Frame
+    x, y, w, h, u, v: int16
+    D: Display.DisplayMsg
+    M1: Display.PFrameMsg
+    R: Display3.Mask
+    obj: Objects.Object
+    name: array 64 of char
+begin
+  case F of
+  | Frame:
+    case M of
+    | Objects.PFileMsg:
+      if M.id = Objects.load then
+        Files.ReadInt(@M.R, @F.X)
+        Files.ReadInt(@M.R, @F.Y)
+        Files.ReadInt(@M.R, @F.W)
+        Files.ReadInt(@M.R, @F.H)
+        ReadRef(@M.R, F.lib, @obj) // dummy next pointer
+        Files.ReadSet(@M.R, @F.state)
+        Files.ReadInt(@M.R, @x) // dummy
+        if x # 8367 then
+        // old version
+        else
+          // x = 2 version with links
+          Links.LoadLinks(@M.R, F.lib, @F.link)
+        end
+
+        ReadRef(@M.R, F.lib, @F.obj)
+        Attributes.LoadAttributes(@M.R, @F.attr)
+        // hack
+        Objects.GetName(@F.lib.dict, F.ref, @name, 64)
+        if name[0] # 0X then
+          NameObj(F, @name)
+        end
+      elsif M.id = Objects.store then
+        Files.WriteInt(@M.R, F.X)
+        Files.WriteInt(@M.R, F.Y)
+        Files.WriteInt(@M.R, F.W)
+        Files.WriteInt(@M.R, F.H)
+        WriteRef(@M.R, F.lib, nil) // not really needed
+        Files.WriteSet(@M.R, F.state)
+        if F.link = nil then
+          Files.WriteInt(@M.R, 1) // write old version
+        else
+          Files.WriteInt(@M.R, 8367)
+          Links.StoreLinks(@M.R, F.lib, F.link)
+        end
+
+        WriteRef(@M.R, F.lib, F.obj)
+        Attributes.StoreAttributes(@M.R, F.attr)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F0)
+        F.stamp := M.stamp
+        F.dlink := F0
+        CopyFrame(M, F, F0)
+        M.obj := F0
+      end
+
+    | Objects.PBindMsg:
+      BindObj(F, M.lib)
+      if F.obj # nil then
+        F.obj.handle(F.obj, M)
+      end
+      Links.BindLinks(F.link, M)
+
+    | Objects.PAttrMsg:
+      HandleFrameAttributes(F, M)
+
+    | Objects.PLinkMsg:
+      if (M.id = Objects.get) & (M.name = "Model") then
+        M.obj := F.obj
+        M.res := 0
+      elsif (M.id = Objects.set_) & (M.name = "Model") then
+        F.obj := M.obj
+        M.res := 0
+      elsif M.id = Objects.enum then
+        M.Enum("Model")
+        Links.HandleLinkMsg(@F.link, M)
+      else
+        Links.HandleLinkMsg(@F.link, M)
+      end
+
+    | Objects.PFindMsg:
+      if F.obj # nil then
+        GetObjName(F.obj, @name, 64)
+        if name = M.name then
+          M.obj := F.obj
+        end
+      end
+
+      findobj(F, F.link, M)
+
+    | Display.PFrameMsg:
+      if M.res >= 0 then
+        (* another debug test
+        IF M IS Display3.OverlapMsg THEN HALT(100) END;
+        *)
+        return
+      end
+
+      x := M.x + F.X
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      u := M.x
+      v := M.y
+
+      // debug tests
+      if (M.F # nil) & (M.F is Frame) then
+      end // check if M.F is initialized. Should trap if not
+      if (abs(x) > 20000) or (abs(y) > 20000) then
+        halt(99)
+      end
+      // end of debug tests
+
+      M1 := M
+      case M1 of
+      | Display.PDisplayMsg:
+        if M1.device = Display.screen then
+          if (M1.F = nil) or (M1.id = Display.full) & (M1.F = F) then
+            MakeMask(F, x, y, M1.dlink, @R)
+            Display3.ReplConst(R, 1, x, y, w, h, Display.replace)
+          elsif (M1.id = Display.area) & (M1.F = F) then
+            MakeMask(F, x, y, M1.dlink, @R)
+            Display3.AdjustMask(R, x + M1.u, y + h - 1 + M1.v, M1.w, M1.h)
+            Display3.ReplConst(R, 1, x, y, w, h, Display.replace)
+          end
+
+        elsif M1.device = Display.printer then
+          MakePrinterMask(F(Frame), M1.x, M1.y, M1.dlink, @R)
+          Printer3.Rect(R, 15, Display.solid, M1.x, M1.y, P(w), P(h), 1, Display.replace)
+        end
+
+      | PUpdateMsg:
+        if ~(transparent in F.state) & (M1.obj is Frame) then
+          // causes a trap if message not initialised correctly
+          obj := M1.obj
+          while obj # nil do
+            if obj = F then
+              D.device := Display.screen
+              D.id := Display.full
+              D.F := F
+              D.x := M1.x
+              D.y := M1.y
+              D.dlink := M1.dlink
+              D.res := -1
+              F.handle(F, @D)
+            end
+
+            obj := obj.slink
+          end
+        end
+
+      | Display3.POverlapMsg:
+        if (M1.F = F) or (M1.F = nil) then
+          F.mask := M1.M
+          M1.res := 0
+        end
+
+      | Display.PModifyMsg:
+        if M1.F = F then
+          // Copying
+          Adjust(F, M1)
+        end
+
+      | Display.PLocateMsg:
+        if (M1.loc = nil) & Effects.Inside(M1.X, M1.Y, x, y, w, h) then
+          M1.loc := F
+          M1.u := M1.X - x
+          M1.v := M1.Y - (y + h - 1)
+          M1.res := 0
+        end
+
+      | Display.PSelectMsg:
+        if (M1.id = Display.set_) & (M1.F = F) then
+          F.state := F.state + {selected}
+          M1.res := 0
+        elsif (M1.id = Display.reset) & (M1.F = F) then
+          F.state := F.state - {selected}
+          M1.res := 0
+        elsif M1.id = Display.get then
+        end
+
+      | Display.PConsumeMsg:
+        if (M1.id = Display.drop) & (M1.F = F) & (F is Frame) then
+          if HasCmdAttr(F, "ConsumeCmd") then
+            ExecuteAttr(F(Frame), "ConsumeCmd", M1.dlink, M1.obj, F)
+            M1.res := 0
+          end
+        end
+
+      | Display.PControlMsg:
+        if F.obj # nil then
+          F.obj.handle(F.obj, M1)
+        end
+      | Oberon.PInputMsg:
+        if M1.id = Oberon.track then
+          TrackFrame(F, M1)
+        end
+
+      end
+
+      M.x := u
+      M.y := v
+
+    end
+  end
+end FrameHandler
+
+// ------- Additional commands --------
+
+// Look up value of the name alias. Empty string is returned if name is not aliased.
+procedure GetAlias*(const name: pointer to array of char; value: pointer to array of char; value_len: int32)
+  var
+    a: Alias
+begin
+  a := aliases
+  value[0] := 0X
+  while (a # nil) & (a.name # name^) do
+    a := a.next
+  end
+  if a # nil then
+    copy(value, @a.value, value_len)
+  end
+end GetAlias
+
+// Create an object from the generator procedure or alias objname.
+procedure CreateObject*(const objname: pointer to array of char): Objects.Object
+  var
+    genproc: array 64 of char
+    res: int16
+begin
+  Objects.NewObj := nil
+  GetAlias(objname, @genproc, 64) // ps 20.5.96
+  if genproc = "" then
+    copy(@genproc, objname, 64)
+  end
+  Oberon.Call(@genproc, Oberon.Par, false, @res)
+  if res # 0 then
+    Texts.WriteString(@W, "Call error: ")
+    Texts.WriteString(@W, @Modules.resMsg)
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+    return nil
+  end
+
+  if Objects.NewObj = nil then
+    Texts.WriteString(@W, objname)
+    Texts.WriteString(@W, " is not a generator procedure or alias")
+    Texts.WriteLn(@W)
+    Log()
+  end
+
+  return Objects.NewObj
+end CreateObject
+
+// Create a View/Model pair from the generator procedures viewnewproc and modelnewproc. Aliasing is supported.
+procedure CreateViewModel*(const viewnewproc, modelnewproc: pointer to array of char): Display.Frame
+  var
+    F: Display.Frame
+    obj: Objects.Object
+    L: Objects.LinkMsg
+begin
+  obj := CreateObject(viewnewproc)
+  if obj # nil then
+    if ~(obj is Display.Frame) then
+      Texts.WriteString(@W, viewnewproc)
+      Texts.WriteString(@W, " is not a Display.Frame generator procedure")
+      Texts.WriteLn(@W)
+      Log()
+      return nil
+    end
+
+    F := obj(Display.Frame)
+    if modelnewproc^ # "" then
+      obj := CreateObject(modelnewproc)
+      case F of
+      | Frame:
+        L.id := Objects.set_
+        L.obj := obj
+        copy(@L.name, "Model", 32)
+        L.res := -1
+        F.handle(F, @L)
+        if L.res < 0 then
+          Texts.WriteString(@W, " Model could not be set")
+          Texts.WriteLn(@W)
+          Log()
+        end
+        return F
+      else
+        Texts.WriteString(@W, viewnewproc)
+        Texts.WriteString(@W, " is not a Gadget")
+        Texts.WriteLn(@W)
+        Log()
+        return F
+      end
+
+    else
+      return F
+    end
+  end
+
+  return nil
+end CreateViewModel
+
+// Adds a generator alias.
+procedure AddAlias*(const name, value: pointer to array of char)
+  var
+    a, b: Alias
+begin
+  if aliases = nil then
+    newgc(a)
+    aliases := a
+    copy(@a.name, name, 32 (* nameLen *))
+  else
+    a := aliases
+    b := nil
+    while (a # nil) & (a.name # name^) do
+      b := a
+      a := a.next
+    end
+    if a = nil then
+      newgc(a)
+      b.next := a
+      copy(@a.name, name, 32 (* nameLen *))
+    end
+  end
+
+  copy(@a.value, value, 64 (* valueLen *))
+end AddAlias
+
+(** Command to insert a newly allocated gadget at the caret. Used in the form:
+
+Gadgets.Insert <generatorproc> ~  for a single object
+or
+Gadgets.Insert <viewgeneratorproc> <modelgeneratorproc> ~ for a model-view pair
+
+Aliasing is supported.
+*)
+procedure Insert*()
+  // ^ is "Frame.New Thing.New"
+  var
+    S: Attributes.Scanner
+    fname, tname: array 32 of char
+    F: Display.Frame
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if S.class = Attributes.Name then
+    copy(@fname, @S.s, 32)
+    Attributes.Scan(@S)
+    if S.class = Attributes.Name then
+      copy(@tname, @S.s, 32)
+      F := CreateViewModel(@fname, @tname)
+      if F # nil then
+        Integrate(F)
+        if (F is Frame) & (F(Frame).obj # nil) then
+          Update(F(Frame).obj)
+        end
+      end
+
+    else
+      Integrate(CreateViewModel(@fname, ""))
+    end
+  end
+
+  Objects.NewObj := nil
+end Insert
+
+// Returns the latest object selection. Time < 0 indicates no selection.
+procedure GetSelection*(objs: pointer to Objects.Object; time: pointer to int32)
+  var
+    SM: Display.SelectMsg
+begin
+  time^ := -1
+  objs^ := nil
+  SM.id := Display.get
+  SM.F := nil
+  SM.sel := nil
+  SM.obj := nil
+  SM.time := -1
+  Display.Broadcast(@SM)
+  if (SM.time # -1) & (SM.obj # nil) then
+    time^ := SM.time
+    objs^ := SM.obj
+  end
+end GetSelection
+
+// Search for the object "O" in the public library "L.Lib" where the name is specified as "L.O" and return a deep copy or shallow copy.
+procedure CopyPublicObject*(const name: pointer to array of char; deep: boolean): Objects.Object
+
+  var
+    C: Objects.CopyMsg
+    obj: Objects.Object
+begin
+  obj := FindPublicObj(name)
+  if obj # nil then
+    Objects.Stamp(@C)
+    C.obj := nil
+    // ejz 10.7.96
+    if deep then
+      C.id := Objects.deep
+    else
+      C.id := Objects.shallow
+    end
+
+    obj.handle(obj, @C)
+    return C.obj
+  else
+    return nil
+  end
+  return nil // TODO o2m: Micron requires a result on all control paths
+end CopyPublicObject
+
+(** Changes the selected frame into a new frame type. Used in the form
+
+Gadgets.Change <generatorproc>
+
+Aliasing is supported.
+*)
+procedure Change*()
+  // ^ Frame.New
+  var
+    S: Attributes.Scanner
+    C: Display.ConsumeMsg
+    fname: array 32 of char
+    oF, nF: Display.Frame
+    CM: Display.ControlMsg
+    SM: Display.SelectMsg
+    obj: Objects.Object
+begin
+  SM.id := Display.get
+  SM.F := nil
+  SM.sel := nil
+  SM.obj := nil
+  SM.time := -1
+  Display.Broadcast(@SM)
+  if SM.time # -1 then
+    Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+    Attributes.Scan(@S)
+    if S.class = Attributes.Name then
+      copy(@fname, @S.s, 32)
+      nF := CreateViewModel(@fname, "")
+      if (nF # nil) & (SM.obj is Display.Frame) then
+        obj := SM.obj
+        while obj # nil do
+          oF := obj(Display.Frame)
+          nF.X := oF.X
+          nF.Y := oF.Y
+          if (nF is Frame) & (oF is Frame) then
+            nF(Frame).obj := oF(Frame).obj
+            if ~(lockedsize in nF(Frame).state) then
+              nF.W := oF.W
+              nF.H := oF.H
+            end
+          end
+
+          obj := obj.slink
+          CM.id := Display.remove // <<< remove
+          CM.F := oF
+          Display.Broadcast(@CM)
+          C.id := Display.drop
+          C.F := SM.sel
+          C.u := nF.X
+          C.v := nF.Y
+          C.obj := nF
+          Display.Broadcast(@C)
+          if (nF is Frame) & (nF(Frame).obj # nil) then
+            Update(nF(Frame).obj)
+          end
+          if obj # nil then
+            nF := CreateViewModel(@fname, "")
+          end
+        end
+      end
+    end
+  end
+end Change
+
+// Make a deep copy of the object selection and insert the result at the caret.
+procedure Copy*()
+  var
+    M: Display.SelectMsg
+    p, nl: Objects.Object
+    C: Objects.CopyMsg
+    CM: Display.ConsumeMsg
+begin
+  M.id := Display.get
+  M.F := nil
+  M.time := -1
+  M.sel := nil
+  M.obj := nil
+  Display.Broadcast(@M)
+  if M.time # -1 then
+    p := M.obj
+    nl := nil
+    Objects.Stamp(@C)
+    while p # nil do
+      C.id := Objects.deep
+      p.handle(p, @C)
+      C.obj.slink := nl
+      nl := C.obj
+      p := p.slink
+    end
+
+    CM.id := Display.integrate
+    CM.obj := nl
+    CM.F := nil
+    Display.Broadcast(@CM)
+  end
+end Copy
+
+(** Change the value(s) of (an) attribute(s) in the object selection. Used in the form:
+
+Gadgets.ChangeAttr <AttributeName> <AttributeValue> ~
+
+AttributeValue can take several forms, depending on the type of the attribute:
+
+names  For string attributes
+Yes/No      For boolean attributes
+1234    For number attributes
+"strings" For string attributes
+*)
+procedure ChangeAttr*()
+  var
+    S: Attributes.Scanner
+    U: UpdateMsg
+    M: Display.SelectMsg
+    obj: Objects.Object
+    A: Objects.AttrMsg
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if (S.class = Attributes.Name) or (S.class = Attributes.String) then
+    A.id := Objects.set_
+    copy(@A.name, @S.s, 32)
+    Attributes.Scan(@S)
+    A.class := Objects.Inval
+    copy(@A.s, "", 64)
+    if S.class = Attributes.Int then
+      A.class := Objects.Int
+      A.i := S.i
+    elsif S.class = Attributes.Name then
+      A.class := Objects.String
+      copy(@A.s, @S.s, 64)
+    elsif S.class = Attributes.String then
+      A.class := Objects.String
+      copy(@A.s, @S.s, 64)
+    end
+
+    if (A.s = "Yes") or (A.s = "No") then
+      Strings.StrToBool(@A.s, @A.b)
+      A.class := Objects.Bool
+    end
+    if A.class # Objects.Inval then
+      M.id := Display.get
+      M.F := nil
+      M.sel := nil
+      M.obj := nil
+      M.time := -1
+      Display.Broadcast(@M)
+      if M.time # -1 then
+        obj := M.obj
+        while obj # nil do
+          A.res := -1
+          obj.handle(obj, @A)
+          if A.res = -1 then
+            Texts.WriteString(@W, "Attribute not set")
+            Texts.WriteLn(@W)
+            Log()
+          end
+
+          obj := obj.slink
+        end
+
+        U.F := nil
+        U.obj := M.obj
+        Display.Broadcast(@U)
+      else
+        Texts.WriteString(@W, "No selection")
+        Texts.WriteLn(@W)
+        Log()
+      end
+    end
+  end
+end ChangeAttr
+
+(** Set an attribute value of a named object. Used in the form:
+
+Gadgets.Set O.A <AttributeValue> ~  for attribute A of named object O in the current context
+*)
+procedure Set*()
+  // O.A value
+  var
+    S: Attributes.Scanner
+    name: array 64 of char
+    i, j: int16
+    attr: array 32 of char
+    obj: Objects.Object
+    A: Objects.AttrMsg
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  copy(@name, "", 64)
+  if S.class = Attributes.String then
+    copy(@name, @S.s, 64)
+  elsif S.class = Attributes.Name then
+    copy(@name, @S.s, 64)
+  end
+
+  while name[0] = "." do
+    i := 0
+    repeat
+      name[i] := name[i + 1]
+      inc(i)
+    until name[i] = 0X
+
+    if context # nil then
+      context := context.dlink
+    end
+  end
+
+  Attributes.Scan(@S)
+  A.class := Objects.Inval
+  copy(@A.s, "", 64)
+  A.id := Objects.set_
+  if S.class = Attributes.Int then
+    A.class := Objects.Int
+    A.i := S.i
+  elsif S.class = Attributes.Real then
+    A.class := Objects.Real
+    A.x := S.x
+  elsif S.class = Attributes.LongReal then
+    A.class := Objects.LongReal
+    A.y := val(longreal, S.x)
+  elsif S.class = Attributes.Name then
+    A.class := Objects.String
+    copy(@A.s, @S.s, 64)
+  elsif S.class = Attributes.String then
+    A.class := Objects.String
+    copy(@A.s, @S.s, 64)
+  end
+
+  if (A.s = "Yes") or (A.s = "No") then
+    Strings.StrToBool(@A.s, @A.b)
+    A.class := Objects.Bool
+  end
+
+  if (A.class # Objects.Inval) & (name # "") then
+    i := 0
+    while name[i] # 0X do
+      inc(i)
+    end
+    while (i > 0) & (name[i] # ".") do
+      dec(i)
+    end
+    if name[i] = "." then
+      name[i] := 0X
+      inc(i)
+      j := 0
+      while name[i] # 0X do
+        attr[j] := name[i]
+        inc(i)
+        inc(j)
+      end
+      attr[j] := 0X
+      copy(@A.name, @attr, 32)
+      obj := FindObj(context, @name)
+      if obj # nil then
+        obj.handle(obj, @A)
+        if A.res = -1 then
+          Texts.WriteString(@W, "Attribute not set")
+          Texts.WriteLn(@W)
+          Log()
+        else
+          Update(obj)
+        end
+      end
+    end
+  end
+end Set
+
+(** Create a new Model gadget and link it to all the visual objects in the current selection. Used in the form:
+
+Gadgets.Link <modelgenerator>
+
+Aliasing is supported. An Objects.LinkMsg is sent behind the scenes.
+*)
+procedure Link*()
+  var
+    S: Attributes.Scanner
+    M: Display.SelectMsg
+    obj, o: Objects.Object
+    B: Objects.BindMsg
+    L: Objects.LinkMsg
+    oname: array 64 of char
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if (S.class = Attributes.Name) or (S.class = Attributes.String) then
+    M.id := Display.get
+    M.F := nil
+    M.sel := nil
+    M.obj := nil
+    M.time := -1
+    Display.Broadcast(@M)
+    copy(@oname, @S.s, 64)
+    obj := CreateObject(@oname)
+    if (obj # nil) & (M.time # -1) then
+      o := M.obj
+      if o # nil then
+        if o.lib # nil then
+          B.lib := o.lib // bind
+          obj.handle(obj, @B)
+        end
+      end
+
+      while o # nil do
+        case o of
+        | Frame:
+          L.id := Objects.set_
+          copy(@L.name, "Model", 32)
+          L.obj := obj
+          L.res := -1
+          o.handle(o, @L)
+          if L.res < 0 then
+            Texts.WriteString(@W, " Model could not be set")
+            Texts.WriteLn(@W)
+            Log()
+          end
+
+          (* old way
+          o(Frame).obj := obj
+          *)
+        end
+
+        o := o.slink
+      end
+
+      Update(obj)
+    end
+  end
+end Link
+
+procedure LoadAliases()
+  var
+    S: Texts.Scanner
+    alias: Objects.Name
+    err: boolean
+begin
+  Oberon.OpenScanner(@S, "Gadgets.Aliases")
+  if S.class = Texts.Inval then
+    Texts.WriteString(@W, "Oberon.Text - Gadgets.Aliases not found")
+    Texts.WriteLn(@W)
+    Log()
+  else
+    err := false
+    while (S.class in {Texts.Name,Texts.String}) & ~err do
+      copy(@alias, @S.s, 32)
+      Texts.Scan(@S)
+      if (S.class = Texts.Char) & (S.c = "=") then
+        Texts.Scan(@S)
+        if S.class in {Texts.Name,Texts.String} then
+          AddAlias(@alias, @S.s)
+          Texts.Scan(@S)
+        else
+          err := true
+        end
+
+      else
+        err := true
+      end
+    end
+
+    if err or (S.class # Texts.Char) or (S.c # "}") then
+      Texts.WriteString(@W, "Error in Gadgets.Aliases")
+      Texts.WriteLn(@W)
+      Log()
+    end
+  end
+
+  Oberon.OpenScanner(@S, "Gadgets.Verbose")
+  verbose := ((S.class = Texts.Name) or (S.class = Texts.String)) & (val(int32, band(ord(S.s[0]), 0DFH)) = 59H)
+end LoadAliases
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "Insert" end return Insert end
+  if i = 1 then if name # nil then name^ := "Change" end return Change end
+  if i = 2 then if name # nil then name^ := "Copy" end return Copy end
+  if i = 3 then if name # nil then name^ := "ChangeAttr" end return ChangeAttr end
+  if i = 4 then if name # nil then name^ := "Set" end return Set end
+  if i = 5 then if name # nil then name^ := "Link" end return Link end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Gadgets", cmd_)
+  Texts.OpenWriter(@W)
+  Texts.OpenWriter(@WW)
+  Texts.OpenWriter(@mW)
+  newgc(emptyText)
+  Texts.Open(emptyText, "")
+  LoadAliases()
+
+  (*
+  IF Display.Width < 800 THEN
+  Texts.WriteString(W, "Higher resolution recommended for Gadgets");
+  Texts.WriteLn(W);  Log
+  END;
+  *)
+
+  Attributes.AddMacro("&", StandardMacros) // lookup
+  Attributes.AddMacro("#", StandardMacros) // executor
+  Attributes.AddMacro("!", StandardMacros) // sender
+  Attributes.AddMacro("'", StandardMacros) // substitute
+  Attributes.AddMacro("^", UpArrowMacro)
+
+  framehandle := FrameHandler
+  objecthandle := ObjectHandler
+  MakeMask := MakeMask0
+  MakePrinterMask := MakePrinterMask0
+  Oberon.Collect()
+end Gadgets.

@@ -1,0 +1,1620 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Strings [level=5]
+
+import Oberon, Texts, Dates, Reals, Modules
+// portable
+// ejz,
+
+(** Strings is a utility module that provides procedures to manipulate strings.
+Note: All strings MUST be 0X terminated. *)
+
+const
+  CR* = 0DX // the Oberon end of line character
+  Tab* = 9X // the horizontal tab character
+  LF* = 0AX // the UNIX end of line character
+
+var
+  isAlpha*: array 256 of boolean // all letters in the oberon charset
+  ISOToOberon*: array 256 of char // Translation tables for iso-8859-1 to oberon ascii code.
+  OberonToISO*: array 256 of char
+  CRLF*: array 4 of char // end of line "string" used by MS-DOS and most TCP protocols
+  sDayName: array 7 of array 4 of char
+  lDayName: array 7 of array 12 of char
+  sMonthName: array 12 of array 4 of char
+  lMonthName: array 12 of array 12 of char
+  dateform, timeform: array 32 of char
+
+// Length of str.
+procedure Length*(str: pointer to array of char; str_len: int32): int32
+  // in
+  var
+    i, l: int32
+begin
+  l := str_len
+  i := 0
+  while (i < l) & (str[i] # 0X) do
+    inc(i)
+  end
+
+  return i
+end Length
+
+// Append this to to.
+procedure Append*(to_: pointer to array of char; to_len: int32; const this: pointer to array of char)
+  // in/out
+  var
+    i, j, l: int32
+begin
+  i := 0
+  while to_[i] # 0X do
+    inc(i)
+  end
+
+  l := val(int32, val(int16, to_len) - 1)
+  j := 0
+  while (i < l) & (this[j] # 0X) do
+    to_[i] := this[j]
+    inc(i)
+    inc(j)
+  end
+
+  to_[i] := 0X
+end Append
+
+// Append this to to.
+procedure AppendCh*(to_: pointer to array of char; to_len: int32; this: char)
+  // in/out
+  var
+    i: int32
+begin
+  i := 0
+  while to_[i] # 0X do
+    inc(i)
+  end
+
+  if i < val(int32, val(int16, to_len) - 1) then
+    to_[i] := this
+    to_[i + 1] := 0X
+  end
+end AppendCh
+
+// TRUE if ch is a hexadecimal digit.
+procedure IsHexDigit*(ch: char): boolean
+begin
+  return (ch >= "0") & (ch <= "9") or (val(int32, band(ord(ch), 0DFH)) >= 41H) & (val(int32, band(ord(ch), 0DFH)) <= 46H)
+end IsHexDigit
+
+// TRUE if ch is a decimal digit.
+procedure IsDigit*(ch: char): boolean
+begin
+  return (ch >= "0") & (ch <= "9")
+end IsDigit
+
+// TRUE if ch is a letter.
+procedure IsAlpha*(ch: char): boolean
+begin
+  return isAlpha[ord(ch)]
+end IsAlpha
+
+// If ch is an upper-case letter return the corresponding lower-case letter.
+procedure LowerCh*(ch: char): char
+begin
+  case ch of
+    41X..5AX:
+    ch := chr(val(int16, ord(ch)) - val(int16, ord("A")) + val(int16, ord("a")))
+  | 0FFFFFFC4X:
+    ch := 0FFFFFFE4X
+  | 0FFFFFFD6X:
+    ch := 0FFFFFFF6X
+  | 0FFFFFFDCX:
+    ch := 0FFFFFFFCX
+  else
+  end
+
+  return ch
+end LowerCh
+
+// If ch is an lower-case letter return the corresponding upper-case letter.
+procedure UpperCh*(ch: char): char
+begin
+  case ch of
+    61X..7AX:
+    ch := chr(band(ord(ch), 0DFH))
+  | 0FFFFFFE4X:
+    ch := 0FFFFFFC4X
+  | 0FFFFFFF6X:
+    ch := 0FFFFFFD6X
+  | 0FFFFFFFCX:
+    ch := 0FFFFFFDCX
+  | 0FFFFFFE2X:
+    ch := "A"
+  | 0FFFFFFEAX:
+    ch := "E"
+  | 0FFFFFFEEX:
+    ch := "I"
+  | 0FFFFFFF4X:
+    ch := "O"
+  | 0FFFFFFFBX:
+    ch := "U"
+  | 0FFFFFFE0X:
+    ch := "A"
+  | 0FFFFFFE8X:
+    ch := "E"
+  | 0FFFFFFECX:
+    ch := "I"
+  | 0FFFFFFF2X:
+    ch := "O"
+  | 0FFFFFFF9X:
+    ch := "U"
+  | 0FFFFFFE9X:
+    ch := "E"
+  | 0FFFFFFEBX:
+    ch := "E"
+  | 0FFFFFFEFX:
+    ch := "I"
+  | 0FFFFFFE7X:
+    ch := "C"
+  | 0FFFFFFE1X:
+    ch := "A"
+  | 0FFFFFFF1X:
+    ch := "N"
+  | 0FFFFFFDFX:
+    ch := "S"
+  else
+  end
+
+  return ch
+end UpperCh
+
+// Convert str to all lower-case letters.
+procedure Lower*(str, lstr: pointer to array of char)
+  // in
+  // out
+  var
+    i: int32
+begin
+  i := 0
+  while str[i] # 0X do
+    lstr[i] := LowerCh(str[i])
+    inc(i)
+  end
+
+  lstr[i] := 0X
+end Lower
+
+// Convert str to all upper-case letters.
+procedure Upper*(str, ustr: pointer to array of char)
+  // in
+  // out
+  var
+    i: int32
+begin
+  i := 0
+  while str[i] # 0X do
+    ustr[i] := UpperCh(str[i])
+    inc(i)
+  end
+
+  ustr[i] := 0X
+end Upper
+
+// Is str prefixed by pre?
+procedure Prefix*(const pre: pointer to array of char; str: pointer to array of char): boolean
+  // in
+  var
+    i: int32
+begin
+  i := 0
+  while (pre[i] # 0X) & (pre[i] = str[i]) do
+    inc(i)
+  end
+
+  return pre[i] = 0X
+end Prefix
+
+// Checks if str is prefixed by pre. The case is ignored.
+procedure CAPPrefix*(const pre: pointer to array of char; str: pointer to array of char): boolean
+  // in
+  var
+    i: int32
+begin
+  i := 0
+  while (pre[i] # 0X) & (val(int32, band(ord(pre[i]), 0DFH)) = val(int32, band(ord(str[i]), 0DFH))) do
+    inc(i)
+  end
+
+  return pre[i] = 0X
+end CAPPrefix
+
+// Compare str1 to str2. The case is ignored.
+procedure CAPCompare*(str1, str2: pointer to array of char): boolean
+  // in
+  // in
+  var
+    i: int32
+begin
+  i := 0
+  while (str1[i] # 0X) & (str2[i] # 0X) & (val(int32, band(ord(str1[i]), 0DFH)) = val(int32, band(ord(str2[i]), 0DFH))) do
+    inc(i)
+  end
+
+  return str1[i] = str2[i]
+end CAPCompare
+
+// Get the parameter-value on line. The parameter value is started behind the first colon character.
+procedure GetPar*(line: pointer to array of char; par: pointer to array of char; par_len: int32)
+  // in
+  // out
+  var
+    i, j, l: int32
+begin
+  i := 0
+  while (line[i] # 0X) & (line[i] # ":") do
+    inc(i)
+  end
+
+  if line[i] = ":" then
+    inc(i)
+  end
+
+  while (line[i] # 0X) & (line[i] <= " ") do
+    inc(i)
+  end
+
+  l := val(int32, val(int16, par_len) - 1)
+  j := 0
+  while (j < l) & (line[i] # 0X) do
+    par[j] := line[i]
+    inc(j)
+    inc(i)
+  end
+
+  par[j] := 0X
+end GetPar
+
+// Get the suffix of str. The suffix is started by the last dot in str.
+procedure GetSuffix*(str: pointer to array of char; suf: pointer to array of char; suf_len: int32)
+  // in
+  // out
+  var
+    i, j, l, dot: int32
+begin
+  dot := -1
+  i := 0
+  while str[i] # 0X do
+    if str[i] = "." then
+      dot := i
+    elsif str[i] = "/" then
+      dot := -1
+    end
+
+    inc(i)
+  end
+
+  j := 0
+  if dot > 0 then
+    l := val(int32, val(int16, suf_len) - 1)
+    i := dot + 1
+    while (j < l) & (str[i] # 0X) do
+      suf[j] := str[i]
+      inc(j)
+      inc(i)
+    end
+  end
+
+  suf[j] := 0X
+end GetSuffix
+
+// Change the suffix of str to suf.
+procedure ChangeSuffix*(str: pointer to array of char; str_len: int32; const suf: pointer to array of char)
+  // in/out
+  var
+    i, j, l, dot: int32
+begin
+  dot := -1
+  i := 0
+  while str[i] # 0X do
+    if str[i] = "." then
+      dot := i
+    elsif str[i] = "/" then
+      dot := -1
+    end
+
+    inc(i)
+  end
+
+  if dot > 0 then
+    l := val(int32, val(int16, str_len) - 1)
+    i := dot + 1
+    j := 0
+    while (i < l) & (suf[j] # 0X) do
+      str[i] := suf[j]
+      inc(i)
+      inc(j)
+    end
+
+    str[i] := 0X
+  end
+end ChangeSuffix
+
+// Search in src starting at pos for the next occurrence of pat.  Returns pos=-1 if not found.
+procedure Search*(const pat: pointer to array of char; pat_len: int32; src: pointer to array of char; src_len: int32; pos: pointer to int32)
+  // in
+  // in/out
+  const
+    MaxPat = 128
+
+  var
+    buf: array 128 (* MaxPat *) of char
+    len_, i, srclen: int32
+
+  procedure Find(beg: int32; buf: pointer to array 128 (* MaxPat *) of char; len_: pointer to int32; pos: pointer to int32; src: pointer to array of char; srclen: pointer to int32)
+
+    var
+      i, j, b, e: int32
+      ch: char
+      ref: array 128 (* MaxPat *) of char
+  begin
+    ch := src[pos^]
+    inc(pos^)
+    ref[0] := ch
+    i := 0
+    j := 0
+    b := 0
+    e := 1
+    while (pos^ <= srclen^) & (i < len_^) do
+      if buf[i] = ch then
+        inc(i)
+        j := band(j + 1, 127)
+      else
+        i := 0
+        b := band(b + 1, 127)
+        j := b
+      end
+
+      if j # e then
+        ch := ref[j]
+      else
+        if pos^ >= srclen^ then
+          ch := 0X
+        else
+          ch := src[pos^]
+        end
+
+        inc(pos^)
+        ref[j] := ch
+        e := band(e + 1, 127)
+        inc(beg)
+      end
+    end
+
+    if i = len_^ then
+      pos^ := beg - len_^
+    else
+      pos^ := -1
+    end
+  end Find
+begin
+  len_ := Length(pat, pat_len)
+  if MaxPat < len_ then
+    len_ := MaxPat
+  end
+
+  if len_ <= 0 then
+    pos^ := -1
+    return
+  end
+
+  i := 0
+  repeat
+    buf[i] := pat[i]
+    inc(i)
+  until i >= len_
+
+  srclen := Length(src, src_len)
+  if pos^ < 0 then
+    pos^ := 0
+  elsif pos^ >= srclen then
+    pos^ := -1
+    return
+  end
+
+  Find(pos^, @buf, @len_, pos, src, @srclen)
+end Search
+
+// Search in src starting at pos for the next occurrence of pat.
+procedure CAPSearch*(const pat: pointer to array of char; pat_len: int32; src: pointer to array of char; src_len: int32; pos: pointer to int32)
+  // in
+  // in/out
+  const
+    MaxPat = 128
+
+  var
+    buf: array 128 (* MaxPat *) of char
+    len_, i, srclen: int32
+
+  procedure Find(beg: int32; buf: pointer to array 128 (* MaxPat *) of char; len_: pointer to int32; pos: pointer to int32; src: pointer to array of char; srclen: pointer to int32)
+
+    var
+      i, j, b, e: int32
+      ch: char
+      ref: array 128 (* MaxPat *) of char
+  begin
+    ch := UpperCh(src[pos^])
+    inc(pos^)
+    ref[0] := ch
+    i := 0
+    j := 0
+    b := 0
+    e := 1
+    while (pos^ <= srclen^) & (i < len_^) do
+      if buf[i] = ch then
+        inc(i)
+        j := band(j + 1, 127)
+      else
+        i := 0
+        b := band(b + 1, 127)
+        j := b
+      end
+
+      if j # e then
+        ch := ref[j]
+      else
+        if pos^ >= srclen^ then
+          ch := 0X
+        else
+          ch := UpperCh(src[pos^])
+        end
+
+        inc(pos^)
+        ref[j] := ch
+        e := band(e + 1, 127)
+        inc(beg)
+      end
+    end
+
+    if i = len_^ then
+      pos^ := beg - len_^
+    else
+      pos^ := -1
+    end
+  end Find
+begin
+  len_ := Length(pat, pat_len)
+  if MaxPat < len_ then
+    len_ := MaxPat
+  end
+
+  if len_ <= 0 then
+    pos^ := -1
+    return
+  end
+
+  i := 0
+  repeat
+    buf[i] := UpperCh(pat[i])
+    inc(i)
+  until i >= len_
+
+  srclen := Length(src, src_len)
+  if pos^ < 0 then
+    pos^ := 0
+  elsif pos^ >= srclen then
+    pos^ := -1
+    return
+  end
+
+  Find(pos^, @buf, @len_, pos, src, @srclen)
+end CAPSearch
+
+// Convert a string into an integer. Leading white space characters are ignored.
+procedure StrToInt*(str: pointer to array of char; val_: pointer to int32)
+  var
+    i, d: int32
+    ch: char
+    neg: boolean
+begin
+  i := 0
+  ch := str[0]
+  while (ch # 0X) & (ch <= " ") do
+    inc(i)
+    ch := str[i]
+  end
+
+  neg := false
+  if ch = "+" then
+    inc(i)
+    ch := str[i]
+  end
+  if ch = "-" then
+    neg := true
+    inc(i)
+    ch := str[i]
+  end
+  while (ch # 0X) & (ch <= " ") do
+    inc(i)
+    ch := str[i]
+  end
+
+  val_^ := 0
+  while (ch >= "0") & (ch <= "9") do
+    d := val(int32, val(int16, ord(ch)) - val(int16, ord("0")))
+    inc(i)
+    ch := str[i]
+    if val_^ <= obdiv(2147483647 - d, 10) then
+      val_^ := 10 * val_^ + d
+    elsif neg & (val_^ = 214748364) & (d = 8) & ((ch < "0") or (ch > "9")) then
+      val_^ := (-2147483647-1)
+      neg := false
+    else
+      halt(99)
+    end
+  end
+
+  if neg then
+    val_^ := -val_^
+  end
+end StrToInt
+
+(** Convert the substring beginning at position i in str into an integer. Any leading whitespace characters are ignored.
+After the conversion i pointes to the first character after the integer. *)
+procedure StrToIntPos*(str: pointer to array of char; val_: pointer to int32; i: pointer to int16)
+  var
+    noStr: array 16 of char
+begin
+  while (str[i^] # 0X) & (str[i^] <= " ") do
+    inc(i^)
+  end
+
+  val_^ := 0
+  if str[i^] = "-" then
+    noStr[val_^] := str[i^]
+    inc(val_^)
+    inc(i^)
+    while (str[i^] # 0X) & (str[i^] <= " ") do
+      inc(i^)
+    end
+  end
+
+  while (str[i^] >= "0") & (str[i^] <= "9") do
+    noStr[val_^] := str[i^]
+    inc(val_^)
+    inc(i^)
+  end
+
+  noStr[val_^] := 0X
+  StrToInt(@noStr, val_)
+end StrToIntPos
+
+// Convert an integer into a string.
+procedure IntToStr*(val_: int32; str: pointer to array of char; str_len: int32)
+
+  var
+    i, j: int32
+    digits: array 16 of int32
+begin
+  if val_ = (-2147483647-1) then
+    copy(str, "-2147483648", str_len)
+    return
+  end
+
+  if val_ < 0 then
+    val_ := -val_
+    str[0] := "-"
+    j := 1
+  else
+    j := 0
+  end
+
+  i := 0
+  repeat
+    digits[i] := obmod(val_, 10)
+    inc(i)
+    val_ := obdiv(val_, 10)
+  until val_ = 0
+
+  dec(i)
+  while i >= 0 do
+    str[j] := chr(digits[i] + val(int32, ord("0")))
+    inc(j)
+    dec(i)
+  end
+
+  str[j] := 0X
+end IntToStr
+
+// Converts a real to a string.
+procedure RealToStr*(x: longreal; s: pointer to array of char; s_len: int32)
+  var
+    e, h, l, n, len_: int32
+    i, j, pos: int16
+    z: longreal
+    d: array 16 of char
+
+  procedure Wr(ch: char; len_: pointer to int32; pos: pointer to int16; s: pointer to array of char)
+  begin
+    if ch = 0X then
+      halt(42)
+    end
+    if pos^ < len_^ then
+      s[pos^] := ch
+      inc(pos^)
+    end
+  end Wr
+begin
+  len_ := val(int32, val(int16, s_len) - 1)
+  pos := 0
+  e := Reals.ExpoL(x)
+  if e = 2047 then
+    Wr("N", @len_, @pos, s)
+    Wr("a", @len_, @pos, s)
+    Wr("N", @len_, @pos, s)
+  else
+    n := 14
+    if (x < val(longreal, 0)) & (e # 0) then
+      Wr("-", @len_, @pos, s)
+      x := -x
+    end
+    if e = 0 then
+      h := 0 // no denormals
+      l := 0
+    else
+      e := obdiv((e - 1023) * 301029, 1000000) // ln(2)/ln(10) = 0.301029996
+      z := Reals.Ten(e + 1)
+      if x >= z then
+        x := x / z
+        inc(e)
+      else
+        x := x * Reals.Ten(-e)
+      end
+      if x >= val(longreal, 10) then
+        x := x * Reals.Ten(-1) + 0.5 / Reals.Ten(n)
+        inc(e)
+      else
+        x := x + 0.5 / Reals.Ten(n)
+        if x >= val(longreal, 10) then
+          x := x * Reals.Ten(-1)
+          inc(e)
+        end
+      end
+
+      x := x * Reals.Ten(7)
+      h := val(int32, floor(x))
+      x := (x - val(longreal, h)) * Reals.Ten(8)
+      l := val(int32, floor(x))
+    end
+
+    i := 15
+    while i > 7 do
+      d[i] := chr(obmod(l, 10) + val(int32, ord("0")))
+      l := obdiv(l, 10)
+      dec(i)
+    end
+    while i >= 0 do
+      d[i] := chr(obmod(h, 10) + val(int32, ord("0")))
+      h := obdiv(h, 10)
+      dec(i)
+    end
+    if abs(e) > 8 then
+      // scientific notation
+      j := 15
+      while (j > 0) & (d[j] = "0") do
+        dec(j)
+      end
+      Wr(d[0], @len_, @pos, s)
+      if j # 0 then
+        Wr(".", @len_, @pos, s)
+      end
+      i := 1
+      while i <= j do
+        Wr(d[i], @len_, @pos, s)
+        inc(i)
+      end
+      if e < 0 then
+        Wr("D", @len_, @pos, s)
+        Wr("-", @len_, @pos, s)
+        e := -e
+      else
+        Wr("D", @len_, @pos, s)
+        Wr("+", @len_, @pos, s)
+      end
+      Wr(chr(obdiv(e, 100) + val(int32, ord("0"))), @len_, @pos, s)
+      e := obmod(e, 100)
+      Wr(chr(obdiv(e, 10) + val(int32, ord("0"))), @len_, @pos, s)
+      Wr(chr(obmod(e, 10) + val(int32, ord("0"))), @len_, @pos, s)
+    else
+      if e < 0 then
+        // leading zeros
+        j := 14 // !15
+        while (j > 0) & (d[j] = "0") do
+          dec(j)
+        end
+        Wr("0", @len_, @pos, s)
+        Wr(".", @len_, @pos, s)
+        inc(e)
+        while e < 0 do
+          Wr("0", @len_, @pos, s)
+          inc(e)
+        end
+        i := 0
+        while i <= j do
+          Wr(d[i], @len_, @pos, s)
+          inc(i)
+        end
+      else
+        i := 0
+        while (e >= 0) & (i < 16) do
+          Wr(d[i], @len_, @pos, s)
+          inc(i)
+          dec(e)
+        end
+        if i < 16 then
+          Wr(".", @len_, @pos, s)
+          while i < 15 do
+            // 16
+            Wr(d[i], @len_, @pos, s)
+            inc(i)
+          end
+          while s[pos - 1] = "0" do
+            dec(pos)
+          end
+          if s[pos - 1] = "." then
+            dec(pos)
+          end
+        end
+      end
+    end
+  end
+
+  s[pos] := 0X
+end RealToStr
+
+procedure RealToFixStr*(x: longreal; str: pointer to array of char; str_len: int32; n, f, D: int32)
+  var
+    pos, len_, e, i, h, l: int32
+    r, z: longreal
+    d: array 16 of char
+    s: char
+
+  procedure Wr(ch: char; len_: pointer to int32; pos: pointer to int32; str: pointer to array of char)
+  begin
+    if ch = 0X then
+      halt(42)
+    end
+    if pos^ < len_^ then
+      str[pos^] := ch
+      inc(pos^)
+    end
+  end Wr
+begin
+  len_ := val(int32, val(int16, str_len) - 1)
+  pos := 0
+  e := Reals.ExpoL(x)
+  if (e = 2047) or (abs(D) > 308) then
+    Wr("N", @len_, @pos, str)
+    Wr("a", @len_, @pos, str)
+    Wr("N", @len_, @pos, str)
+  else
+    if D = 0 then
+      dec(n, 2)
+    else
+      dec(n, 7)
+    end
+    if n < 2 then
+      n := 2
+    end
+    if f < 0 then
+      f := 0
+    end
+    if n < f + 2 then
+      n := f + 2
+    end
+    dec(n, f)
+    if (e # 0) & (x < val(longreal, 0)) then
+      s := "-"
+      x := -x
+    else
+      s := " "
+    end
+    if e = 0 then
+      h := 0 // no denormals
+      l := 0
+      dec(e, D - 1)
+    else
+      e := obdiv((e - 1023) * 301029, 1000000) // ln(2)/ln(10) = 0.301029996
+      z := Reals.Ten(e + 1)
+      if x >= z then
+        x := x / z
+        inc(e)
+      else
+        x := x * Reals.Ten(-e)
+      end
+      dec(e, D - 1)
+      i := -(e + f)
+      if i <= 0 then
+        r := val(longreal, 5) * Reals.Ten(i)
+      else
+        r := val(longreal, 0)
+      end
+      if x >= val(longreal, 10) then
+        x := x * Reals.Ten(-1) + r
+        inc(e)
+      else
+        x := x + r
+        if x >= val(longreal, 10) then
+          x := x * Reals.Ten(-1)
+          inc(e)
+        end
+      end
+
+      x := x * Reals.Ten(7)
+      h := val(int32, floor(x))
+      x := (x - val(longreal, h)) * Reals.Ten(8)
+      l := val(int32, floor(x))
+    end
+
+    i := 15
+    while i > 7 do
+      d[i] := chr(obmod(l, 10) + val(int32, ord("0")))
+      l := obdiv(l, 10)
+      dec(i)
+    end
+    while i >= 0 do
+      d[i] := chr(obmod(h, 10) + val(int32, ord("0")))
+      h := obdiv(h, 10)
+      dec(i)
+    end
+    if n <= e then
+      n := e + 1
+    end
+    if e > 0 then
+      while n > e do
+        Wr(" ", @len_, @pos, str)
+        dec(n)
+      end
+      Wr(s, @len_, @pos, str)
+      e := 0
+      while n > 0 do
+        dec(n)
+        if e < 16 then
+          Wr(d[e], @len_, @pos, str)
+          inc(e)
+        else
+          Wr("0", @len_, @pos, str)
+        end
+      end
+
+      Wr(".", @len_, @pos, str)
+    else
+      while n > 1 do
+        Wr(" ", @len_, @pos, str)
+        dec(n)
+      end
+      Wr(s, @len_, @pos, str)
+      Wr("0", @len_, @pos, str)
+      Wr(".", @len_, @pos, str)
+      while (0 < f) & (e < 0) do
+        Wr("0", @len_, @pos, str)
+        dec(f)
+        inc(e)
+      end
+    end
+
+    while f > 0 do
+      dec(f)
+      if e < 16 then
+        Wr(d[e], @len_, @pos, str)
+        inc(e)
+      else
+        Wr("0", @len_, @pos, str)
+      end
+    end
+
+    if D # 0 then
+      if D < 0 then
+        Wr("D", @len_, @pos, str)
+        Wr("-", @len_, @pos, str)
+        D := -D
+      else
+        Wr("D", @len_, @pos, str)
+        Wr("+", @len_, @pos, str)
+      end
+
+      Wr(chr(obdiv(D, 100) + val(int32, ord("0"))), @len_, @pos, str)
+      D := obmod(D, 100)
+      Wr(chr(obdiv(D, 10) + val(int32, ord("0"))), @len_, @pos, str)
+      Wr(chr(obmod(D, 10) + val(int32, ord("0"))), @len_, @pos, str)
+    end
+  end
+
+  str[pos] := 0X
+end RealToFixStr
+
+// Convert a string into a real. Precondition: s has a well defined real syntax. Scientific notation with D and E to indicate exponents is allowed.
+procedure StrToReal*(const s: pointer to array of char; r: pointer to longreal)
+  var
+    p, e: int16
+    y, g: longreal
+    neg, negE: boolean
+begin
+  p := 0
+  while (s[p] = " ") or (s[p] = "0") do
+    inc(p)
+  end
+  if s[p] = "-" then
+    neg := true
+    inc(p)
+  else
+    neg := false
+  end
+  while (s[p] = " ") or (s[p] = "0") do
+    inc(p)
+  end
+
+  y := val(longreal, 0)
+  while ("0" <= s[p]) & (s[p] <= "9") do
+    y := y * val(longreal, 10) + val(longreal, val(int16, ord(s[p])) - 48)
+    inc(p)
+  end
+
+  if s[p] = "." then
+    inc(p)
+    g := val(longreal, 1)
+    while ("0" <= s[p]) & (s[p] <= "9") do
+      g := g / val(longreal, 10)
+      y := y + g * val(longreal, val(int16, ord(s[p])) - 48)
+      inc(p)
+    end
+  end
+
+  if (s[p] = "D") or (s[p] = "E") then
+    inc(p)
+    e := 0
+    if s[p] = "-" then
+      negE := true
+      inc(p)
+    else
+      negE := false
+    end
+    while s[p] = "0" do
+      inc(p)
+    end
+    while ("0" <= s[p]) & (s[p] <= "9") do
+      e := e * 10 + (val(int16, ord(s[p])) - 48)
+      inc(p)
+    end
+
+    if negE then
+      y := y / Reals.Ten(e)
+    else
+      y := y * Reals.Ten(e)
+    end
+  end
+
+  if neg then
+    y := -y
+  end
+  r^ := y
+end StrToReal
+
+(** Convert a string into a boolean. "Yes", "True" and "On" are TRUE all other strings are FALSE.
+Leading white space characters are ignored. *)
+procedure StrToBool*(str: pointer to array of char; b: pointer to boolean)
+  var
+    i: int32
+begin
+  i := 0
+  while (str[i] # 0X) & (str[i] <= " ") do
+    inc(i)
+  end
+
+  case chr(band(ord(str[i]), 0DFH)) of
+    89, 84:
+    b^ := true
+  | 79:
+    b^ := val(int32, band(ord(str[i + 1]), 0DFH)) = 4EH
+  else
+    b^ := false
+  end
+end StrToBool
+
+// Convert a boolean into "Yes" or "No".
+procedure BoolToStr*(b: boolean; str: pointer to array of char; str_len: int32)
+begin
+  if b then
+    copy(str, "Yes", str_len)
+  else
+    copy(str, "No", str_len)
+  end
+end BoolToStr
+
+// Convert a string to a set
+procedure StrToSet*(const str: pointer to array of char; set_: pointer to set)
+  var
+    i, d, d1: int16
+    ch: char
+    dot: boolean
+begin
+  set_^ := {}
+  dot := false
+  i := 0
+  ch := str[i]
+  while (ch # 0X) & (ch # "}") do
+    while (ch # 0X) & ((ch < "0") or (ch > "9")) do
+      inc(i)
+      ch := str[i]
+    end
+    d := 0
+    while (ch >= "0") & (ch <= "9") do
+      d := d * 10 + val(int16, ord(ch)) - 48
+      inc(i)
+      ch := str[i]
+    end
+    if d <= val(int16, 31) then
+      set_^ := set_^ + {d}
+    end
+    if dot then
+      d1 := 0
+      while (d1 <= val(int16, 31)) & (d1 < d) do
+        set_^ := set_^ + {d1}
+        inc(d1)
+      end
+      dot := false
+    end
+
+    while ch = " " do
+      inc(i)
+      ch := str[i]
+    end
+    if ch = "." then
+      d1 := d + 1
+      dot := true
+    end
+  end
+end StrToSet
+
+// Convert a set to a string
+procedure SetToStr*(set_: set; str: pointer to array of char)
+  var
+    i, j, k: int16
+    noFirst: boolean
+begin
+  str[0] := "{"
+  i := 0
+  k := 1
+  noFirst := false
+  while i <= val(int16, 31) do
+    if i in set_ then
+      if noFirst then
+        str[k] := ","
+        inc(k)
+      else
+        noFirst := true
+      end
+      if i >= 10 then
+        str[k] := chr(obdiv(i, 10) + 48)
+        inc(k)
+      end
+      str[k] := chr(obmod(i, 10) + 48)
+      inc(k)
+      j := i
+      inc(i)
+      while (i <= val(int16, 31)) & (i in set_) do
+        inc(i)
+      end
+      if i - 2 > j then
+        str[k] := "."
+        str[k + 1] := "."
+        inc(k, 2)
+        j := i - 1
+        if j >= 10 then
+          str[k] := chr(obdiv(j, 10) + 48)
+          inc(k)
+        end
+        str[k] := chr(obmod(j, 10) + 48)
+        inc(k)
+      else
+        i := j
+      end
+    end
+
+    inc(i)
+  end
+
+  str[k] := "}"
+  str[k + 1] := 0X
+end SetToStr
+
+// Convert date (Oberon.GetClock) into specified format.
+procedure DateToStr*(date: int32; str: pointer to array of char)
+  var
+    i, j, k, x: int32
+    form, name: array 32 of char
+begin
+  copy(@form, @dateform, 32)
+  if form = "" then
+    copy(@form, "DD.MM.YY", 32)
+  end
+  i := 0
+  j := 0
+  while form[j] # 0X do
+    if val(int32, band(ord(form[j]), 0DFH)) = 44H then
+      // Day
+      inc(j)
+      x := band(date, 31)
+      if val(int32, band(ord(form[j]), 0DFH)) = 44H then
+        inc(j)
+        if val(int32, band(ord(form[j]), 0DFH)) = 44H then
+          inc(j)
+          x := Dates.DayOfWeek(date)
+          if val(int32, band(ord(form[j]), 0DFH)) = 44H then
+            inc(j)
+            copy(@name, @lDayName[x], 32)
+          else
+            copy(@name, @sDayName[x], 32)
+          end
+
+          k := 0
+          while name[k] # 0X do
+            str[i] := name[k]
+            inc(i)
+            inc(k)
+          end
+        else
+          // day with leading zero
+          str[i] := chr(obdiv(x, 10) + val(int32, ord("0")))
+          str[i + 1] := chr(obmod(x, 10) + val(int32, ord("0")))
+          inc(i, 2)
+        end
+
+      else
+        // no leading zero
+        if x > 9 then
+          str[i] := chr(obdiv(x, 10) + val(int32, ord("0")))
+          inc(i)
+        end
+        str[i] := chr(obmod(x, 10) + val(int32, ord("0")))
+        inc(i)
+      end
+
+    elsif val(int32, band(ord(form[j]), 0DFH)) = 4DH then
+      // Month
+      inc(j)
+      x := band(asr(date, 5), 15)
+      if val(int32, band(ord(form[j]), 0DFH)) = 4DH then
+        inc(j)
+        if val(int32, band(ord(form[j]), 0DFH)) = 4DH then
+          inc(j)
+          if val(int32, band(ord(form[j]), 0DFH)) = 4DH then
+            inc(j)
+            copy(@name, @lMonthName[x - 1], 32)
+          else
+            copy(@name, @sMonthName[x - 1], 32)
+          end
+
+          k := 0
+          while name[k] # 0X do
+            str[i] := name[k]
+            inc(i)
+            inc(k)
+          end
+        else
+          str[i] := chr(obdiv(x, 10) + val(int32, ord("0")))
+          str[i + 1] := chr(obmod(x, 10) + val(int32, ord("0")))
+          inc(i, 2)
+        end
+
+      else
+        if x > 9 then
+          str[i] := chr(obdiv(x, 10) + val(int32, ord("0")))
+          inc(i)
+        end
+        str[i] := chr(obmod(x, 10) + val(int32, ord("0")))
+        inc(i)
+      end
+
+    elsif val(int32, band(ord(form[j]), 0DFH)) = 59H then
+      // Year
+      inc(j, 2)
+      x := asr(date, 9)
+      if val(int32, band(ord(form[j]), 0DFH)) = 59H then
+        inc(j, 2)
+        inc(x, 1900)
+        str[i] := chr(obdiv(x, 1000) + val(int32, ord("0")))
+        str[i + 1] := chr(obmod(obdiv(x, 100), 10) + val(int32, ord("0")))
+        str[i + 2] := chr(obmod(obdiv(x, 10), 10) + val(int32, ord("0")))
+        str[i + 3] := chr(obmod(x, 10) + val(int32, ord("0")))
+        inc(i, 4)
+      else
+        str[i] := chr(obmod(obdiv(x, 10), 10) + val(int32, ord("0")))
+        str[i + 1] := chr(obmod(x, 10) + val(int32, ord("0")))
+        inc(i, 2)
+      end
+
+    else
+      str[i] := form[j]
+      inc(i)
+      inc(j)
+    end
+  end
+
+  str[i] := 0X
+end DateToStr
+
+// Returns a month's name (set short to get the abbreviation)
+procedure MonthToStr*(month: int16; str: pointer to array of char; str_len: int32; short_: boolean)
+begin
+  month := obmod(month - 1, 12)
+  if short_ then
+    copy(str, @sMonthName[month], str_len)
+  else
+    copy(str, @lMonthName[month], str_len)
+  end
+end MonthToStr
+
+// Returns a day's name (set short to get the abbreviation)
+procedure DayToStr*(day: int16; str: pointer to array of char; str_len: int32; short_: boolean)
+begin
+  if short_ then
+    copy(str, @sDayName[obmod(day, 7)], str_len)
+  else
+    copy(str, @lDayName[obmod(day, 7)], str_len)
+  end
+end DayToStr
+
+// Convert time (Oberon.GetClock) into specified format.
+procedure TimeToStr*(time: int32; str: pointer to array of char)
+  var
+    i, j, x, h, hPos: int32
+    form: array 32 of char
+    shortH, leadingH: boolean
+begin
+  copy(@form, @timeform, 32)
+  if form = "" then
+    copy(@form, "HH:MM:SS", 32)
+  end
+  i := 0
+  j := 0
+  h := band(asr(time, 12), 31)
+  shortH := false
+  while form[j] # 0X do
+    if ((val(int32, band(ord(form[j]), 0DFH)) = 41H) or (val(int32, band(ord(form[j]), 0DFH)) = 50H)) & (val(int32, band(ord(form[j + 1]), 0DFH)) = 4DH) then
+      shortH := true
+      if val(int32, band(ord(form[j]), 0DFH)) = val(int32, ord(form[j])) then
+        x := 0
+      else
+        x := 32
+      end
+      if (h < 1) or (h > 12) then
+        str[i] := chr(val(int32, ord("P")) + x)
+      else
+        str[i] := chr(val(int32, ord("A")) + x)
+      end
+      h := obmod(h, 12)
+      if h = 0 then
+        h := 12
+      end
+      str[i + 1] := chr(val(int32, ord("M")) + x)
+      inc(i, 2)
+      while (val(int32, band(ord(form[j]), 0DFH)) = 41H) or (val(int32, band(ord(form[j]), 0DFH)) = 50H) or (val(int32, band(ord(form[j]), 0DFH)) = 4DH) do
+        inc(j)
+      end
+    elsif form[j] = "H" then
+      hPos := i
+      inc(i, 2)
+      inc(j)
+      leadingH := form[j] = "H"
+      if leadingH then
+        inc(j)
+      end
+    elsif form[j] = "M" then
+      inc(j)
+      x := band(asr(time, 6), 63)
+      if form[j] = "M" then
+        str[i] := chr(obdiv(x, 10) + val(int32, ord("0")))
+        inc(i)
+        inc(j)
+      elsif x > 9 then
+        str[i] := chr(obdiv(x, 10) + val(int32, ord("0")))
+        inc(i)
+      end
+
+      str[i] := chr(obmod(x, 10) + val(int32, ord("0")))
+      inc(i)
+    elsif form[j] = "S" then
+      inc(j)
+      x := band(time, 63)
+      if form[j] = "S" then
+        str[i] := chr(obdiv(x, 10) + val(int32, ord("0")))
+        inc(i)
+        inc(j)
+      elsif x > 9 then
+        str[i] := chr(obdiv(x, 10) + val(int32, ord("0")))
+        inc(i)
+      end
+
+      str[i] := chr(obmod(x, 10) + val(int32, ord("0")))
+      inc(i)
+    else
+      str[i] := form[j]
+      inc(i)
+      inc(j)
+    end
+  end
+
+  str[i] := 0X
+  if ~leadingH then
+    if h > 9 then
+      str[hPos] := chr(obdiv(h, 10) + val(int32, ord("0")))
+      inc(hPos)
+    else
+      i := hPos + 1
+      while str[i] # 0X do
+        str[i] := str[i + 1]
+        inc(i)
+      end
+    end
+
+    str[hPos] := chr(obmod(h, 10) + val(int32, ord("0")))
+  else
+    str[hPos] := chr(obdiv(h, 10) + val(int32, ord("0")))
+    str[hPos + 1] := chr(obmod(h, 10) + val(int32, ord("0")))
+  end
+end TimeToStr
+
+// Convert a string into an time value. Leading white space characters are ignored.
+procedure StrToTime*(const str: pointer to array of char; time: pointer to int32)
+
+  var
+    h, m, s: int32
+    i: int16
+begin
+  i := 0
+  while (str[i] # 0X) & ((str[i] < "0") or (str[i] > "9")) do
+    inc(i)
+  end
+  StrToIntPos(str, @h, @i)
+  while (str[i] # 0X) & ((str[i] < "0") or (str[i] > "9")) do
+    inc(i)
+  end
+  StrToIntPos(str, @m, @i)
+  while (str[i] # 0X) & ((str[i] < "0") or (str[i] > "9")) do
+    inc(i)
+  end
+  StrToIntPos(str, @s, @i)
+  time^ := (h * 64 + m) * 64 + s
+end StrToTime
+
+// Convert a string into an date value. Leading white space characters are ignored.
+procedure StrToDate*(const str: pointer to array of char; date: pointer to int32)
+
+  var
+    d, m, y: int32
+    i: int16
+begin
+  i := 0
+  while (str[i] # 0X) & ((str[i] < "0") or (str[i] > "9")) do
+    inc(i)
+  end
+  StrToIntPos(str, @d, @i)
+  while (str[i] # 0X) & ((str[i] < "0") or (str[i] > "9")) do
+    inc(i)
+  end
+  StrToIntPos(str, @m, @i)
+  while (str[i] # 0X) & ((str[i] < "0") or (str[i] > "9")) do
+    inc(i)
+  end
+  StrToIntPos(str, @y, @i)
+  y := y - 1900
+  date^ := (y * 16 + m) * 32 + d
+end StrToDate
+
+procedure Init()
+  var
+    i: int32
+    s: Texts.Scanner
+begin
+  Oberon.OpenScanner(@s, "System.DateFormat")
+  if s.class = Texts.String then
+    copy(@dateform, @s.s, 32)
+  else
+    copy(@dateform, "", 32)
+  end
+  Oberon.OpenScanner(@s, "System.TimeFormat")
+  if s.class = Texts.String then
+    copy(@timeform, @s.s, 32)
+  else
+    copy(@timeform, "", 32)
+  end
+  copy(@sDayName[0], "Mon", 4)
+  copy(@sDayName[1], "Tue", 4)
+  copy(@sDayName[2], "Wed", 4)
+  copy(@sDayName[3], "Thu", 4)
+  copy(@sDayName[4], "Fri", 4)
+  copy(@sDayName[5], "Sat", 4)
+  copy(@sDayName[6], "Sun", 4)
+
+  copy(@lDayName[0], "Monday", 12)
+  copy(@lDayName[1], "Tuesday", 12)
+  copy(@lDayName[2], "Wednesday", 12)
+  copy(@lDayName[3], "Thursday", 12)
+  copy(@lDayName[4], "Friday", 12)
+  copy(@lDayName[5], "Saturday", 12)
+  copy(@lDayName[6], "Sunday", 12)
+
+  copy(@sMonthName[0], "Jan", 4)
+  copy(@sMonthName[1], "Feb", 4)
+  copy(@sMonthName[2], "Mar", 4)
+  copy(@sMonthName[3], "Apr", 4)
+  copy(@sMonthName[4], "May", 4)
+  copy(@sMonthName[5], "Jun", 4)
+  copy(@sMonthName[6], "Jul", 4)
+  copy(@sMonthName[7], "Aug", 4)
+  copy(@sMonthName[8], "Sep", 4)
+  copy(@sMonthName[9], "Oct", 4)
+  copy(@sMonthName[10], "Nov", 4)
+  copy(@sMonthName[11], "Dec", 4)
+
+  copy(@lMonthName[0], "January", 12)
+  copy(@lMonthName[1], "February", 12)
+  copy(@lMonthName[2], "March", 12)
+  copy(@lMonthName[3], "April", 12)
+  copy(@lMonthName[4], "May", 12)
+  copy(@lMonthName[5], "June", 12)
+  copy(@lMonthName[6], "July", 12)
+  copy(@lMonthName[7], "August", 12)
+  copy(@lMonthName[8], "September", 12)
+  copy(@lMonthName[9], "October", 12)
+  copy(@lMonthName[10], "November", 12)
+  copy(@lMonthName[11], "December", 12)
+
+  for i := 0 to 255 do
+    isAlpha[i] := (i >= val(int32, ord("A"))) & (i <= val(int32, ord("Z"))) or (i >= val(int32, ord("a"))) & (i <= val(int32, ord("z")))
+  end
+
+  isAlpha[ord(0FFFFFFC4X)] := true
+  isAlpha[ord(0FFFFFFD6X)] := true
+  isAlpha[ord(0FFFFFFDCX)] := true
+  isAlpha[ord(0FFFFFFE4X)] := true
+  isAlpha[ord(0FFFFFFF6X)] := true
+  isAlpha[ord(0FFFFFFFCX)] := true
+  isAlpha[ord(0FFFFFFE2X)] := true
+  isAlpha[ord(0FFFFFFEAX)] := true
+  isAlpha[ord(0FFFFFFEEX)] := true
+  isAlpha[ord(0FFFFFFF4X)] := true
+  isAlpha[ord(0FFFFFFFBX)] := true
+  isAlpha[ord(0FFFFFFE0X)] := true
+  isAlpha[ord(0FFFFFFE8X)] := true
+  isAlpha[ord(0FFFFFFECX)] := true
+  isAlpha[ord(0FFFFFFF2X)] := true
+  isAlpha[ord(0FFFFFFF9X)] := true
+  isAlpha[ord(0FFFFFFE9X)] := true
+  isAlpha[ord(0FFFFFFEBX)] := true
+  isAlpha[ord(0FFFFFFEFX)] := true
+  isAlpha[ord(0FFFFFFE7X)] := true
+  isAlpha[ord(0FFFFFFE1X)] := true
+  isAlpha[ord(0FFFFFFF1X)] := true
+  isAlpha[ord(0FFFFFFDFX)] := true
+  for i := 0 to 255 do
+    ISOToOberon[i] := chr(i)
+    OberonToISO[i] := chr(i)
+  end
+
+  ISOToOberon[8] := 7FX
+  ISOToOberon[146] := "'"
+  ISOToOberon[160] := " "
+  ISOToOberon[162] := "c"
+  ISOToOberon[166] := "|"
+  ISOToOberon[168] := 22X
+  ISOToOberon[169] := "c"
+  ISOToOberon[170] := "a"
+  ISOToOberon[171] := "<"
+  ISOToOberon[173] := "-"
+  ISOToOberon[174] := "r"
+  ISOToOberon[175] := "-"
+  ISOToOberon[176] := "o"
+  ISOToOberon[178] := "2"
+  ISOToOberon[179] := "3"
+  ISOToOberon[180] := "'"
+  ISOToOberon[183] := "."
+  ISOToOberon[185] := "1"
+  ISOToOberon[186] := "0"
+  ISOToOberon[187] := ">"
+  ISOToOberon[192] := "A"
+  ISOToOberon[193] := "A"
+  ISOToOberon[194] := "A"
+  ISOToOberon[195] := "A"
+  ISOToOberon[196] := 80X
+  OberonToISO[128] := 0C4X
+  ISOToOberon[197] := "A"
+  ISOToOberon[198] := "A"
+  ISOToOberon[199] := "C"
+  ISOToOberon[200] := "E"
+  ISOToOberon[201] := "E"
+  ISOToOberon[202] := "E"
+  ISOToOberon[203] := "E"
+  ISOToOberon[204] := "I"
+  ISOToOberon[205] := "I"
+  ISOToOberon[206] := "I"
+  ISOToOberon[207] := "I"
+  ISOToOberon[208] := "D"
+  ISOToOberon[209] := "N"
+  ISOToOberon[210] := "O"
+  ISOToOberon[211] := "O"
+  ISOToOberon[212] := "O"
+  ISOToOberon[213] := "O"
+  ISOToOberon[214] := 81X
+  OberonToISO[129] := 0D6X
+  ISOToOberon[215] := "*"
+  ISOToOberon[216] := "O"
+  ISOToOberon[217] := "U"
+  ISOToOberon[218] := "U"
+  ISOToOberon[219] := "U"
+  ISOToOberon[220] := 82X
+  OberonToISO[130] := 0DCX
+  ISOToOberon[221] := "Y"
+  ISOToOberon[222] := "P"
+  ISOToOberon[223] := 96X
+  OberonToISO[150] := 0DFX
+  ISOToOberon[224] := 8BX
+  OberonToISO[139] := 0E0X
+  ISOToOberon[225] := 94X
+  OberonToISO[148] := 0E1X
+  ISOToOberon[226] := 86X
+  OberonToISO[134] := 0E2X
+  ISOToOberon[227] := "a"
+  ISOToOberon[228] := 83X
+  OberonToISO[131] := 0E4X
+  ISOToOberon[229] := "a"
+  ISOToOberon[230] := "a"
+  ISOToOberon[231] := 93X
+  OberonToISO[147] := 0E7X
+  ISOToOberon[232] := 8CX
+  OberonToISO[140] := 0E8X
+  ISOToOberon[233] := 90X
+  OberonToISO[144] := 0E9X
+  ISOToOberon[234] := 87X
+  OberonToISO[135] := 0EAX
+  ISOToOberon[235] := 91X
+  OberonToISO[145] := 0EBX
+  ISOToOberon[236] := 8DX
+  OberonToISO[141] := 0ECX
+  ISOToOberon[237] := "i"
+  ISOToOberon[238] := 88X
+  OberonToISO[136] := 0EEX
+  ISOToOberon[239] := 92X
+  OberonToISO[146] := 0EFX
+  ISOToOberon[240] := "d"
+  ISOToOberon[241] := 95X
+  OberonToISO[149] := 0F1X
+  ISOToOberon[242] := 8EX
+  OberonToISO[142] := 0F2X
+  ISOToOberon[243] := "o"
+  ISOToOberon[244] := 89X
+  OberonToISO[137] := 0F4X
+  ISOToOberon[245] := "o"
+  ISOToOberon[246] := 84X
+  OberonToISO[132] := 0F6X
+  ISOToOberon[248] := "o"
+  ISOToOberon[249] := 8FX
+  OberonToISO[143] := 0F9X
+  ISOToOberon[250] := "u"
+  ISOToOberon[251] := 8AX
+  OberonToISO[138] := 0FBX
+  ISOToOberon[252] := 85X
+  OberonToISO[133] := 0FCX
+  ISOToOberon[253] := "y"
+  ISOToOberon[254] := "p"
+  ISOToOberon[255] := "y"
+  CRLF[0] := CR
+  CRLF[1] := LF
+  CRLF[2] := 0X
+  CRLF[3] := 0X
+end Init
+
+begin
+  Modules.Register("Strings", nil)
+  Init()
+end Strings.

@@ -1,0 +1,2946 @@
+(* ETH Oberon, Copyright 1990-2003 Computer Systems Institute, ETH Zurich, CH-8092 Zurich.
+Refer to the license.txt file provided with this distribution. *)
+
+module Panels [level=5]
+
+import Objects, Display, Display3, Fonts, Gadgets, Effects, Oberon, Texts, Input, Files, Printer, Printer3, Attributes, Pictures, Modules
+// portable
+// jm 19.1.95
+
+(** Implementation of a panel container.
+*)
+(* some nice to haves:
+- control over the new focus point
+- TranslateToGadgets returns lists of gadgets
+- defocus panel when selecting it
+- remove children direct/indirect
+
+- caret disappears when transparent objects are involved
+- missing cursor when overlapped modify + adjust with transparent on top does not work
+
+14.12.94
+- improved consume
+30.1.95
+- fixed vanishing cursor when resizing transparent gadgets
+19.4.95 - Minor changes in the handling of the left mouse key
+25.4.95 - Changed ChangeBackdrop
+27.4.95 - Fixed resizing of selected lockedsize child
+7.6.95 - changed detection of putting a public object in a panel
+24.8.95 - forward SelectMsg to Children
+7.11.95 - fixed Align0 (thanks jt)
+16.11.95 - fixed insert in locked panel problem
+13.5.96 - fixed Picture link (when L.obj is nil) (ps - 13.5.96)
+13.5.96 - fixed shifting of components (ps - 13.5.96)
+23.5.96 - components stay relative to bottom when panel grows upwards (ps - 23.5.96)
+*)
+
+const
+  DefBorderWidth* = 2 // Default border clipping width.
+
+  // Panel State0 flags
+  noselect* = 0 // Panel will not attempt to select children.
+  noinsert* = 1 // Panel will refuse to accept additional children.
+  frozen* = 3 // Panel is frozen. no further editing is allowed.
+  flatlook* = 4 // Panel is drawn without its 3D look.
+  texture* = 5 // Panel has a picture replicated as a textured background.
+
+  outofboundsmodify = 3
+
+  markW = 5
+
+type
+  Panel* = pointer to PanelDesc
+  Methods* = pointer to MethodsDesc
+
+  PanelDesc* = object (Gadgets.FrameDesc)
+    focused*: boolean // Has the caret ?
+    focusx*: int16 // Relative coordinates of caret.
+    focusy*: int16
+    time*: int32 // Time of selection.
+    back*: Display3.Mask // Background mask of the panel, in relative coordinates.
+    rx*: int16 // Current hull to be redrawn (damage region).
+    ry*, rr*, rt*, borderW*: int16 // Size in pixels of the border area to which children are clipped.
+    do_*: Methods // Method block.
+    state0*: set
+    grid*: int16 // Grid snap size.
+    col*: int16 // Panel background color.
+    pict*: Pictures.Picture // Background picture, NIL if none is used.
+  end
+
+  // In the following methods x, y is the absolute position of the panel on the display.
+  MethodsDesc* = record
+    // Draw panel background.
+    RestoreBackGround*: procedure(F: Panel; x: int16; y: int16; R: Display3.Mask)
+
+    // Directly draw caret shape.
+    RestoreCaret*: procedure(F: Panel; x: int16; y: int16; R: Display3.Mask)
+
+    // Directly display an area of a panel.
+    RestoreArea*: procedure(F: Panel; x: int16; y: int16; u: int16; v: int16; w: int16; h: int16; R: Display3.Mask; dlink: Objects.Object)
+
+    // Update the caret. Calls GrowHull followed by DrawHull for the caret area.
+    UpdateCaret*: procedure(F: Panel)
+
+    // Default caret tracking. Calls Effects.TrackCross, UpdateCaret, CopyObjList, InsertFrames
+    TrackCaret*: procedure(F: Panel; M: pointer to Oberon.InputMsg)
+
+    (** Default selection tracking. Calls Effects.SizeRect, GetPanelSelection, KillChildren,
+    GetPanelSelection, CopyObjList, Gadgets.Integrate *)
+    TrackSelection*: procedure(F: Panel; M: pointer to Oberon.InputMsg)
+
+    (** Selection tracking started directly on a child. Sends a Display.SelectMsg. Calls GetPanelSelection,
+    ResetHull, GrowHull, Effects.TrackMouse, TrackSelection, GetPanelSelection, KillChildren, GetPanelSelection,
+    CopyObjList, Gadgets.Integrate *)
+    TrackSelectChild*: procedure(F: Panel; M: pointer to Oberon.InputMsg; child: Gadgets.Frame)
+
+    (** Standard selection dragging. Calls GetPanelSelection, BoundingBox, Effects.MoveRect, Gadgets.ThisFrame,
+    CopyObjList, ResetHull, GrowHull, TranslateChildren. Sends a ConsumeMsg. *)
+    DragSelection*: procedure(F: Panel; M: pointer to Oberon.InputMsg)
+
+    (** Standard mouse tracking. Calls Effects.SetSnap, ToChild, TrackCaret, Gadgets.SizeFrame, DragSelection,
+    TrackSelection, TrackSelectChild. *)
+    TrackMouse*: procedure(F: Panel; M: pointer to Oberon.InputMsg)
+
+    // Standard keyboard handling. Calls BoundingBox, ResetHull, GrowHull, TranslateChildren, InsertFrames.
+    ConsumeChar*: procedure(F: Panel; M: pointer to Oberon.InputMsg)
+
+    // Convert object into a frame for ConsumeMsg.
+    TranslateToGadget*: procedure(F: Panel; obj: pointer to Objects.Object)
+
+    // Does panel accept this child?
+    AcceptChild*: procedure(F: Panel; obj: pointer to Objects.Object): boolean
+
+    // Insert child into panel. Calls GrowHull. Directly sends a Display.ModifyMsg.
+    InsertChild*: procedure(F: Panel; f: Display.Frame; u: int16; v: int16)
+
+    (** Insert several frames into the panel at u, v. Calls BoundingBox, ResetHull, InsertChild, InvalidateMasks,
+    UpdateMasks, DrawHull. *)
+    InsertFrames*: procedure(F: Panel; u: int16; v: int16; list: Objects.Object)
+
+    // Removes a child from a panel. Calls GrowHull.
+    RemoveChild*: procedure(F: Panel; f: Display.Frame)
+
+    // Removes a list of children. Calls ResetHull, RemoveChild, UpdateMasks, DrawHull.
+    RemoveFrames*: procedure(F: Panel; list: Display.Frame)
+  end
+
+var
+  methods*: Methods // Default method block.
+  defaultgrid*: int16 // Default grid snap for new panels.
+  newfocusX*: int16 // Set by InsertFrames to indicate the caret position after child consumption.
+  newfocusY*: int16
+  recall*: Objects.Object // Last deleted children
+
+  W: Texts.Writer
+
+  // for invalidating masks
+  sx: int16 // also for tracking the selection
+  sy, sw, sh: int16
+  tmpR: Display3.Mask
+
+  // for restoreRegion
+  tmpP: Panel
+  px, py: int16
+  tmpdlink: Objects.Object
+  tmpM: Display3.Mask
+
+procedure ^ PromoteChild*(F, f: Display.Frame)
+
+procedure Min(x, y: int16): int16
+begin
+  if x < y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Min
+
+procedure Max(x, y: int16): int16
+begin
+  if x > y then
+    return x
+  else
+    return y
+  end
+  return 0 // TODO o2m: Micron requires a result on all control paths
+end Max
+
+procedure ClipAgainst(x, y, w, h: pointer to int16; x1, y1, w1, h1: int16)
+  var
+    r, t, r1, t1: int16
+begin
+  r := x^ + w^ - 1
+  r1 := x1 + w1 - 1
+  t := y^ + h^ - 1
+  t1 := y1 + h1 - 1
+  if x^ < x1 then
+    x^ := x1
+  end
+  if y^ < y1 then
+    y^ := y1
+  end
+  if r > r1 then
+    r := r1
+  end
+  if t > t1 then
+    t := t1
+  end
+  w^ := r - x^ + 1
+  h^ := t - y^ + 1
+end ClipAgainst
+
+// Calculate the bounding box and count of a list of frames.
+procedure BoundingBox*(list: Display.Frame; x, y, w, h, count: pointer to int16)
+  var
+    f: Display.Frame
+    r, t: int16
+begin
+  x^ := 32000
+  y^ := 32000
+  r := -32000
+  t := -32000
+  f := list
+  count^ := 0
+  while f # nil do
+    x^ := Min(x^, f.X)
+    y^ := Min(y^, f.Y)
+    r := Max(r, f.X + f.W - 1)
+    t := Max(t, f.Y + f.H - 1)
+    w^ := r - x^ + 1
+    h^ := t - y^ + 1
+    inc(count^)
+    if f.slink # nil then
+      f := f.slink(Display.Frame)
+    else
+      f := nil
+    end
+  end
+end BoundingBox
+
+// Is f in the dsc-next list of F ?
+procedure IsChild*(F, f: Display.Frame): boolean
+begin
+  F := F.dsc
+  while F # nil do
+    if F = f then
+      return true
+    end
+    F := F.next
+  end
+
+  return false
+end IsChild
+
+// Forward a message M from F to child f. x, y is the display coordinates of F.
+procedure ToChild*(F: Panel; f: Display.Frame; x, y: int16; M: pointer to Display.FrameMsg)
+  var
+    u, v: int16
+    Mdlink, Fdlink: Objects.Object
+begin
+  if M.res < 0 then
+    u := M.x
+    v := M.y
+    M.x := x
+    M.y := y + F.H - 1
+    Fdlink := F.dlink
+    Mdlink := M.dlink
+    F.dlink := M.dlink
+    M.dlink := F
+    f.handle(f, M)
+    F.dlink := Fdlink
+    M.dlink := Mdlink
+    M.x := u
+    M.y := v
+  end
+end ToChild
+
+// Forward message to all children of F.
+procedure ToChildren*(F: Panel; M: pointer to Objects.ObjMsg)
+  var
+    n, f: Display.Frame
+    u, v: int16
+    Mdlink, Fdlink: Objects.Object
+begin
+  case M of
+  | Display.PFrameMsg:
+    if M.res < 0 then
+      Fdlink := F.dlink
+      Mdlink := M.dlink
+      F.dlink := M.dlink
+      M.dlink := F
+      u := M.x
+      v := M.y
+      M.x := M.x + F.X
+      M.y := M.y + F.Y + F.H - 1
+      f := F.dsc
+      while (f # nil) & (M.res < 0) do
+        n := f.next
+        f.handle(f, M)
+        f := n
+      end
+
+      M.x := u
+      M.y := v
+      F.dlink := Fdlink
+      M.dlink := Mdlink
+    end
+
+  else
+    f := F.dsc
+    while f # nil do
+      n := f.next
+      f.handle(f, M)
+      f := n
+    end
+  end
+end ToChildren
+
+// What child is located at absolute X, Y? x, y is the absolute position of F.
+procedure ThisChild*(F: Panel; x, y, X, Y: int16): Display.Frame
+  var
+    f, T: Display.Frame
+    childu, childv: int16
+    M: Display.LocateMsg
+begin
+  childu := x
+  childv := y + F.H - 1
+  M.X := X
+  M.Y := Y
+  f := F.dsc
+  T := nil
+  while f # nil do
+    x := childu + f.X
+    y := childv + f.Y
+    if (X >= x) & (Y >= y) & (X < x + f.W) & (Y < y + f.H) then
+      M.x := childu
+      M.y := childv
+      M.dlink := nil
+      M.F := nil
+      M.loc := nil
+      M.res := -1
+      f.handle(f, @M)
+      if M.loc # nil then
+        T := f
+      end
+    end
+
+    f := f.next
+  end
+
+  return T
+end ThisChild
+
+// Return all frames selected inside of F. Link is by slink field.
+procedure GetPanelSelection*(F: Panel; list: pointer to Display.Frame)
+  var
+    t, last: Display.Frame
+begin
+  list^ := nil
+  last := nil
+  t := F.dsc
+  while t # nil do
+    if (t is Gadgets.Frame) & (Gadgets.selected in t(Gadgets.Frame).state) then
+      if last = nil then
+        list^ := t
+      else
+        last.slink := t
+      end
+
+      last := t
+      t.slink := nil
+    end
+
+    t := t.next
+  end
+end GetPanelSelection
+
+// Default store mechanism.
+procedure StorePanel*(F: Panel; M: pointer to Objects.FileMsg)
+  var
+    t: Display.Frame
+    u: int16
+begin
+  Files.WriteNum(@M.R, 7)
+  Files.WriteSet(@M.R, F.state0)
+  Files.WriteNum(@M.R, F.borderW)
+  Files.WriteNum(@M.R, F.grid)
+  t := F.dsc // count the entries
+  u := 0
+  while t # nil do
+    inc(u)
+    t := t.next
+  end
+  Files.WriteInt(@M.R, u) // write the count
+  t := F.dsc
+  while t # nil do
+    Gadgets.WriteRef(@M.R, F.lib, t)
+    t := t.next
+  end
+  Gadgets.WriteRef(@M.R, F.lib, F.pict)
+  Files.WriteInt(@M.R, F.col)
+  Gadgets.framehandle(F, M)
+end StorePanel
+
+procedure Explain()
+begin
+  if (Modules.res # 0) & (Modules.resMsg # "") then
+    Texts.WriteString(@W, " (")
+    Texts.WriteString(@W, @Modules.resMsg)
+    Texts.Write(@W, ")")
+  end
+end Explain
+
+// Default load mechanism.
+procedure LoadPanel*(F: Panel; M: pointer to Objects.FileMsg)
+  var
+    ver, x: int32
+    u: int16
+    t: Display.Frame
+    obj: Objects.Object
+begin
+  Files.ReadNum(@M.R, @ver)
+  if (ver = 5) or (ver = 6) or (ver = 7) then
+    Files.ReadSet(@M.R, @F.state0)
+    Files.ReadNum(@M.R, @x)
+    F.borderW := val(int16, x)
+    Files.ReadNum(@M.R, @x)
+    F.grid := val(int16, x)
+    Files.ReadInt(@M.R, @u)
+    F.dsc := nil
+    t := nil
+    while u > 0 do
+      Gadgets.ReadRef(@M.R, F.lib, @obj)
+      if obj # nil then
+        case obj of
+        | Display.Frame:
+          obj(Display.Frame).next := nil
+          if t = nil then
+            F.dsc := obj(Display.Frame)
+            t := F.dsc
+          else
+            t.next := obj(Display.Frame)
+            t := t.next
+          end
+
+        | Objects.Dummy:
+          // Alien
+          Texts.WriteString(@W, "Discarding ")
+          Texts.WriteString(@W, @obj(Objects.Dummy).GName)
+          Explain()
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+        else
+          halt(99)
+        end
+      end
+
+      dec(u)
+    end
+
+    if ver >= 6 then
+      Gadgets.ReadRef(@M.R, F.lib, @obj)
+      if obj # nil then
+        case obj of
+        | Pictures.Picture:
+          F.pict := obj(Pictures.Picture)
+        | Objects.Dummy:
+          // Alien
+          Texts.WriteString(@W, "Discarding picture")
+          Explain()
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+        end
+      end
+
+      if ver = 7 then
+        Files.ReadInt(@M.R, @F.col)
+      end
+    end
+
+    Gadgets.framehandle(F, M)
+  elsif (ver = 3) or (ver = 4) then
+    Files.ReadSet(@M.R, @F.state0)
+    if ver > 3 then
+      Files.ReadNum(@M.R, @x)
+      F.borderW := val(int16, x)
+      F.grid := defaultgrid
+    end
+
+    Files.ReadInt(@M.R, @u)
+    F.dsc := nil
+    t := nil
+    while u > 0 do
+      Gadgets.ReadRef(@M.R, F.lib, @obj)
+      if obj # nil then
+        case obj of
+        | Display.Frame:
+          obj(Display.Frame).next := nil
+          if t = nil then
+            F.dsc := obj(Display.Frame)
+            t := F.dsc
+          else
+            t.next := obj(Display.Frame)
+            t := t.next
+          end
+
+        | Objects.Dummy:
+          // Alien
+          Texts.WriteString(@W, "Discarding ")
+          Texts.WriteString(@W, @obj(Objects.Dummy).GName)
+          Explain()
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+        else
+          halt(99)
+        end
+      end
+
+      dec(u)
+    end
+
+    Gadgets.framehandle(F, M)
+  else
+    halt(99)
+  end
+
+  if F.col < 0 then
+    F.col := Display3.groupC
+  end
+end LoadPanel
+
+// Default copy behavior.
+procedure CopyPanel*(M: pointer to Objects.CopyMsg; from, to_: Panel)
+  var
+    t, t0: Display.Frame
+    C: Objects.CopyMsg
+begin
+  Gadgets.CopyFrame(M, from, to_)
+
+  t := from.dsc
+  to_.dsc := nil
+  C.stamp := M.stamp
+  C.id := M.id
+  if t # nil then
+    t.handle(t, @C)
+    t0 := C.obj(Display.Frame)
+    t := t.next
+    to_.dsc := t0
+  end
+  while t # nil do
+    t.handle(t, @C)
+    t0.next := C.obj(Display.Frame)
+    t := t.next
+    t0 := t0.next
+  end
+
+  to_.focused := false
+  to_.time := Input.Time() - val(int32, 32767)
+  to_.grid := from.grid
+  to_.borderW := from.borderW
+  to_.state0 := from.state0
+  to_.do_ := from.do_
+  if (from.pict # nil) & (M.id = Objects.deep) then
+    C.stamp := M.stamp
+    C.id := M.id
+    from.pict.handle(from.pict, @C)
+    to_.pict := C.obj(Pictures.Picture)
+  else
+    to_.pict := from.pict
+  end
+
+  to_.col := from.col
+end CopyPanel
+
+procedure PanelAttr(F: Panel; M: pointer to Objects.AttrMsg)
+  var
+    f: Files.File
+begin
+  if M.id = Objects.get then
+    if M.name = "Gen" then
+      M.class := Objects.String
+      copy(@M.s, "Panels.NewPanel", 64)
+      M.res := 0
+    elsif M.name = "LineupHY" then
+      M.class := Objects.Int
+      M.i := F.H - Fonts.Default.height
+      M.res := 0
+    elsif M.name = "Locked" then
+      M.class := Objects.Bool
+      M.b := frozen in F.state0
+      M.res := 0
+    elsif M.name = "Color" then
+      M.class := Objects.Int
+      M.i := F.col
+      M.res := 0
+    elsif M.name = "Flat" then
+      M.class := Objects.Bool
+      M.b := flatlook in F.state0
+      M.res := 0
+    elsif (M.name = "FocusX") & F.focused then
+      M.class := Objects.Int
+      M.i := F.focusx
+      M.res := 0
+    elsif (M.name = "FocusY") & F.focused then
+      M.class := Objects.Int
+      M.i := F.focusy
+      M.res := 0
+    elsif M.name = "Border" then
+      M.class := Objects.Int
+      M.i := F.borderW
+      F.mask := nil
+      M.res := 0
+    elsif M.name = "GridSnap" then
+      M.class := Objects.Int
+      M.i := F.grid
+      M.res := 0
+    elsif M.name = "Texture" then
+      M.class := Objects.Bool
+      M.b := texture in F.state0
+      M.res := 0
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.set_ then
+    if M.name = "Locked" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state := F.state + {Gadgets.lockedcontents,Gadgets.lockedsize}
+          F.state0 := F.state0 + {noselect,noinsert,frozen}
+        else
+          F.state := F.state - {Gadgets.lockedcontents,Gadgets.lockedsize}
+          F.state0 := F.state0 - {noselect,noinsert,frozen}
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "Color" then
+      if (M.class = Objects.Int) & (M.i >= 0) & (M.i <= 255) then
+        F.col := val(int16, M.i)
+        M.res := 0
+      end
+    elsif M.name = "Flat" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state0 := F.state0 + {flatlook}
+        else
+          F.state0 := F.state0 - {flatlook}
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "Texture" then
+      if M.class = Objects.Bool then
+        if M.b then
+          F.state0 := F.state0 + {texture}
+        else
+          F.state0 := F.state0 - {texture}
+        end
+
+        M.res := 0
+      end
+
+    elsif M.name = "Border" then
+      if (M.class = Objects.Int) & (M.i >= 0) then
+        F.borderW := val(int16, M.i)
+        M.res := 0
+      end
+    elsif M.name = "GridSnap" then
+      if (M.class = Objects.Int) & (M.i >= 1) then
+        F.grid := val(int16, M.i)
+        M.res := 0
+      end
+    elsif M.name = "Picture" then
+      if M.class = Objects.String then
+        if M.s = "" then
+          F.pict := nil
+        else
+          f := Files.Old(@M.s)
+          if f # nil then
+            newgc(F.pict) // IF M.res = -1 THEN Gadgets.Update(F); END;
+            Pictures.Open(F.pict, @M.s, true)
+          else
+            F.pict := nil
+          end
+        end
+
+        M.res := 0
+      end
+
+    else
+      Gadgets.framehandle(F, M)
+    end
+
+  elsif M.id = Objects.enum then
+    M.Enum("Color")
+    M.Enum("Border")
+    M.Enum("GridSnap")
+    M.Enum("Flat")
+    M.Enum("Texture")
+    M.Enum("Locked")
+    Gadgets.framehandle(F, M)
+  end
+end PanelAttr
+
+procedure Adjust(F: Panel; x, y: int16; M: pointer to Display.ModifyMsg)
+  // ps - 23.5.96
+  var
+    f: Display.Frame
+    A: Display.ModifyMsg
+begin
+  if (M.dH # 0) & (M.Y + M.H # F.Y + F.H) or (M.dW # 0) & (M.X # F.X) then
+    A.id := Display.move
+    A.mode := Display.state
+    Objects.Stamp(@A)
+    // A.dX := F.X - M.X; A.dY := (F.Y + F.H) - (M.Y + M.H);
+    A.dW := 0
+    A.dH := 0
+    A.dX := M.dX
+    A.dY := M.dY
+    A.x := 0
+    A.y := 0
+    f := F.dsc
+    while f # nil do
+      A.X := f.X + A.dX
+      A.Y := f.Y + A.dY
+      A.W := f.W
+      A.H := f.H
+      A.F := f
+      A.res := -1
+      ToChild(F, f, x, y, @A)
+      f := f.next
+    end
+  end
+
+  Gadgets.Adjust(F, M)
+end Adjust
+
+procedure FindObj(F: Panel; M: pointer to Objects.FindMsg)
+  var
+    name: array 64 of char
+    f: Display.Frame
+begin
+  Gadgets.framehandle(F, M)
+  if (M.name # "") & (M.obj = nil) then
+    // first search own children
+    f := F.dsc
+    while (f # nil) & (M.obj = nil) do
+      Gadgets.GetObjName(f, @name, 64)
+      if name = M.name then
+        M.obj := f
+      end
+      f := f.next
+    end
+
+    if M.obj = nil then
+      // to all children
+      f := F.dsc
+      while (f # nil) & (M.obj = nil) do
+        f.handle(f, M)
+        f := f.next
+      end
+    end
+  end
+end FindObj
+
+// Default method implementation. x, y is the panel coordinates. u, v, w, h the relative coordinates of the area to be restored.
+procedure RestoreArea*(F: Panel; x, y, u, v, w, h: int16; M: Display3.Mask; dlink: Objects.Object)
+  var
+    D: Display.DisplayMsg
+    B: Display3.Mask
+    f: Display.Frame
+    X, Y, W, H: int16
+begin
+  Oberon.RemoveMarks(x + u, y + F.H - 1 + v, w, h)
+  X := M.X
+  Y := M.Y
+  W := M.W
+  H := M.H
+
+  if M # F.mask then
+    F.back.x := x
+    F.back.y := y + F.H - 1
+    Display3.IntersectMasks(M, F.back, @B)
+    F.back.x := 0
+    F.back.y := 0
+    B.x := 0
+    B.y := 0
+  else
+    B := F.back
+    B.x := 0
+    B.y := 0
+  end
+
+  Display3.AdjustMask(M, x + u, y + F.H - 1 + v, w, h)
+  B.X := M.X
+  B.Y := M.Y
+  B.W := M.W
+  B.H := M.H
+  B.x := x
+  B.y := y + F.H - 1
+  F.do_.RestoreBackGround(F, x, y, B) // restore visible background
+  f := F.dsc
+  while f # nil do
+    if Effects.Intersect(u, v, w, h, f.X, f.Y, f.W, f.H) then
+      // should clip against here
+      D.u := f.X
+      D.v := f.Y
+      D.w := f.W
+      D.h := f.H
+      ClipAgainst(@D.u, @D.v, @D.w, @D.h, u, v, w, h)
+      D.u := D.u - f.X
+      D.v := D.v - (f.Y + f.H - 1)
+      D.dlink := dlink
+      D.x := 0
+      D.y := 0
+      D.device := Display.screen
+      D.id := Display.area
+      D.F := f
+      D.res := -1
+      ToChild(F, f, x, y, @D)
+    end
+
+    f := f.next
+  end
+
+  if F.focused then
+    Gadgets.MakeMask(F, x, y, dlink, @M)
+    F.do_.RestoreCaret(F, x, y, M)
+  end
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(M, Display3.white, Display3.selectpat, x, y, x, y, F.W, F.H, Display.paint)
+  end
+
+  M.X := X
+  M.Y := Y
+  M.W := W
+  M.H := H
+end RestoreArea
+
+// The hull contains the panel area to be updated in rel coordinates.
+procedure ResetHull*(F: Panel)
+begin
+  F.rx := 32000
+  F.ry := 32000
+  F.rr := -32000
+  F.rt := -32000
+end ResetHull
+
+procedure GetHull*(F: Panel; u, v, w, h: pointer to int16)
+begin
+  if (F.rr > F.rx) & (F.rt > F.ry) then
+    u^ := F.rx
+    v^ := F.ry
+    w^ := F.rr - F.rx + 1
+    h^ := F.rt - F.ry + 1
+  else
+    u^ := 0
+    v^ := 0
+    w^ := 0
+    h^ := 0
+  end
+end GetHull
+
+// Increase the size of the hull with the area u, v, w, h..
+procedure GrowHull*(F: Panel; u, v, w, h: int16)
+begin
+  F.rx := Min(F.rx, u)
+  F.ry := Min(F.ry, v)
+  F.rr := Max(F.rr, u + w - 1)
+  F.rt := Max(F.rt, v + h - 1)
+end GrowHull
+
+// Draw the hull area. Hull is reset.
+procedure DrawHull*(F: Panel)
+  var
+    D: Display.DisplayMsg
+    x, y, w, h: int16
+begin
+  GetHull(F, @x, @y, @w, @h)
+  if (w > 0) & (h > 0) then
+    D.device := Display.screen
+    D.id := Display.area
+    D.F := F
+    D.u := x
+    D.v := y
+    D.w := w
+    D.h := h
+    ResetHull(F)
+    Display.Broadcast(@D)
+  end
+end DrawHull
+
+// Recalculate and update all invalid (NIL) masks of children. partialupdate modifies the existing backgound mask to reflect the current situation. buildback recreates the whole background mask from scratch. Both options are normally used mutual exclusive. Partial update is faster if few masks were invalidated, otherwise use buildback.  Partial update requires the use of InvalidateMasks to keep the background mask valid. When in doubt simply use buildback.
+procedure UpdateMasks*(F: Panel; partialupdate, buildback: boolean)
+  var
+    f, o: Display.Frame
+    O: Display3.OverlapMsg
+    allTransp: boolean
+    R: Display3.Mask
+    fx, fy, fw, fh: int16
+begin
+  if F.mask = nil then
+    // clear everything
+    F.back := nil
+    f := F.dsc
+    O.M := nil
+    O.F := nil
+    O.x := 0
+    O.y := 0
+    O.res := -1
+    Objects.Stamp(@O)
+    while f # nil do
+      O.res := -1
+      f.handle(f, @O)
+      f := f.next
+    end
+  else
+    f := F.dsc // KR
+    allTransp := true
+    while (f # nil) & allTransp do
+      allTransp := allTransp & (f is Gadgets.Frame) & (Gadgets.transparent in f(Gadgets.Frame).state)
+      f := f.next
+    end
+
+    F.mask.x := 0
+    F.mask.y := 0
+
+    // build background
+    if buildback then
+      Display3.Copy(F.mask, @F.back) // original background, relative
+      if ~allTransp then
+        f := F.dsc
+        while f # nil do
+          if (f is Gadgets.Frame) & ~(Gadgets.transparent in f(Gadgets.Frame).state) then
+            fx := f.X
+            fy := f.Y
+            fw := f.W
+            fh := f.H
+            ClipAgainst(@fx, @fy, @fw, @fh, F.borderW, -F.H + F.borderW + 1, F.W - F.borderW * 2, F.H - F.borderW * 2)
+            Display3.Subtract(F.back, fx, fy, fw, fh)
+          end
+
+          f := f.next
+        end
+      end
+    end
+
+    // build masks for children
+    f := F.dsc
+    while f # nil do
+      if ~partialupdate or (f is Gadgets.Frame) & (f(Gadgets.Frame).mask = nil) then
+        Display3.Copy(F.mask, @R)
+        Display3.Intersect(R, F.borderW, -F.H + F.borderW + 1, F.W - F.borderW * 2, F.H - F.borderW * 2)
+        Display3.Intersect(R, f.X, f.Y, f.W, f.H)
+        if ~allTransp then
+          o := f.next
+          while o # nil do
+            // loop through higher priority children
+            if Effects.Intersect(f.X, f.Y, f.W, f.H, o.X, o.Y, o.W, o.H) & (o is Gadgets.Frame) & ~(Gadgets.transparent in o(Gadgets.Frame).state) then
+              Display3.Subtract(R, o.X, o.Y, o.W, o.H)
+            end
+
+            o := o.next
+          end
+        end
+
+        R.x := -f.X
+        R.y := -(f.Y + f.H - 1)
+        Display3.Shift(R)
+        O.x := 0
+        O.y := 0
+        O.M := R
+        O.F := f
+        O.res := -1
+        O.dlink := nil
+        O.x := 0
+        O.y := 0
+        f.handle(f, @O)
+      end
+
+      f := f.next
+    end
+  end
+end UpdateMasks
+
+procedure Out0(x, y, w, h: int16)
+begin
+  ClipAgainst(@x, @y, @w, @h, sx, sy, sw, sh)
+  if (w > 0) & (h > 0) then
+    Display3.Subtract(tmpR, x, y, w, h)
+  end
+end Out0
+
+// Invalidate all masks of the children in the specified rectangle except the exception. Background is updated so that the rectangle becomes part of the panel background.
+procedure InvalidateMasks*(F: Panel; except: Display.Frame; x, y, w, h: int16)
+  var
+    f: Display.Frame
+    x0, y0, w0, h0: int16
+    O: Display3.OverlapMsg
+begin
+  if F.back # nil then
+    // add background in
+    F.back.x := 0
+    F.back.y := 0
+    ClipAgainst(@x, @y, @w, @h, 0, -F.H + 1, F.W, F.H)
+    Display3.Add(F.back, x, y, w, h)
+  end
+
+  f := F.dsc
+  O.M := nil
+  O.x := 0
+  O.F := nil
+  O.y := 0
+  O.res := -1
+  Objects.Stamp(@O)
+  while f # nil do
+    if Effects.Intersect(x, y, w, h, f.X, f.Y, f.W, f.H) & (f is Gadgets.Frame) then
+      if ~(Gadgets.transparent in f(Gadgets.Frame).state) & (F.back # nil) then
+        x0 := f.X
+        y0 := f.Y
+        w0 := f.W
+        h0 := f.H
+        ClipAgainst(@x0, @y0, @w0, @h0, F.borderW, -F.H + F.borderW + 1, F.W - F.borderW * 2, F.H - F.borderW * 2)
+        Display3.Subtract(F.back, x0, y0, w0, h0)
+      end
+
+      if f # except then
+        O.F := f
+        f.handle(f, @O)
+        O.res := -1
+      end
+    end
+
+    f := f.next
+  end
+
+  // cut out parts of the total mask
+  if (F.back # nil) & (F.mask # nil) then
+    F.mask.x := 0
+    F.mask.y := 0
+    tmpR := F.back
+    sx := 0
+    sy := -F.H + 1
+    sw := F.W
+    sh := F.H
+    Display3.EnumInvert(F.mask, Out0)
+    tmpR := nil
+  end
+end InvalidateMasks
+
+// Set the selection state of children to Display.reset or Display.set.
+procedure SetChildren*(F: Panel; x, y, state: int16)
+  var
+    M: Display.SelectMsg
+    f: Display.Frame
+begin
+  M.id := state
+  f := F.dsc
+  ResetHull(F)
+  while f # nil do
+    if ~(f is Gadgets.Frame) then
+      GrowHull(F, f.X, f.Y, f.W, f.H)
+    elsif (state = Display.reset) & (Gadgets.selected in f(Gadgets.Frame).state) then
+      GrowHull(F, f.X, f.Y, f.W, f.H)
+    elsif (state = Display.set_) & ~(Gadgets.selected in f(Gadgets.Frame).state) then
+      GrowHull(F, f.X, f.Y, f.W, f.H)
+    end
+
+    M.F := f
+    M.res := -1
+    M.dlink := nil
+    Objects.Stamp(@M)
+    M.x := 0
+    M.y := 0
+    M.time := Input.Time()
+    ToChild(F, f, x, y, @M)
+    f := f.next
+  end
+
+  DrawHull(F)
+end SetChildren
+
+// Method implementations.
+procedure TrackMouse*(F: Panel; M: pointer to Oberon.InputMsg)
+  var
+    T: Display.Frame
+    x, y, t, u, v: int16
+    Fdlink, Mdlink: Objects.Object
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  t := y + F.H - 1
+  T := ThisChild(F, x, y, M.X, M.Y)
+
+  if T # nil then
+    Effects.SetSnap(x, t, F.grid, F.grid)
+    ToChild(F, T, x, y, M)
+    Effects.SetSnap(0, 0, 1, 1)
+  end
+
+  if M.res < 0 then
+    Effects.SetSnap(x, t, F.grid, F.grid)
+    if 2 in M.keys then
+      // left
+      if ~(noinsert in F.state0) then
+        F.do_.TrackCaret(F, M)
+      end
+    elsif 1 in M.keys then
+      // middle
+      if (T # nil) & (Gadgets.selected in T(Gadgets.Frame).state) then
+        case T of
+        | Gadgets.Frame:
+          if Effects.InCorner(M.X, M.Y, x + T.X, t + T.Y, T.W, T.H) & ~(Gadgets.lockedsize in T.state) then
+            // !!!test here
+            u := M.x
+            v := M.y
+            M.x := x
+            M.y := t
+            Fdlink := F.dlink
+            Mdlink := M.dlink
+            F.dlink := M.dlink
+            M.dlink := F
+            Gadgets.SizeFrame(T, M)
+            F.dlink := Fdlink
+            M.dlink := Mdlink
+            M.x := u
+            M.y := v
+            M.res := 0
+          else
+            F.do_.DragSelection(F, M)
+          end
+        end
+      end
+
+    elsif 0 in M.keys then
+      // right
+      if ~(noselect in F.state0) then
+        if T = nil then
+          F.do_.TrackSelection(F, M)
+        else
+          F.do_.TrackSelectChild(F, M, T(Gadgets.Frame))
+        end
+      end
+    end
+
+    Effects.SetSnap(0, 0, 1, 1)
+  end
+end TrackMouse
+
+// Default handling of the LocateMsg.
+procedure Locate*(F: Display.Frame; M: pointer to Display.LocateMsg)
+  var
+    f, T: Display.Frame
+    childu, childv, x, y, tx, ty, tu, tv, X, Y, u, v: int16
+begin
+  u := M.x
+  v := M.y
+  childu := u + F.X
+  childv := v + F.Y + F.H - 1
+  X := M.X
+  Y := M.Y
+  f := F.dsc
+  T := nil
+  while f # nil do
+    x := childu + f.X
+    y := childv + f.Y
+    if (X >= x) & (Y >= y) & (X < x + f.W) & (Y < y + f.H) then
+      M.x := childu
+      M.y := childv
+      M.F := nil
+      M.loc := nil
+      M.res := -1
+      M.dlink := nil
+      f.handle(f, M)
+      if M.loc # nil then
+        T := M.loc
+        tx := M.x
+        ty := M.y
+        tu := M.u
+        tv := M.v
+      end
+    end
+
+    f := f.next
+  end
+
+  if T = nil then
+    M.loc := F
+    M.x := u
+    M.y := v
+    M.u := M.X - childu
+    M.v := M.Y - childv
+  else
+    M.loc := T
+    M.x := tx
+    M.y := ty
+    M.u := tu
+    M.v := tv
+  end
+end Locate
+
+// restore all the transparent objects above a certain rectangle
+procedure RestoreAboveArea(F: Panel; above: Display.Frame; x, y, u, v, w, h: int16; dlink: Objects.Object; M: Display3.Mask)
+  var
+    D: Display.DisplayMsg
+    f: Display.Frame
+begin
+  Oberon.RemoveMarks(x + u, y + F.H - 1 + v, w, h)
+  f := F.dsc
+  while (f # nil) & (f # above) do
+    f := f.next
+  end
+  if f = above then
+    f := f.next
+  end
+  while f # nil do
+    if Effects.Intersect(u, v, w, h, f.X, f.Y, f.W, f.H) & (f is Gadgets.Frame) & (Gadgets.transparent in f(Gadgets.Frame).state) then
+      // should clip against here
+      D.u := f.X
+      D.v := f.Y
+      D.w := f.W
+      D.h := f.H
+      ClipAgainst(@D.u, @D.v, @D.w, @D.h, u, v, w, h)
+      D.u := D.u - f.X
+      D.v := D.v - (f.Y + f.H - 1)
+      D.dlink := dlink
+      D.x := 0
+      D.y := 0
+      D.device := Display.screen
+      D.id := Display.area
+      D.F := f
+      D.res := -1
+      ToChild(F, f, x, y, @D)
+    end
+
+    f := f.next
+  end
+
+  if F.focused then
+    F.do_.RestoreCaret(F, x, y, M)
+  end
+  if Gadgets.selected in F.state then
+    Display3.FillPattern(M, Display3.white, Display3.selectpat, x, y, x, y, F.W, F.H, Display.paint)
+  end
+end RestoreAboveArea
+
+procedure RestoreRegion0(x, y, w, h: int16)
+begin
+  tmpP.do_.RestoreArea(tmpP, px, py, x, y, w, h, tmpM, tmpdlink)
+end RestoreRegion0
+
+// Redraw region M of panel. Mask M is in relative coordinates.
+procedure RestoreRegion*(F: Panel; x, y: int16; dlink: Objects.Object; M: Display3.Mask)
+  var
+    P: Panel
+    tpx, tpy: int16
+begin
+  Gadgets.MakeMask(F, x, y, dlink, @tmpM)
+  P := tmpP // save
+  tpx := px
+  tpy := py
+  tmpP := F
+  px := x
+  py := y
+  tmpdlink := dlink
+  Display3.Enum(M, RestoreRegion0)
+  tmpP := P // restore
+  px := tpx
+  py := tpy
+  tmpM := nil // restore
+  tmpdlink := nil
+end RestoreRegion
+
+procedure HandleChildAdjust(F: Panel; M: pointer to Display.ModifyMsg)
+  var
+    u, v, x, y, ox, oy, ow, oh, oldmode: int16
+    second: boolean
+    R: Display3.Mask
+
+  procedure Forward(F: pointer to Panel; M: pointer to Display.ModifyMsg; u: pointer to int16; v: pointer to int16)
+    var
+      f, next: Display.Frame
+      p, q: int16
+  begin
+    f := F^.dsc
+    p := u^ + F^.X
+    q := v^ + F^.Y
+    while f # nil do
+      next := f.next
+      if f # M.F then
+        ToChild(F^, f, p, q, M)
+      end
+      f := next
+    end
+  end Forward
+begin
+  u := M.x
+  v := M.y
+  x := u + F.X
+  y := v + F.Y
+
+  ox := M.X
+  oy := M.Y
+  ow := M.W
+  oh := M.H
+  ClipAgainst(@ox, @oy, @ow, @oh, 0, -F.H + 1, F.W, F.H)
+  if ((ow <= 0) or (oh <= 0)) & (M.id # outofboundsmodify) then
+    M.res := 0 // out of bounds
+    return
+  end
+  ox := M.X - M.dX // calculate old position
+  oy := M.Y - M.dY
+  ow := M.W - M.dW
+  oh := M.H - M.dH
+
+  if 31 in F.state0 then
+    // recursive adjust
+    F.state0 := F.state0 + {30} // recursive adjust happened
+    oldmode := M.mode
+    M.mode := Display.state
+    ToChild(F, M.F, x, y, M)
+    InvalidateMasks(F, M.F, ox, oy, ow, oh)
+    InvalidateMasks(F, M.F, M.X, M.Y, M.W, M.H)
+    M.mode := oldmode
+    GrowHull(F, ox, oy, ow, oh)
+    GrowHull(F, M.X, M.Y, M.W, M.H)
+    Forward(@F, M, @u, @v)
+  else
+    // first adjust
+    // bring child to front
+    PromoteChild(F, M.F)
+    //
+    F.state0 := F.state0 + {31}
+    F.state0 := F.state0 - {30}
+    second := M.stamp = F.stamp // check for second time around
+    F.stamp := M.stamp
+
+    if M.mode = Display.state then
+      ToChild(F, M.F, x, y, M)
+      GrowHull(F, ox, oy, ow, oh)
+      GrowHull(F, M.X, M.Y, M.W, M.H)
+      if ~second then
+        InvalidateMasks(F, M.F, ox, oy, ow, oh)
+        InvalidateMasks(F, M.F, M.X, M.Y, M.W, M.H)
+      end
+
+    else
+      // M.mode = Display.display
+      if Effects.Intersect(ox, oy, ow, oh, M.X, M.Y, M.W, M.H) then
+        if (M.F is Gadgets.Frame) & (Gadgets.transparent in M.F(Gadgets.Frame).state) then
+          // transparent gadgets
+          GrowHull(F, ox, oy, ow, oh)
+          GrowHull(F, M.X, M.Y, M.W, M.H)
+          M.mode := Display.state
+          ToChild(F, M.F, x, y, M)
+          if ~second then
+            InvalidateMasks(F, M.F, ox, oy, ow, oh)
+            InvalidateMasks(F, M.F, M.X, M.Y, M.W, M.H)
+          end
+          M.mode := Display.display
+        else
+          ToChild(F, M.F, x, y, M)
+          if ~second then
+            InvalidateMasks(F, M.F, ox, oy, ow, oh)
+            InvalidateMasks(F, M.F, M.X, M.Y, M.W, M.H)
+          end
+          Gadgets.MakeMask(F, x, y, M.dlink, @R)
+          RestoreAboveArea(F, M.F, x, y, M.X, M.Y, M.W, M.H, M.dlink, R)
+          newgc(R)
+          Display3.Open(R)
+          Display3.Add(R, ox, oy, ow, oh)
+          Display3.Subtract(R, M.X, M.Y, M.W, M.H)
+          RestoreRegion(F, x, y, M.dlink, R)
+        end
+
+      else
+        ToChild(F, M.F, x, y, M)
+        if ~second then
+          InvalidateMasks(F, M.F, ox, oy, ow, oh)
+          InvalidateMasks(F, M.F, M.X, M.Y, M.W, M.H)
+        end
+        Gadgets.MakeMask(F, x, y, M.dlink, @R)
+        RestoreAboveArea(F, M.F, x, y, M.X, M.Y, M.W, M.H, M.dlink, R)
+        F.do_.RestoreArea(F, x, y, ox, oy, ow, oh, R, M.dlink)
+      end
+    end
+
+    Forward(@F, M, @u, @v)
+
+    if M.mode = Display.display then
+      GetHull(F, @ox, @oy, @ow, @oh)
+      if (ow > 0) & (oh > 0) then
+        if 30 in F.state0 then
+          // recursive happened
+          F.state0 := F.state0 - {30}
+          DrawHull(F)
+        else
+          ResetHull(F)
+          Gadgets.MakeMask(F, x, y, M.dlink, @R)
+          F.do_.RestoreArea(F, x, y, ox, oy, ow, oh, R, M.dlink)
+        end
+      end
+    end
+
+    F.state0 := F.state0 - {31}
+  end
+end HandleChildAdjust
+
+// Get the latest object selection.
+procedure GetSelection*(obj: pointer to Objects.Object; parent: pointer to Display.Frame; time: pointer to int32)
+  var
+    S: Display.SelectMsg
+begin
+  obj^ := nil
+  parent^ := nil
+  S.id := Display.get // object selection
+  S.time := -1
+  S.sel := nil
+  S.obj := nil
+  S.F := nil
+  Display.Broadcast(@S)
+  if S.time # -1 then
+    obj^ := S.obj
+    parent^ := S.sel
+    time^ := S.time
+  else
+    time^ := -1
+  end
+end GetSelection
+
+procedure PrintPanel(F: Panel; x, y: int16; dlink: Objects.Object)
+  var
+    P: Display.DisplayMsg
+    f: Display.Frame
+    R: Display3.Mask
+
+  procedure Pr(x: int16): int16
+  begin
+    return val(int16, obdiv(x * Display.Unit, Printer.Unit))
+  end Pr
+begin
+  Gadgets.MakePrinterMask(F, x, y, dlink, @R)
+  if F.pict # nil then
+    if ~(texture in F.state0) then
+      if F.pict.width < F.W then
+        Printer3.FillPattern(R, 15, Display3.selectpat, x, y, x + Pr(F.pict.width), y, Pr(F.W - F.pict.width), Pr(F.H), Display.replace)
+      end
+
+      if F.pict.height < F.H then
+        Printer3.FillPattern(R, 15, Display3.selectpat, x, y, x, y, Pr(F.W), Pr(F.H - F.pict.height), Display.replace)
+      end
+
+      Printer3.Pict(R, F.pict, x, y + Pr(F.H - F.pict.height), Pr(F.pict.width), Pr(F.pict.height), Display.replace)
+    else
+      Printer3.ReplPict(R, F.pict, x, y, x, y, Pr(F.W), Pr(F.H), Display.replace)
+    end
+
+  elsif flatlook in F.state0 then
+    Printer3.ReplConst(R, F.col, x, y, Pr(F.W), Pr(F.H), Display.replace)
+  else
+    Printer3.FilledRect3D(R, Display3.topC, Display3.bottomC, F.col, x, y, Pr(F.W), Pr(F.H), Pr(1), Display.replace)
+  end
+
+  f := F.dsc
+  y := y + Pr(F.H) - 1
+  while (f # nil) & (Printer.res = 0) do
+    P.res := -1
+    Objects.Stamp(@P)
+    P.device := Display.printer
+    P.id := Display.full
+    P.F := f
+    P.dlink := F
+    P.x := x + Pr(f.X)
+    P.y := y + Pr(f.Y)
+    f.handle(f, @P)
+    f := f.next
+  end
+end PrintPanel
+
+// Bring f to the top in F.
+procedure PromoteChild*(F, f: Display.Frame)
+  var
+    p, p0: Display.Frame
+begin
+  p := F.dsc
+  p0 := nil
+  while p # nil do
+    if p = f then
+      if p0 # nil then
+        p0.next := p.next
+      else
+        F.dsc := p.next
+      end
+      if F.dsc # nil then
+        p := F.dsc
+        while p.next # nil do
+          p := p.next
+        end
+        p.next := f
+      else
+        F.dsc := f
+      end
+
+      f.next := nil
+      return
+    end
+
+    p0 := p
+    p := p.next
+  end
+end PromoteChild
+
+// Method implementation.
+procedure RemoveChild*(F: Panel; f: Display.Frame)
+  var
+    T, T0: Display.Frame
+begin
+  GrowHull(F, f.X, f.Y, f.W, f.H)
+
+  T := F.dsc
+  T0 := nil
+  while T # nil do
+    if T = f then
+      if T0 # nil then
+        T0.next := f.next
+        f.next := nil
+      else
+        F.dsc := f.next
+        f.next := nil
+      end
+
+      return
+    end
+
+    T0 := T
+    T := T.next
+  end
+end RemoveChild
+
+// Put f at the back in F.
+procedure DemoteChild*(F: Panel; f: Display.Frame)
+begin
+  if IsChild(F, f) then
+    RemoveChild(F, f)
+    f.next := F.dsc
+    F.dsc := f
+  end
+end DemoteChild
+
+procedure Priority(F: Panel; f: Display.Frame; where_: int16; passon: boolean)
+  var
+    M: Gadgets.PriorityMsg
+    g: Display.Frame
+begin
+  if where_ = Gadgets.top then
+    PromoteChild(F, f)
+    InvalidateMasks(F, nil, f.X, f.Y, f.W, f.H)
+    Gadgets.Update(f)
+  elsif where_ = Gadgets.bottom then
+    DemoteChild(F, f)
+    InvalidateMasks(F, nil, f.X, f.Y, f.W, f.H)
+    Gadgets.Update(f)
+  elsif where_ = Gadgets.visible then
+    g := f.next
+    loop
+      if g = nil then
+        exit
+      end
+      if Effects.Intersect(g.X, g.Y, g.W, g.H, f.X, f.Y, f.W, f.H) then
+        PromoteChild(F, f)
+        InvalidateMasks(F, nil, f.X, f.Y, f.W, f.H)
+        Gadgets.Update(f)
+        exit
+      end
+
+      g := g.next
+    end
+  end
+
+  if passon then
+    M.id := where_
+    M.F := F
+    M.passon := true
+    Display.Broadcast(@M)
+  end
+end Priority
+
+procedure CopyOver(F: Panel; text: Texts.Text; beg, end_: int32)
+  var
+    T: Texts.Text
+    buf: Texts.Buffer
+begin
+  newgc(buf)
+  Texts.OpenBuf(buf)
+  Texts.Save(text, beg, end_, buf)
+  Oberon.Defocus()
+  newgc(T)
+  Texts.Open(T, "")
+  Texts.Insert(T, 0, buf)
+  Objects.NewObj := T
+  Gadgets.Execute("TextFields.MakeCaption", nil, nil, nil, nil)
+  if Objects.NewObj # nil then
+    F.do_.InsertFrames(F, F.focusx, F.focusy, Objects.NewObj(Display.Frame))
+  end
+end CopyOver
+
+procedure PanelHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    M1: Display.PFrameMsg
+    F2: Panel
+    u, v, x, y, w, h: int16
+    R: Display3.Mask
+    t: Display.Frame
+    obj: Objects.Object
+    U: Display3.UpdateMaskMsg
+begin
+  case F of
+  | Panel:
+    case M of
+    | Display.PFrameMsg:
+      if M.res >= 0 then
+        return
+      end
+      u := M.x
+      v := M.y
+      x := M.x + F.X
+      y := M.y + F.Y
+      w := F.W
+      h := F.H
+      if (M.F = nil) or (M.F = F) then
+        // for this panel or a broadcast
+        if M is Display.PDisplayMsg then
+          if M(Display.PDisplayMsg).device = Display.screen then
+            Gadgets.MakeMask(F, x, y, M(Display.PDisplayMsg).dlink, @R)
+            if M(Display.PDisplayMsg).id = Display.area then
+              F.do_.RestoreArea(F, x, y, M(Display.PDisplayMsg).u, M(Display.PDisplayMsg).v, M(Display.PDisplayMsg).w, M(Display.PDisplayMsg).h, R, M(Display.PDisplayMsg).dlink)
+            else
+              F.do_.RestoreArea(F, x, y, 0, -h + 1, w, h, R, M(Display.PDisplayMsg).dlink)
+            end
+
+          elsif M(Display.PDisplayMsg).device = Display.printer then
+            PrintPanel(F, u, v, M(Display.PDisplayMsg).dlink)
+          end
+
+        elsif M is Display3.POverlapMsg then
+          F.mask := M(Display3.POverlapMsg).M
+          UpdateMasks(F, false, true)
+          M(Display3.POverlapMsg).res := 0
+
+        elsif M is Display3.PUpdateMaskMsg then
+          newgc(F.mask)
+          Display3.Open(F.mask)
+          Display3.Add(F.mask, 0, -F.H + 1, F.W, F.H)
+          F.mask.x := 0
+          F.mask.y := 0
+          UpdateMasks(F, false, true)
+          M(Display3.PUpdateMaskMsg).res := 0
+        elsif M is Display.PLocateMsg then
+          if (M(Display.PLocateMsg).loc = nil) & Effects.Inside(M(Display.PLocateMsg).X, M(Display.PLocateMsg).Y, x, y, w, h) then
+            Locate(F, M(Display.PLocateMsg))
+          end
+
+        elsif M is Display.PSelectMsg then
+          if M(Display.PSelectMsg).id = Display.get then
+            if ((M(Display.PSelectMsg).time - F.time < 0) or (M(Display.PSelectMsg).time = -1)) & (F.time # -1) then
+              GetPanelSelection(F, @t)
+              if t # nil then
+                M(Display.PSelectMsg).time := F.time
+                M(Display.PSelectMsg).obj := t
+                M(Display.PSelectMsg).sel := F
+              else
+                ToChildren(F, M(Display.PSelectMsg))
+              end
+
+            else
+              ToChildren(F, M(Display.PSelectMsg))
+            end
+
+          else
+            Gadgets.framehandle(F, M(Display.PSelectMsg))
+          end
+
+        elsif M is Display.PConsumeMsg then
+          if ~(noinsert in F.state0) then
+            if (M(Display.PConsumeMsg).id = Display.integrate) & F.focused then
+              Oberon.Defocus()
+              F.do_.InsertFrames(F, F.focusx, F.focusy, M(Display.PConsumeMsg).obj)
+              M(Display.PConsumeMsg).res := 0
+              F.focused := true
+              F.focusx := newfocusX
+              F.focusy := newfocusY
+              F.do_.UpdateCaret(F)
+            elsif M(Display.PConsumeMsg).id = Display.drop then
+              F.do_.InsertFrames(F, M(Display.PConsumeMsg).u, M(Display.PConsumeMsg).v, M(Display.PConsumeMsg).obj)
+              M(Display.PConsumeMsg).res := 0
+            end
+          end
+
+          if M(Display.PConsumeMsg).res < 0 then
+            ToChildren(F, M(Display.PConsumeMsg))
+          end
+
+        elsif M is Display.PModifyMsg then
+          Adjust(F, x, y, M(Display.PModifyMsg))
+        elsif M is Display.PControlMsg then
+          ToChildren(F, M(Display.PControlMsg))
+
+        elsif M is Gadgets.PUpdateMsg then
+          if M(Gadgets.PUpdateMsg).obj = F then
+            Gadgets.framehandle(F, M(Gadgets.PUpdateMsg))
+          elsif (M(Gadgets.PUpdateMsg).obj is Gadgets.Frame) & IsChild(F, M(Gadgets.PUpdateMsg).obj(Gadgets.Frame)) then
+            ToChildren(F, M(Gadgets.PUpdateMsg))
+            obj := M(Gadgets.PUpdateMsg).obj
+            while obj # nil do
+              t := obj(Display.Frame)
+              if Gadgets.transparent in t(Gadgets.Frame).state then
+                Gadgets.MakeMask(F, x, y, M(Gadgets.PUpdateMsg).dlink, @R)
+                F.do_.RestoreArea(F, x, y, t.X, t.Y, t.W, t.H, R, M(Gadgets.PUpdateMsg).dlink)
+              else
+                Gadgets.MakeMask(F, x, y, M(Gadgets.PUpdateMsg).dlink, @R)
+                RestoreAboveArea(F, t, x, y, t.X, t.Y, t.W, t.H, M(Gadgets.PUpdateMsg).dlink, R)
+              end
+
+              obj := obj.slink
+            end
+
+          else
+            ToChildren(F, M(Gadgets.PUpdateMsg))
+          end
+
+        elsif M is Oberon.PControlMsg then
+          if M(Oberon.PControlMsg).id = Oberon.neutralize then
+            SetChildren(F, x, y, Display.reset)
+            F.time := Input.Time() - val(int32, 32767)
+            if F.focused then
+              F.focused := false
+              F.do_.UpdateCaret(F)
+            end
+          elsif M(Oberon.PControlMsg).id = Oberon.defocus then
+            if F.focused then
+              F.focused := false
+              F.do_.UpdateCaret(F)
+            end
+          end
+
+          ToChildren(F, M(Oberon.PControlMsg))
+
+        elsif M is Oberon.PConsumeMsg then
+          if F.focused then
+            CopyOver(F, M(Oberon.PConsumeMsg).text, M(Oberon.PConsumeMsg).beg, M(Oberon.PConsumeMsg).end_)
+            M(Oberon.PConsumeMsg).res := 0
+          else
+            ToChildren(F, M(Oberon.PConsumeMsg))
+          end
+
+        elsif M is Oberon.PInputMsg then
+          if (M(Oberon.PInputMsg).id = Oberon.track) & Effects.Inside(M(Oberon.PInputMsg).X, M(Oberon.PInputMsg).Y, x, y, w, h) then
+            if (M(Oberon.PInputMsg).keys # {}) & (M(Oberon.PInputMsg).keys # {2}) & Effects.InBorder(M(Oberon.PInputMsg).X, M(Oberon.PInputMsg).Y, x, y, w, h) then
+              Gadgets.framehandle(F, M(Oberon.PInputMsg))
+            elsif ~(Gadgets.selected in F.state) then
+              F.do_.TrackMouse(F, M(Oberon.PInputMsg))
+            end
+
+          elsif (M(Oberon.PInputMsg).id = Oberon.consume) & F.focused then
+            F.do_.ConsumeChar(F, M(Oberon.PInputMsg))
+          else
+            ToChildren(F, M(Oberon.PInputMsg))
+          end
+
+        elsif M.F # nil then
+          Gadgets.framehandle(F, M)
+        else
+          ToChildren(F, M)
+        end
+
+      else
+        // ================= perhaps for a child
+        if IsChild(F, M.F) then
+          M1 := M
+          case M1 of
+          | Display.PDisplayMsg:
+            if (M1.device = Display.screen) & (Gadgets.transparent in M1.F(Gadgets.Frame).state) then
+              Gadgets.MakeMask(F, x, y, M1.dlink, @R)
+              F.do_.RestoreArea(F, x, y, M1.F.X, M1.F.Y, M1.F.W, M1.F.H, R, M1.dlink)
+            else
+              ToChildren(F, M1)
+            end
+
+          | Display3.PUpdateMaskMsg:
+            if F.mask = nil then
+              U.F := F
+              Display.Broadcast(@U)
+            else
+              UpdateMasks(F, true, false)
+            end
+
+          | Display.PModifyMsg:
+            HandleChildAdjust(F, M1(Display.PModifyMsg))
+          | Gadgets.PPriorityMsg:
+            Priority(F, M1.F, M1.id, M1.passon)
+            M1.res := 0
+
+          | Display.PControlMsg:
+            ToChildren(F, M1)
+            if M1.id = Display.remove then
+              F.do_.RemoveFrames(F, M1.F)
+              M1.res := 0
+            end
+
+          | Display.PSelectMsg:
+            if M1.id = Display.set_ then
+              F.time := Oberon.Time()
+              ToChildren(F, M1)
+            elsif M1.id = Display.reset then
+              GetPanelSelection(F, @t)
+              if t = nil then
+                F.time := Input.Time() - val(int32, 32767)
+              end
+              ToChildren(F, M1)
+            end
+
+          | Display.PConsumeMsg:
+            ToChildren(F, M1)
+            if (M1.res < 0) & ~(noinsert in F.state0) then
+              // has not consumed
+              F.do_.InsertFrames(F, M1.F.X + M1.u, M1.F.Y + M1.F.H - 1 + M1.v, M1.obj)
+              M1.res := 0
+            end
+
+          else
+            ToChildren(F, M1)
+          end
+
+        else
+          ToChildren(F, M) // not a direct child
+        end
+      end
+
+      M.x := u
+      M.y := v
+
+    | Objects.PAttrMsg:
+      PanelAttr(F, M(Objects.PAttrMsg))
+    | Objects.PFileMsg:
+      if M.id = Objects.load then
+        LoadPanel(F, M)
+      elsif M.id = Objects.store then
+        StorePanel(F, M)
+      end
+
+    | Objects.PCopyMsg:
+      if M.stamp = F.stamp then
+        M.obj := F.dlink
+      else
+        newgc(F2)
+        F.stamp := M.stamp
+        F.dlink := F2
+        CopyPanel(M, F, F2)
+        M.obj := F2
+      end
+
+    | Objects.PBindMsg:
+      Gadgets.framehandle(F, M)
+      ToChildren(F, M)
+      if F.pict # nil then
+        F.pict.handle(F.pict, M)
+      end
+    | Objects.PLinkMsg:
+      if M.id = Objects.get then
+        if M.name = "Picture" then
+          M.obj := F.pict
+          M.res := 0
+        else
+          Gadgets.framehandle(F, M)
+        end
+
+      elsif M.id = Objects.set_ then
+        if M.name = "Picture" then
+          // ps - 13.2.96
+          if M.obj = nil then
+            F.pict := nil
+            M.res := 0
+          elsif M.obj is Pictures.Picture then
+            F.pict := M.obj(Pictures.Picture)
+            M.res := 0
+          end
+
+        else
+          Gadgets.framehandle(F, M)
+        end
+
+      elsif M.id = Objects.enum then
+        M.Enum("Picture")
+        Gadgets.framehandle(F, M)
+      else
+        halt(99)
+      end
+
+    | Objects.PFindMsg:
+      FindObj(F, M(Objects.PFindMsg))
+    else
+      Gadgets.framehandle(F, M)
+    end
+  end
+end PanelHandler
+
+procedure InitPanel*(P: Panel)
+begin
+  P.handle := PanelHandler
+  P.dsc := nil
+  P.W := 128
+  P.H := 128
+  P.focused := false
+  P.time := Input.Time() - val(int32, 32767)
+  P.borderW := DefBorderWidth
+  P.grid := defaultgrid
+  ResetHull(P)
+  P.do_ := methods
+  P.col := Display3.groupC
+end InitPanel
+
+procedure NewPanel*()
+  var
+    P: Panel
+begin
+  newgc(P)
+  InitPanel(P)
+  Objects.NewObj := P
+end NewPanel
+
+// Generator for a panel with a picture as background. Default picture is Default.Pict.
+procedure NewPictPanel*()
+  var
+    P: Panel
+    f: Files.File
+begin
+  newgc(P)
+  InitPanel(P)
+  f := Files.Old("Default.Pict")
+  if f # nil then
+    newgc(P.pict)
+    Pictures.Open(P.pict, "Default.Pict", true)
+  end
+
+  Objects.NewObj := P
+end NewPictPanel
+
+// Command to bring the selection of a panel to the front.
+procedure ToFront*()
+  var
+    M: Display.SelectMsg
+    b: Objects.Object
+    P: Gadgets.PriorityMsg
+begin
+  M.id := Display.get
+  M.time := -1
+  M.obj := nil
+  M.sel := nil
+  M.F := nil
+  Display.Broadcast(@M)
+  if M.time # -1 then
+    b := M.obj
+    while b # nil do
+      P.id := Gadgets.top
+      P.F := b(Display.Frame)
+      P.passon := true
+      Display.Broadcast(@P)
+      b := b.slink
+    end
+  end
+end ToFront
+
+// Command to take the selection of a panel to the back.
+procedure ToBack*()
+  var
+    M: Display.SelectMsg
+    b: Objects.Object
+    P: Gadgets.PriorityMsg
+begin
+  M.id := Display.get
+  M.time := -1
+  M.obj := nil
+  M.sel := nil
+  M.F := nil
+  Display.Broadcast(@M)
+  if M.time # -1 then
+    b := M.obj
+    while b # nil do
+      P.id := Gadgets.bottom
+      P.F := b(Display.Frame)
+      P.passon := true
+      Display.Broadcast(@P)
+      b := b.slink
+    end
+  end
+end ToBack
+
+(** Used in the form:
+
+Panels.ChangeBackdrop <picturename>
+
+Changes the background of the selected panels. Use a non-existing filename to reset the backdrop of a panel.
+*)
+procedure ChangeBackdrop*()
+  var
+    S: Attributes.Scanner
+    M: Display.SelectMsg
+    b: Objects.Object
+    f: Files.File
+    P: Pictures.Picture
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if S.class = Attributes.Name then
+    f := Files.Old(@S.s)
+    if f # nil then
+      newgc(P)
+      Pictures.Open(P, @S.s, true)
+    else
+      Texts.WriteString(@W, "  picture not found")
+      Texts.WriteLn(@W)
+      Texts.Append(Oberon.Log, W.buf)
+      P := nil
+    end
+
+    M.id := Display.get
+    M.time := -1
+    M.obj := nil
+    M.sel := nil
+    M.F := nil
+    Display.Broadcast(@M)
+    if M.time # -1 then
+      b := M.obj
+      while b # nil do
+        case b of
+        | Panel:
+          b.pict := P
+          Gadgets.Update(b)
+
+        end
+
+        b := b.slink
+      end
+
+    else
+      Texts.WriteString(@W, "  no selection")
+      Texts.WriteLn(@W)
+      Texts.Append(Oberon.Log, W.buf)
+    end
+  end
+end ChangeBackdrop
+
+// Top, Bottom, Left, Right, Vertical, Horizontal, Width, Height, Size
+procedure Align0(const type_: pointer to array of char)
+  var
+    M: Display.SelectMsg
+    obj, n: Objects.Object
+    x, y, w, h, maxW, maxH, px, py, count: int16
+    A: Display.ModifyMsg
+    L, p, q: Objects.Object
+    vertical: boolean
+
+  procedure Score(F: Display.Frame; vertical: pointer to boolean): int32
+  begin
+    if vertical^ then
+      return 16000 - F.Y
+    else
+      return F.X
+    end
+    return 0 // TODO o2m: Micron requires a result on all control paths
+  end Score
+begin
+  M.id := Display.get
+  M.time := -1
+  M.sel := nil
+  M.obj := nil
+  M.F := nil
+  Display.Broadcast(@M)
+  if (M.time # -1) & (M.obj # nil) then
+    BoundingBox(M.obj(Display.Frame), @x, @y, @w, @h, @count)
+
+    vertical := (type_^ = "verticalcenter") or (type_^ = "vertical")
+    // First Pass
+    maxW := 0
+    maxH := 0
+    L := nil
+    obj := M.obj
+    while obj # nil do
+      n := obj.slink
+      obj.slink := nil
+      case obj of
+      | Display.Frame:
+        maxW := Max(maxW, obj.W)
+        maxH := Max(maxH, obj.H)
+        if L = nil then
+          L := obj
+        else
+          q := L
+          p := nil
+          while (q # nil) & (Score(obj, @vertical) > Score(q(Display.Frame), @vertical)) do
+            p := q
+            q := q.slink
+          end
+          if p # nil then
+            obj.slink := q
+            p.slink := obj
+          else
+            obj.slink := L
+            L := obj
+          end
+        end
+      end
+
+      obj := n
+    end
+
+    // Second Pass
+    px := x
+    py := y + h - 1
+    obj := L // M.obj
+    while obj # nil do
+      n := obj.slink
+      case obj of
+      | Display.Frame:
+        A.id := Display.move
+        A.mode := Display.display
+        A.F := obj
+        A.X := obj.X
+        A.Y := obj.Y
+        A.W := obj.W
+        A.H := obj.H
+        if type_^ = "bottom" then
+          A.Y := y
+        elsif type_^ = "top" then
+          A.Y := y + h - obj.H
+        elsif type_^ = "left" then
+          A.X := x
+        elsif type_^ = "right" then
+          A.X := x + w - obj.W
+        elsif type_^ = "width" then
+          A.W := maxW
+        elsif type_^ = "height" then
+          A.H := maxH
+        elsif type_^ = "size" then
+          A.W := maxW
+          A.H := maxH
+        elsif type_^ = "verticalcenter" then
+          A.X := x + asr(maxW, 1) - asr(obj.W, 1)
+        elsif type_^ = "horizontalcenter" then
+          A.Y := y + h - asr(maxH, 1) - asr(obj.H, 1)
+        elsif type_^ = "horizontal" then
+          A.X := px
+          inc(px, obj.W)
+        elsif type_^ = "vertical" then
+          A.Y := py - obj.H + 1
+          dec(py, obj.H)
+        end
+
+        A.dX := A.X - obj.X
+        A.dY := A.Y - obj.Y
+        A.dW := A.W - obj.W
+        A.dH := A.H - obj.H
+        Display.Broadcast(@A)
+      end
+
+      obj := n
+    end
+
+  else
+    Texts.WriteString(@W, "  no selection ")
+    Texts.WriteLn(@W)
+    Texts.Append(Oberon.Log, W.buf)
+  end
+end Align0
+
+(** Aligns the selected children of a panel. Used in the form:
+
+Panels.Align < bottom | top | left | right | width | height | size | verticalcenter | horizontalcenter | horizontal | vertical >
+*)
+procedure Align*()
+  var
+    S: Attributes.Scanner
+begin
+  Attributes.OpenScanner(@S, Oberon.Par.text, Oberon.Par.pos)
+  Attributes.Scan(@S)
+  if S.class = Attributes.Name then
+    Align0(@S.s)
+  end
+end Align
+
+// Determine if possible to have list as children of F.
+procedure NewChildrenOK*(F: Panel; list: pointer to Objects.Object): boolean
+  var
+    obj, newobj: Objects.Object
+    ok: boolean
+    t: Objects.Object
+begin
+  obj := list^
+  list^ := nil
+  ok := true
+  while (obj # nil) & ok do
+    newobj := obj
+    obj := obj.slink // get next already
+    if ~(newobj is Gadgets.Frame) then
+      F.do_.TranslateToGadget(F, @newobj)
+    end
+    ok := F.do_.AcceptChild(F, @newobj)
+    if ok & (newobj # nil) & (newobj is Gadgets.Frame) then
+      case newobj of
+      | Gadgets.Frame:
+        if Gadgets.Recursive(F, newobj) then
+          Texts.WriteString(@W, "Not allowed, will cause recursive structures")
+          Texts.Append(Oberon.Log, W.buf)
+          ok := false
+        elsif (newobj.lib # nil) & (newobj.lib.name # "") & (F.lib # newobj.lib) then
+          Texts.WriteString(@W, " sorry, cannot insert public object directly in panel; make a copy first")
+          Texts.WriteLn(@W)
+          Texts.Append(Oberon.Log, W.buf)
+          ok := false
+        end
+      end
+
+      // Append to list, can be optimized a little
+      if ok then
+        newobj.slink := nil
+        if list^ = nil then
+          list^ := newobj
+        else
+          t := list^
+          while t.slink # nil do
+            t := t.slink
+          end
+          t.slink := newobj
+        end
+      end
+    end
+  end
+
+  return ok
+end NewChildrenOK
+
+// Copy a list of objects Objects.deep or Objects.shallow.
+procedure CopyObjList*(id: int16; from: Objects.Object; to_: pointer to Objects.Object)
+  var
+    t, t0: Objects.Object
+    C: Objects.CopyMsg
+begin
+  t := from
+  to_^ := nil
+  C.stamp := Oberon.Time()
+  C.id := id
+  if t # nil then
+    t.handle(t, @C)
+    t0 := C.obj
+    t := t.slink
+    to_^ := t0
+  end
+
+  while t # nil do
+    t.handle(t, @C)
+    t0.slink := C.obj
+    t := t.slink
+    t0 := t0.slink
+  end
+end CopyObjList
+
+// Recalls last deleted children to the caret.
+procedure Recall*()
+  var
+    M: Display.ConsumeMsg
+begin
+  if recall # nil then
+    M.id := Display.integrate
+    M.F := nil
+    CopyObjList(Objects.deep, recall, @M.obj)
+    Display.Broadcast(@M)
+  end
+end Recall
+
+// === Method implementations ===
+
+procedure RestoreBackGround*(F: Panel; x, y: int16; R: Display3.Mask)
+begin
+  if F.pict # nil then
+
+    if ~(texture in F.state0) then
+      if F.pict.width < F.W then
+        Display3.FillPattern(R, 15, Display3.selectpat, x, y, x + F.pict.width, y, F.W - F.pict.width, F.H, Display.replace)
+      end
+
+      if F.pict.height < F.H then
+        Display3.FillPattern(R, 15, Display3.selectpat, x, y, x, y, F.W, F.H - F.pict.height, Display.replace)
+      end
+
+      Display3.Pict(R, F.pict, 0, 0, F.pict.width, F.pict.height, x, y + F.H - F.pict.height, Display.replace)
+    else
+      Display3.ReplPict(R, F.pict, x, y, x, y, F.W, F.H, Display.replace)
+    end
+
+  elsif flatlook in F.state0 then
+    Display3.ReplConst(R, F.col, x, y, F.W, F.H, Display.replace)
+  else
+    Display3.FilledRect3D(R, Display3.topC, Display3.bottomC, F.col, x, y, F.W, F.H, 1, Display.replace)
+  end
+end RestoreBackGround
+
+procedure RestoreCaret*(F: Panel; x, y: int16; R: Display3.Mask)
+begin
+  Display3.CopyPattern(R, Display3.textC, Display.cross, x + F.focusx - markW, y + F.H - 1 + F.focusy - markW, Display3.paint)
+end RestoreCaret
+
+procedure UpdateCaret*(F: Panel)
+begin
+  GrowHull(F, F.focusx - markW, F.focusy - markW, markW * 2i1 + 1i1, markW * 2i1 + 1i1)
+  DrawHull(F)
+end UpdateCaret
+
+procedure TrackCaret*(F: Panel; M: pointer to Oberon.InputMsg)
+  var
+    x, y, w, h, LX, LY: int16
+    keysum: set
+    obj, newobj: Objects.Object
+    parent: Display.Frame
+    objtime, texttime, beg, end_: int32
+    text: Texts.Text
+    buf: Texts.Buffer
+    T0: Texts.Text
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+  w := F.W
+  h := F.H
+  Oberon.Defocus()
+  Effects.TrackCross(nil, @keysum, @LX, @LY, @x, @y, @w, @h)
+  F.focused := true
+  F.focusx := LX - x
+  F.focusy := LY - (y + h - 1)
+  F.do_.UpdateCaret(F)
+  M.res := 0
+
+  if keysum = {2,1} then
+    // copy to caret
+    GetSelection(@obj, @parent, @objtime)
+    Oberon.GetSelection(@text, @beg, @end_, @texttime)
+    if (obj # nil) & ((texttime - objtime < 0) or (texttime = -1)) then
+      // use the object selection
+      CopyObjList(Objects.shallow, obj, @newobj)
+      F.do_.InsertFrames(F, F.focusx, F.focusy, newobj)
+    elsif (texttime # -1) & ((objtime - texttime < 0) or (objtime = -1)) then
+      // use the text selection
+      newgc(buf)
+      Texts.OpenBuf(buf)
+      Texts.Save(text, beg, end_, buf)
+      newgc(T0)
+      Texts.Open(T0, "")
+      Texts.Insert(T0, 0, buf)
+      Objects.NewObj := T0
+      Gadgets.Execute("TextFields.MakeCaption", nil, M.dlink, nil, nil)
+      if Objects.NewObj # nil then
+        Gadgets.Integrate(Objects.NewObj(Display.Frame))
+      end
+    end
+  end
+end TrackCaret
+
+// Select the gadgets in the area u, v, w, h of the panel.
+procedure SelectArea*(F: Panel; x, y, u, v, w, h: int16)
+  var
+    M: Display.SelectMsg
+    f: Display.Frame
+    b: boolean
+
+  procedure Inside(F: Display.Frame; h: pointer to int16; u: pointer to int16; v: pointer to int16; w: pointer to int16): boolean
+  begin
+    return (u^ <= F.X) & (v^ <= F.Y) & (u^ + w^ - 1 >= F.X + F.W - 1) & (v^ + h^ - 1 >= F.Y + F.H - 1)
+  end Inside
+begin
+  ResetHull(F)
+  f := F.dsc
+  b := false
+  while f # nil do
+    case f of
+    | Gadgets.Frame:
+      if Inside(f, @h, @u, @v, @w) then
+        if ~(Gadgets.selected in f(Gadgets.Frame).state) then
+          M.x := 0
+          M.y := 0
+          M.id := Display.set_
+          M.res := -1
+          M.F := f
+          ToChild(F, f, x, y, @M)
+          GrowHull(F, f.X, f.Y, f.W, f.H)
+        end
+
+        b := true
+      else
+        if Gadgets.selected in f(Gadgets.Frame).state then
+          M.x := 0
+          M.y := 0
+          M.id := Display.reset
+          M.res := -1
+          M.F := f
+          ToChild(F, f, x, y, @M)
+          GrowHull(F, f.X, f.Y, f.W, f.H)
+        end
+      end
+    end
+
+    f := f.next
+  end
+
+  DrawHull(F)
+  if b then
+    F.time := Oberon.Time()
+  else
+    F.time := Input.Time() - val(int32, 32767)
+  end
+end SelectArea
+
+procedure SelectHandler(mx, my, x, y, w, h: int16; keysum: set)
+begin
+  SelectArea(tmpP, px, py, sx - px, y - (py + tmpP.H - 1), sw, h)
+  SelectArea(tmpP, px, py, x - px, y - (py + tmpP.H - 1), w, h)
+  sx := x
+  sy := y
+  sw := w
+  sh := h
+end SelectHandler
+
+// Delete children from the panel. recall is updated.
+procedure KillChildren*(F: Panel; objlist: Objects.Object)
+  var
+    f: Objects.Object
+    A: Display.ControlMsg
+begin
+  if objlist # nil then
+    F.time := Input.Time() - val(int32, 32767)
+    A.id := Display.remove // <<< remove everything
+    A.F := objlist(Display.Frame)
+    Display.Broadcast(@A)
+    recall := objlist // update recall list
+
+    // unname objects
+    if (F.lib # nil) & (F.lib.name # "") then
+      f := objlist
+      while f # nil do
+        if (f.lib # nil) & (f.lib = F.lib) then
+          Objects.PutName(@f.lib.dict, f.ref, "") // !
+          f.lib.FreeObj(f.lib, f.ref)
+          f.lib := nil
+          f.ref := -1
+        end
+
+        f := f.slink
+      end
+    end
+  end
+end KillChildren
+
+procedure TrackSelection*(F: Panel; M: pointer to Oberon.InputMsg)
+  var
+    keysum: set
+    objlist: Display.Frame
+    newobj: Objects.Object
+begin
+  px := M.x + F.X
+  py := M.y + F.Y
+  tmpP := F
+  sx := M.X
+  sy := M.Y
+  sw := 2
+  sh := 2
+
+  Effects.SizeRect(nil, @keysum, @M.X, @M.Y, @sx, @sy, @sw, @sh, SelectHandler)
+  tmpP := nil
+  M.res := 0
+
+  if keysum = {0,2} then
+    // delete selection
+    GetPanelSelection(F, @objlist)
+    KillChildren(F, objlist)
+  elsif keysum = {0,1} then
+    // copy to focus
+    GetPanelSelection(F, @objlist)
+    if objlist # nil then
+      CopyObjList(Objects.shallow, objlist, @newobj)
+      Gadgets.Integrate(newobj)
+    end
+  end
+end TrackSelection
+
+procedure TrackSelectChild*(F: Panel; M: pointer to Oberon.InputMsg; child: Gadgets.Frame)
+  var
+    x, y, sx, sy: int16
+    S: Display.SelectMsg
+    keysum: set
+    t: Display.Frame
+    newobj: Objects.Object
+begin
+  x := M.x + F.X
+  y := M.y + F.Y
+
+  S.F := child
+  S.res := -1
+  S.dlink := nil
+  ResetHull(F)
+  S.x := 0
+  S.y := 0
+  if Gadgets.selected in child.state then
+    S.id := Display.reset
+    ToChild(F, child, x, y, @S)
+    GetPanelSelection(F, @t)
+    if t = nil then
+      F.time := Input.Time() - val(int32, 32767)
+    end
+  else
+    S.id := Display.set_
+    ToChild(F, child, x, y, @S)
+    F.time := Oberon.Time()
+  end
+
+  GrowHull(F, child.X, child.Y, child.W, child.H)
+  DrawHull(F)
+
+  M.res := 0
+  keysum := {}
+  sx := M.X
+  sy := M.Y
+  repeat
+    Effects.TrackMouse(@M.keys, @M.X, @M.Y, Effects.Arrow)
+    keysum := keysum + M.keys
+  until (M.keys = {}) or ~Effects.Invicinity(M.X, M.Y, sx, sy)
+
+  if M.keys # {} then
+    F.do_.TrackSelection(F, M)
+  else
+    if keysum = {0,2} then
+      // RL delete selection
+      GetPanelSelection(F, @t)
+      KillChildren(F, t)
+    elsif keysum = {0,1} then
+      // RM copy to focus
+      GetPanelSelection(F, @t)
+      if t # nil then
+        CopyObjList(Objects.shallow, t, @newobj)
+        Gadgets.Integrate(newobj)
+      end
+    end
+  end
+end TrackSelectChild
+
+// Accepts and returns a single gadget.
+procedure TranslateToGadget*(F: Panel; obj: pointer to Objects.Object)
+  var
+    f: Objects.Object // C: Display.ConsumeMsg;
+    L: Objects.LinkMsg
+    A: Objects.AttrMsg
+begin
+  if obj^ is Pictures.Picture then
+    (* older version
+    f := Gadgets.CreateObject("PictureGadgets.NewPict");
+    IF (f # NIL) & (f IS Gadgets.Frame) THEN
+    C.id := Display.drop; C.F := f(Display.Frame); C.obj := obj; C.res := -1;
+    C.x := 0; C.y := 0; f.handle(f,C);
+    obj := f;
+    END;
+    *)
+    // version for Rembrandt
+    f := Gadgets.CreateObject("Rembrandt.New")
+    if (f # nil) & (f is Gadgets.Frame) then
+      case f of
+      | Gadgets.Frame:
+        L.id := Objects.set_
+        L.obj := obj^
+        L.res := -1
+        copy(@L.name, "Model", 32)
+        f.handle(f, @L)
+        f.W := obj^(Pictures.Picture).width
+        f.H := obj^(Pictures.Picture).height
+
+        A.id := Objects.set_
+        copy(@A.name, "Locked", 32)
+        A.class := Objects.Bool
+        A.b := true
+        A.res := -1
+        f.handle(f, @A)
+        A.id := Objects.set_
+        copy(@A.name, "Border", 32)
+        A.class := Objects.Bool
+        A.b := false
+        A.res := -1
+        f.handle(f, @A)
+        obj^ := f
+      end
+    end
+
+    //
+  end
+end TranslateToGadget
+
+procedure AcceptChild*(F: Panel; obj: pointer to Objects.Object): boolean
+begin
+  return true
+end AcceptChild
+
+procedure InsertChild*(F: Panel; f: Display.Frame; u, v: int16)
+  var
+    f0: Display.Frame
+    B: Objects.BindMsg
+    A: Display.ModifyMsg
+begin
+  if (F.lib # nil) & (F.lib.name # "") then
+    B.lib := F.lib
+    f.handle(f, @B)
+  end
+
+  // F.do.ModifyChild(F, f, u, v, TRUE)
+  A.id := Display.move
+  A.mode := Display.state
+  A.x := 0
+  A.y := 0
+  A.X := u
+  A.Y := v
+  A.W := f.W
+  A.H := f.H
+  A.dX := 0
+  A.dY := 0
+  A.dW := 0
+  A.dH := 0
+  A.res := -1
+  A.F := f
+  A.dlink := nil
+  Objects.Stamp(@A)
+  f.handle(f, @A)
+
+  GrowHull(F, f.X, f.Y, f.W, f.H)
+
+  // add at end of the list
+  f.next := nil
+  if F.dsc # nil then
+    f0 := F.dsc
+    while f0.next # nil do
+      f0 := f0.next
+    end
+    f0.next := f
+  else
+    F.dsc := f
+  end
+end InsertChild
+
+procedure InsertFrames*(F: Panel; u, v: int16; list: Objects.Object)
+  var
+    x, y, w, h, count: int16
+    f, n: Display.Frame
+    O: Display3.OverlapMsg
+    A: Display.ControlMsg
+begin
+  newfocusX := F.focusx
+  newfocusY := F.focusy
+  if NewChildrenOK(F, @list) & (list # nil) then
+    // insert can proceed
+
+    BoundingBox(list(Gadgets.Frame), @x, @y, @w, @h, @count)
+    x := u - x
+    y := v - y
+
+    O.M := nil
+    O.F := nil
+    O.x := 0
+    O.y := 0
+    O.res := -1
+    Objects.Stamp(@O)
+
+    A.id := Display.remove // <<< remove the whole list
+    A.F := list(Gadgets.Frame)
+    Display.Broadcast(@A)
+    ResetHull(F)
+    f := list(Gadgets.Frame)
+    while f # nil do
+      if f.slink # nil then
+        n := f.slink(Display.Frame)
+      else
+        n := nil
+      end
+      F.do_.InsertChild(F, f, f.X + x, f.Y + y)
+      if count < 10 then
+        InvalidateMasks(F, f, f.X, f.Y, f.W, f.H)
+      end
+      O.res := -1
+      f.handle(f, @O)
+      f := n
+    end
+
+    if count < 10 then
+      UpdateMasks(F, true, false)
+    else
+      UpdateMasks(F, false, true)
+    end
+    DrawHull(F)
+    newfocusX := u + w + 5
+    newfocusY := v
+  end
+end InsertFrames
+
+procedure RemoveFrames*(F: Panel; list: Display.Frame)
+  var
+    f: Display.Frame
+begin
+  ResetHull(F)
+  f := list
+  while f # nil do
+    F.do_.RemoveChild(F, f)
+    if f.slink # nil then
+      f := f.slink(Display.Frame)
+    else
+      f := nil
+    end
+  end
+
+  UpdateMasks(F, false, true)
+  DrawHull(F)
+end RemoveFrames
+
+procedure NewLocateMsg(F: Display.Frame; u, v: int16; M: pointer to Display.LocateMsg)
+  var
+    f, T: Display.Frame
+    childu, childv, x, y, tu, tv, X, Y: int16
+begin
+  childu := u + F.X
+  childv := v + F.Y + F.H - 1
+  X := M.X
+  Y := M.Y
+  f := F.dsc
+  T := nil
+  while f # nil do
+    x := childu + f.X
+    y := childv + f.Y
+    if (X >= x) & (Y >= y) & (X < x + f.W) & (Y < y + f.H) & ~((f is Gadgets.Frame) & (Gadgets.selected in f(Gadgets.Frame).state)) then
+
+      M.x := childu
+      M.y := childv
+      M.dlink := nil
+      M.F := nil
+      M.loc := nil
+      M.res := -1
+      f.handle(f, M)
+      if M.loc # nil then
+        T := M.loc // tx := M.x; ty := M.y;
+        tu := M.u
+        tv := M.v
+      end
+    end
+
+    f := f.next
+  end
+
+  if T = nil then
+  else
+    M.loc := T
+    M.u := tu
+    M.v := tv
+  end
+end NewLocateMsg
+
+procedure NewHandler*(F: Objects.Object; M: pointer to Objects.ObjMsg)
+  var
+    u, v: int16
+begin
+  case F of
+  | Display.Frame:
+    case M of
+    | Display.PLocateMsg:
+      u := M.x
+      v := M.y
+      NewLocateMsg(F, u, v, M)
+      if (M.loc = nil) & Effects.Inside(M.X, M.Y, u + F.X, v + F.Y, F.W, F.H) then
+        M.loc := F
+        M.u := M.X - (u + F.X)
+        M.v := M.Y - (v + F.Y + F.H - 1)
+        M.res := 0
+        return
+      end
+
+    else
+      halt(42)
+    end
+  end
+end NewHandler
+
+procedure TranslateChildren*(F: Panel; list: Display.Frame; count, dx, dy: int16)
+  var
+    p: Display.Frame
+    A: Display.ModifyMsg
+    x0, y0: int16
+begin
+  p := list
+  while p # nil do
+    A.id := Display.move
+    A.mode := Display.state
+    A.F := p
+    A.X := p.X + dx
+    A.Y := p.Y + dy
+    A.W := p.W
+    A.H := p.H
+    A.dX := A.X - p.X
+    A.dY := A.Y - p.Y
+    A.dW := 0
+    A.dH := 0
+    GrowHull(F, A.X, A.Y, A.W, A.H)
+    x0 := p.X
+    y0 := p.Y
+    Display.Broadcast(@A)
+    if count < 10 then
+      InvalidateMasks(F, p, x0, y0, p.W, p.H)
+      InvalidateMasks(F, p, p.X, p.Y, p.W, p.H)
+    end
+    if p.slink # nil then
+      p := p.slink(Display.Frame)
+    else
+      p := nil
+    end
+  end
+
+  if count < 10 then
+    UpdateMasks(F, true, false)
+  else
+    UpdateMasks(F, false, true)
+  end
+  DrawHull(F)
+end TranslateChildren
+
+procedure DragSelection*(F: Panel; M: pointer to Oberon.InputMsg)
+  var
+    u, v, X, Y, x, y, w, h, nx, ny, nw, nh, u0, v0, count: int16
+    f, q: Display.Frame
+    keys: set
+    C: Display.ConsumeMsg
+    old: Objects.Handler
+    nl: Objects.Object
+begin
+  GetPanelSelection(F, @f)
+  BoundingBox(f, @x, @y, @w, @h, @count)
+  if (w # 0) & (h # 0) then
+    u := M.x
+    v := M.y
+    x := u + F.X + x
+    y := v + F.Y + F.H - 1 + y
+    Input.Mouse(@keys, @X, @Y)
+    Effects.Snap(@X, @Y)
+    nx := x
+    ny := y
+    nw := w
+    nh := h
+    Effects.MoveRect(nil, @keys, @X, @Y, @nx, @ny, @nw, @nh)
+    old := F.handle
+    F.handle := NewHandler
+    Gadgets.ThisFrame(X, Y, @q, @u0, @v0)
+    F.handle := old
+    if q # nil then
+      if keys = {1,0} then
+        // copy frames
+        CopyObjList(Objects.shallow, f, @nl)
+        C.id := Display.drop
+        C.F := q
+        C.u := u0 + (nx - X)
+        C.v := v0 + (ny - Y)
+        C.obj := nl
+        Display.Broadcast(@C)
+      elsif keys = {1,2} then
+        // consume frames
+        C.id := Display.drop
+        C.F := q
+        C.u := u0 + (nx - X)
+        C.v := v0 + (ny - Y)
+        C.obj := f
+        Display.Broadcast(@C)
+      elsif keys = {1} then
+        // move to own boundary
+        ResetHull(F)
+        GrowHull(F, x - (F.X + u), y - (v + F.Y + F.H - 1), w, h)
+        TranslateChildren(F, f, count, nx - x, ny - y)
+      end
+    end
+  end
+end DragSelection
+
+procedure ConsumeChar*(F: Panel; M: pointer to Oberon.InputMsg)
+
+  procedure Shift(dx, dy: int16; F: pointer to Panel)
+    var
+      f: Display.Frame
+      x, y, w, h, count: int16
+  begin
+    GetPanelSelection(F^, @f)
+    if f # nil then
+      BoundingBox(f, @x, @y, @w, @h, @count)
+      ResetHull(F^)
+      GrowHull(F^, x, y, w, h)
+      TranslateChildren(F^, f, count, dx, dy)
+    end
+  end Shift
+begin
+  if M.ch = 0C4X then
+    // left arrow
+    Shift(-1, 0, @F)
+  elsif M.ch = 0C3X then
+    // right arrow
+    Shift(1, 0, @F)
+  elsif M.ch = 0C1X then
+    // up arrow
+    Shift(0, 1, @F)
+  elsif M.ch = 0C2X then
+    // down arrow
+    Shift(0, -1, @F)
+  else
+    Objects.NewObj := nil
+    Oberon.Defocus()
+    Gadgets.Execute("TextFields.MakeCaption", F, M.dlink, nil, nil)
+    if Objects.NewObj # nil then
+      F.do_.InsertFrames(F, F.focusx, F.focusy, Objects.NewObj)
+      Objects.NewObj.handle(Objects.NewObj, M)
+    end
+  end
+
+  M.res := 0 // ps - 13.5.96
+end ConsumeChar
+
+type CMD_ = procedure()
+
+procedure cmd_*(i: int32; name: ^array 32 of char): CMD_
+begin
+  if i = 0 then if name # nil then name^ := "NewPanel" end return NewPanel end
+  if i = 1 then if name # nil then name^ := "NewPictPanel" end return NewPictPanel end
+  if i = 2 then if name # nil then name^ := "ToFront" end return ToFront end
+  if i = 3 then if name # nil then name^ := "ToBack" end return ToBack end
+  if i = 4 then if name # nil then name^ := "ChangeBackdrop" end return ChangeBackdrop end
+  if i = 5 then if name # nil then name^ := "Align" end return Align end
+  if i = 6 then if name # nil then name^ := "Recall" end return Recall end
+  return nil
+end cmd_
+
+begin
+  Modules.Register("Panels", cmd_)
+  Texts.OpenWriter(@W)
+  defaultgrid := 2
+  newgc(methods)
+  methods.TrackMouse := TrackMouse
+  methods.RestoreBackGround := RestoreBackGround
+  methods.RestoreCaret := RestoreCaret
+  methods.RestoreArea := RestoreArea
+  methods.TrackCaret := TrackCaret
+  methods.TrackSelection := TrackSelection
+  methods.TrackSelectChild := TrackSelectChild
+  methods.ConsumeChar := ConsumeChar
+  methods.UpdateCaret := UpdateCaret
+  methods.InsertChild := InsertChild
+  methods.InsertFrames := InsertFrames
+  methods.AcceptChild := AcceptChild
+  methods.TranslateToGadget := TranslateToGadget
+  methods.RemoveChild := RemoveChild
+  methods.RemoveFrames := RemoveFrames
+  methods.DragSelection := DragSelection
+end Panels.
